@@ -36,21 +36,15 @@ third_party/      ENet patches, VC10 compat shim (deps are fetched, not committe
 
 ## Try it (play with a friend)
 
-You need: Kenshi (Steam) and [RE_Kenshi 0.3.1+](https://www.nexusmods.com/kenshi/mods/847).
+You need: Kenshi (Steam) and [RE_Kenshi 0.3.1+](https://www.nexusmods.com/kenshi/mods/847)
+on both machines. Everything else is bundled in [dist/kit](dist/kit): the
+prebuilt mod, a shared two-squad starter save (`squad1`), and one-command
+host/join scripts that install both for you.
 
-A prebuilt mod is included in this repo - copy
-[dist/mods/KenshiCoop](dist/mods/KenshiCoop) into your Kenshi install so you get:
+On each machine, from the `dist/kit` folder (each player needs the other's
+[SteamID64](https://steamid.io)):
 
-```
-[Kenshi]/mods/KenshiCoop/
-    KenshiCoop.dll      <- prebuilt plugin (or build your own, see Building)
-    RE_Kenshi.json      <- tells RE_Kenshi to load the DLL
-    KenshiCoop.mod      <- empty FCS mod file so Kenshi lists it in the Mods tab
-```
-
-Then, on each machine, from the `scripts/` folder:
-
-Host (share your SteamID with the joining player):
+Host:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File friend_host.ps1 -PeerSteamId <their steamid64>
@@ -62,10 +56,25 @@ Join:
 powershell -ExecutionPolicy Bypass -File friend_join.ps1 -HostSteamId <their steamid64>
 ```
 
-Both scripts also support direct UDP (`-HostIp`) if you'd rather port-forward
-than use Steam P2P, and print step-by-step guidance as they run.
-`scripts/make_remote_kit.ps1` packages a self-contained zip (mod + save +
-scripts) you can send to a friend so they don't need this repo at all.
+The scripts copy the mod into `[Kenshi]/mods/KenshiCoop`, install the `squad1`
+save, launch the game, and connect via Steam P2P (no port forwarding). Direct
+UDP (`-HostIp`, with port forwarding) is also supported; the scripts print
+step-by-step guidance as they run.
+
+Two things to know before playing:
+
+- **Both players must load the exact same save.** Entity identity is resolved
+  from the save itself, so host and join have to start from identical copies -
+  that's why the kit ships `squad1` and installs it on both machines. Don't mix
+  it with your own saves unless you copy the same save folder to both sides.
+- **You only control your own squad tab.** The shared save's player faction has
+  one squad tab per player: the host controls squad tab 1, the joining player
+  controls squad tab 2. Your friend's squad is visible and fully synced on your
+  screen, but its characters answer only to them (and vice versa).
+
+Prefer a manual install? Copy [dist/mods/KenshiCoop](dist/mods/KenshiCoop) into
+`[Kenshi]/mods/` and `dist/kit/save/squad1` into `%LOCALAPPDATA%\kenshi\save\`
+on both machines - the kit scripts do exactly this.
 
 ## Building
 
