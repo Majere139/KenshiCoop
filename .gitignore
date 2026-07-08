@@ -1,0 +1,23 @@
+# Build outputs
+src/plugin/x64/
+build/
+dist/*.exe
+dist/remote-kit/
+dist/KenshiCoop-remote-kit-*.zip
+
+# Vendored dependency source (fetched via clone/git-LFS, not committed; ~500MB)
+third_party/enet/enet/
+third_party/KenshiLib_deps/
+
+# Test-run artifacts (logs, screenshots, verdicts)
+tools/test-runs/
+tools/*.log
+
+# Root-level run logs
+/*.log
+
+# Machine-specific config (committed template: scripts/lan.config.example.json)
+scripts/lan.config.json
+
+# Stray shell artifact
+nul
