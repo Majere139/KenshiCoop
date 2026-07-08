@@ -36,14 +36,16 @@ third_party/      ENet patches, VC10 compat shim (deps are fetched, not committe
 
 ## Try it (play with a friend)
 
-You need: Kenshi (Steam), [RE_Kenshi 0.3.1+](https://www.nexusmods.com/kenshi/mods/847),
-and a built `KenshiCoop.dll` (see Building below) installed as a mod:
+You need: Kenshi (Steam) and [RE_Kenshi 0.3.1+](https://www.nexusmods.com/kenshi/mods/847).
+
+A prebuilt mod is included in this repo - copy
+[dist/mods/KenshiCoop](dist/mods/KenshiCoop) into your Kenshi install so you get:
 
 ```
 [Kenshi]/mods/KenshiCoop/
-    KenshiCoop.dll
-    RE_Kenshi.json      <- from dist/mods/KenshiCoop/
-    KenshiCoop.mod      <- empty FCS mod file (create once in the FCS)
+    KenshiCoop.dll      <- prebuilt plugin (or build your own, see Building)
+    RE_Kenshi.json      <- tells RE_Kenshi to load the DLL
+    KenshiCoop.mod      <- empty FCS mod file so Kenshi lists it in the Mods tab
 ```
 
 Then, on each machine, from the `scripts/` folder:
