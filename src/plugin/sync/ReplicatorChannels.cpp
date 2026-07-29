@@ -1695,12 +1695,16 @@ void Replicator::applyStealthFeedback(GameWorld* gw, Inbound& in) {
                                          p.seers[i].prog))
                 ++applied;
         }
-        // An EMPTY snapshot is the authority saying "no one sees you anymore";
-        // nothing to replay - the local map's entries age out on their own once
-        // the notifies stop (spike-verified decay).
-        char b[160]; _snprintf(b, sizeof(b) - 1,
-            "[sneak] DETECT RECV hand=%u,%u seers=%u applied=%u unseen=%u",
-            k.i, k.s, n, applied, (unsigned)p.unseen);
+        // An EMPTY snapshot is the authority saying "no one sees you anymore".
+        // The entries do NOT age out on their own: the engine only decays
+        // whoSeesMeSneaking while its stealth update runs, so after the sneak
+        // ends the last replayed set stays frozen on the owner. Clear it here or
+        // the detection arrows/status linger for the rest of the session.
+        unsigned int cleared = 0;
+        if (n == 0 && engine::clearStealthSeers(c)) cleared = 1;
+        char b[176]; _snprintf(b, sizeof(b) - 1,
+            "[sneak] DETECT RECV hand=%u,%u seers=%u applied=%u unseen=%u cleared=%u",
+            k.i, k.s, n, applied, (unsigned)p.unseen, cleared);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }

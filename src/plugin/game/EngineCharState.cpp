@@ -489,6 +489,16 @@ bool applyStealthSeer(GameWorld* gw, Character* sneaker,
     }
 }
 
+bool clearStealthSeers(Character* c) {
+    if (!c) return false;
+    __try {
+        c->whoSeesMeSneaking.clear();
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 bool sneakSubject(GameWorld* gw, const unsigned int subjHand[5], bool on) {
     (void)gw;
     Character* c = resolveCharByHand(subjHand[3], subjHand[4], subjHand[0],

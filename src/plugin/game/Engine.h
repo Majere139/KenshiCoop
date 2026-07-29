@@ -1179,6 +1179,11 @@ bool applyStealth(Character* c, bool on);
 // unseen status render natively. SEH-guarded.
 bool applyStealthSeer(GameWorld* gw, Character* sneaker,
                       const unsigned int npcHand[5], unsigned char see, float prog);
+// Drop every entry from the LOCAL body's whoSeesMeSneaking map. The engine only
+// ages those entries while its stealth update is running, so once the sneak ends
+// the last replayed snapshot would linger for the rest of the session (measured:
+// frozen, never decaying). SEH-guarded.
+bool clearStealthSeers(Character* c);
 // Scenario scaffold (sneak_pose / sneak_probe): resolve the subject by hand,
 // applyStealth. Run on the machine that owns the action being tested.
 bool sneakSubject(GameWorld* gw, const unsigned int subjHand[5], bool on);
