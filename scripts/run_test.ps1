@@ -138,11 +138,15 @@ $joinExe = Join-Path $JoinDir "kenshi_x64.exe"
 if (-not (Test-Path $hostExe)) { throw "Host Kenshi not found: $hostExe" }
 if (-not (Test-Path $joinExe)) { throw "Join Kenshi not found: $joinExe (run scripts\setup_join_install.cmd)" }
 
-# Fail fast on a bad save name (auto-loading a non-existent save crashes the game).
+# The live save folder both clients auto-load from. The pristine copy is restored
+# from the repo fixture store just before launch (after the stale-Kenshi kill).
 $saveRoot = Join-Path $env:LOCALAPPDATA "kenshi\save"
-if (-not (Test-Path (Join-Path $saveRoot $Save))) {
+# Fail fast (before starting the WAN proxy) on a name that exists neither as a repo
+# fixture (restored later) nor already in AppData (debug saves not tracked in-repo).
+if (-not (Test-Path (Join-Path $repoRoot "fixtures\saves\$Save\quick.save")) -and `
+    -not (Test-Path (Join-Path $saveRoot $Save))) {
     $avail = (Get-ChildItem $saveRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object Name) -join ", "
-    throw "Save '$Save' not found in $saveRoot. Available saves: $avail"
+    throw "Save '$Save' not found as a repo fixture or in $saveRoot. Available saves: $avail"
 }
 
 $hostLog = Join-Path $OutDir "host.log"
@@ -248,6 +252,20 @@ if (-not $NoKill) {
         $stale | Stop-Process -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 2
     }
+}
+
+# Restore the pristine fixture from the repo (fixtures\saves\<Save>) over the live
+# AppData copy so a prior co-op run's connect-push / stream-commit can't drift the
+# validation save. Runs after the stale-Kenshi kill (the game must not be writing).
+# Debug saves with no repo fixture are left as-is. This is the single choke point
+# for the whole loopback matrix, since regress.ps1 invokes run_test.ps1 per scenario.
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptDir "deploy_saves.ps1") -Save $Save
+if ($LASTEXITCODE -ne 0) { throw "deploy_saves.ps1 failed for '$Save' ($LASTEXITCODE)" }
+
+# Fail fast on a bad save name (auto-loading a non-existent save crashes the game).
+if (-not (Test-Path (Join-Path $saveRoot $Save))) {
+    $avail = (Get-ChildItem $saveRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object Name) -join ", "
+    throw "Save '$Save' not found in $saveRoot (and no repo fixture to restore). Available saves: $avail"
 }
 
 if ($Sync) {

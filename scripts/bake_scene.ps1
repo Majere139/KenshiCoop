@@ -7,6 +7,11 @@
   Example (bed+cage occupancy fixture):
     powershell -ExecutionPolicy Bypass -File scripts\bake_scene.ps1 `
         -Setup bedcage -BaseSave squad1 -BakeSave bedcage1
+
+  Add -Promote to also capture the fresh save into the repo fixture store
+  (fixtures\saves\<BakeSave>), the sanctioned way to update a tracked fixture:
+    powershell -ExecutionPolicy Bypass -File scripts\bake_scene.ps1 `
+        -Setup bedcage -BaseSave squad1 -BakeSave bedcage1 -Promote
 #>
 param(
     [Parameter(Mandatory=$true)][string]$Setup,
@@ -15,7 +20,11 @@ param(
     [string]$HostDir = "C:\Program Files (x86)\Steam\steamapps\common\Kenshi",
     [int]$Seconds = 120,
     [int]$StartTimeoutSec = 240,
-    [switch]$SkipDeploy
+    [switch]$SkipDeploy,
+    # After a successful bake, capture the fresh save into the repo fixture store
+    # (fixtures\saves\<BakeSave>) via capture_save.ps1 so the pristine copy is
+    # version-controlled and restored on future test runs.
+    [switch]$Promote
 )
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -79,6 +88,18 @@ if (Get-Process -Id $gamePid -ErrorAction SilentlyContinue) {
 $bakedDir = Join-Path $saveRoot $BakeSave
 if (Test-Path (Join-Path $bakedDir "quick.save")) {
     Write-Host "OK: baked save present at $bakedDir"
+    if ($Promote) {
+        # Wait for Kenshi to fully exit before capturing (capture_save.ps1 refuses
+        # while the game is running, to avoid grabbing a mid-write save).
+        $exitDeadline = (Get-Date).AddSeconds(20)
+        while ((Get-Date) -lt $exitDeadline -and `
+               @(Get-Process -Name "Kenshi_x64", "kenshi_x64" -ErrorAction SilentlyContinue).Count -gt 0) {
+            Start-Sleep -Milliseconds 500
+        }
+        Write-Host "Promoting baked save into the repo fixture store ..."
+        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $scriptDir "capture_save.ps1") -Save $BakeSave
+        if ($LASTEXITCODE -ne 0) { Write-Warning "capture_save.ps1 failed ($LASTEXITCODE); baked save is in AppData but NOT promoted." }
+    }
     exit 0
 } else {
     Write-Warning "Baked save NOT found at $bakedDir (baked=$baked). Check $log"
