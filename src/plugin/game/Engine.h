@@ -464,10 +464,15 @@ RootObject* resolveObjectByHand(const unsigned int cHand[5]);
 // content fingerprint (0 == empty) so the caller only re-sends on real change.
 // *outTruncated (optional) is set when the container did not fit in maxOut - the result
 // is then an INCOMPLETE description and must not be reconciled against destructively.
+// includeNested (protocol 48) also captures what worn CONTAINERS hold, tagged with
+// parentIdx. Only the inventory PUBLISHER wants that: a nested entry describes a DIFFERENT
+// inventory, so anything that counts or reconciles against the result must leave it off or
+// it reads a bagged item as a loose one.
 // Returns the number of item entries written.
 unsigned int captureContainerContents(GameWorld* gw, const unsigned int cHand[5],
                                       InvItemEntry* out, unsigned int maxOut,
-                                      unsigned int* outHash, bool* outTruncated = 0);
+                                      unsigned int* outHash, bool* outTruncated = 0,
+                                      bool includeNested = false);
 
 // SEH-guarded: reconcile the local container (cHand) to the desired item multiset:
 // add any shortfall (createItem of the template + tryAddItem) and remove any excess
@@ -482,15 +487,21 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
 
 // SEH-guarded (protocol 48): create `qty` of (sid,type) INSIDE the container the character at
 // cHand carries - a worn backpack's own private inventory, which is a different Inventory from
-// the character's and the only place a "bagged" item actually lives. Returns the number added.
+// the character's and the only place a "bagged" item actually lives. `which` selects among
+// several carried containers, in carry order. Returns the number added.
 int addItemToNestedContainer(GameWorld* gw, const unsigned int cHand[5], const char* sid,
-                            unsigned int typeCat, int qty);
+                            unsigned int typeCat, int qty, unsigned int which = 0);
 
-// SEH-guarded (protocol 48): summed quantity of (sid,type) INSIDE the carried container.
-// Returns -1 when the character carries no container, so a caller can distinguish "the bag has
-// not arrived yet" from "the bag is here and the item is missing".
+// SEH-guarded (protocol 48): summed quantity of (sid,type) INSIDE carried container `which`.
+// Returns -1 when the character carries no such container, so a caller can distinguish "the
+// bag has not arrived yet" from "the bag is here and the item is missing".
 int countInNestedContainer(GameWorld* gw, const unsigned int cHand[5], const char* sid,
-                           unsigned int typeCat);
+                           unsigned int typeCat, unsigned int which = 0);
+
+// SEH-guarded (protocol 48): how many CONTAINERS the character at cHand carries, worn or
+// loose. Two bags of the SAME template are the case the apply side can confuse, so a gate
+// needs to assert they are both present before it can assert where their contents landed.
+int nestedContainerCount(GameWorld* gw, const unsigned int cHand[5]);
 
 // 'inventory' setup scene (Phase 4a bake): spawn a save-stable storage container in
 // front of the leader and seed it with a couple of items, so both clients load an

@@ -569,8 +569,12 @@ Character* findWorkerNear(GameWorld* gw, RootObject* fixture);
 
 // Container contents (equipped gear first, then loose) into out[] (see definition).
 // *outTruncated (optional) is set when a qualifying item did not fit in maxOut.
+// includeNested appends what worn CONTAINERS hold, tagged with parentIdx (protocol 48).
+// It defaults OFF because those entries do NOT belong to this inventory: a caller that
+// counts or reconciles against them treats a bagged item as a loose one (see definition).
 unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
-                          unsigned int maxOut, bool* outTruncated = 0);
+                          unsigned int maxOut, bool* outTruncated = 0,
+                          bool includeNested = false);
 // Item template by stringID within its itemType category.
 GameData* findItemTemplateImpl(GameWorld* gw, const char* sid, unsigned int typeCat);
 // Spawn a character from a random template into the given faction.

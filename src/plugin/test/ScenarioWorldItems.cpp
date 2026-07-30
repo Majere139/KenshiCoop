@@ -906,123 +906,6 @@ const char* const RejoinItemsScenario::SAVE_NAME = "coopresume";
 
 } // namespace
 
-// inv_nested_bag (protocol 48): an item placed INSIDE a worn backpack must appear inside the
-// PEER's copy of that backpack. A worn bag owns a private Inventory that no section of the
-// wearer's own inventory mentions, so a bagged item used to be described by no snapshot at all:
-// it existed for the author and nowhere else, and dropping the bag handed the peer a bag
-// missing its contents. The gate is deliberately about the item's PLACE, not its presence -
-// the join must find it in the bag (countInNestedContainer), because landing it loose on the
-// character would still leave the bag empty when it travels.
-class InvNestedBagScenario : public Scenario {
-public:
-    InvNestedBagScenario()
-        : passed_(false), have_(false), isHost_(false), type_(0), step_(0), added_(0),
-          nestedBase_(-1), nestedPeak_(-1), nestedFinal_(-1), lastLogMs_(0) {
-        for (int i = 0; i < 5; ++i) hand_[i] = 0;
-        sid_[0] = '\0';
-    }
-
-    virtual const char* name() const { return "inv_nested_bag"; }
-
-    virtual void onStart(const ScenarioContext& ctx) {
-        isHost_ = ctx.isHost;
-        // The bag carrier: whichever squad member actually has a container. Both clients load
-        // the same save, so they resolve the SAME character and the same bag.
-        have_ = findBagCarrier(ctx.gw, hand_);
-        engine::commonTestItemSid(ctx.gw, sid_, sizeof(sid_), &type_);
-        // The probe template is a COMMON item, so the bag may already hold some. Everything is
-        // measured as a delta against this baseline: an absolute "peer has some in the bag"
-        // check would pass on the save's own contents without the new item ever crossing.
-        if (have_ && sid_[0]) nestedBase_ = engine::countInNestedContainer(ctx.gw, hand_, sid_, type_);
-        char b[240];
-        _snprintf(b, sizeof(b) - 1,
-            "SCENARIO NEST anchor host=%d have=%d hand=%u,%u,%u,%u,%u sid='%s' type=%u base=%d",
-            isHost_ ? 1 : 0, have_ ? 1 : 0, hand_[0], hand_[1], hand_[2], hand_[3], hand_[4],
-            sid_[0] ? sid_ : "(none)", type_, nestedBase_);
-        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-    }
-
-    virtual bool onTick(const ScenarioContext& ctx) {
-        // HOST @8s: put the probe item INSIDE the bag. Late enough that both sides have
-        // seeded their inventory publishers, so this is a real edge rather than part of the
-        // initial convergence.
-        if (isHost_ && have_ && sid_[0] && step_ == 0 && ctx.elapsedMs >= 8000) {
-            step_ = 1;
-            added_ = engine::addItemToNestedContainer(ctx.gw, hand_, sid_, type_, PROBE_QTY);
-            char b[200];
-            _snprintf(b, sizeof(b) - 1, "SCENARIO NEST ADD sid='%s' type=%u qty=%d added=%d",
-                      sid_, type_, PROBE_QTY, added_);
-            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-        }
-
-        if (have_ && sid_[0] && (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0)) {
-            lastLogMs_ = ctx.elapsedMs;
-            int inBag = engine::countInNestedContainer(ctx.gw, hand_, sid_, type_);
-            nestedFinal_ = inBag;
-            if (inBag > nestedPeak_) nestedPeak_ = inBag;
-            char b[220];
-            _snprintf(b, sizeof(b) - 1, "SCENARIO NEST %s t=%lu inBag=%d base=%d peak=%d",
-                      isHost_ ? "HOST" : "JOIN", (unsigned long)ctx.elapsedMs, inBag,
-                      nestedBase_, nestedPeak_);
-            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-        }
-
-        unsigned long dur = isHost_ ? HOST_DURATION_MS : JOIN_DURATION_MS;
-        if (ctx.elapsedMs >= dur) {
-            // Both sides assert the same delta: exactly the probe quantity MORE in the bag than
-            // the save started with. Host also has to prove it really performed the placement,
-            // otherwise a failed setup would leave both sides equal and read as convergence.
-            int delta = (nestedFinal_ >= 0 && nestedBase_ >= 0) ? (nestedFinal_ - nestedBase_) : -1;
-            bool converged = have_ && (nestedBase_ >= 0) && (delta == PROBE_QTY);
-            passed_ = isHost_ ? (converged && added_ == PROBE_QTY) : converged;
-            char b[280];
-            _snprintf(b, sizeof(b) - 1,
-                "SCENARIO NEST verdict role=%s pass=%d sid='%s' want=%d added=%d base=%d "
-                "inBag=%d delta=%d peak=%d",
-                isHost_ ? "host" : "join", passed_ ? 1 : 0, sid_[0] ? sid_ : "(none)",
-                PROBE_QTY, added_, nestedBase_, nestedFinal_, delta, nestedPeak_);
-            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-            return true;
-        }
-        return false;
-    }
-
-    virtual bool passed() const { return passed_; }
-
-private:
-    static const int           PROBE_QTY        = 2;
-    static const unsigned long HOST_DURATION_MS = 30000;
-    static const unsigned long JOIN_DURATION_MS = 28000;
-
-    // First player character that carries a CONTAINER (a worn backpack). Both clients walk the
-    // squad in the same order from the same save, so they settle on the same carrier.
-    static bool findBagCarrier(GameWorld* gw, unsigned int out[5]) {
-        EntityState sq[32];
-        unsigned int n = engine::captureSquad(gw, /*leaderOnly*/ false, sq, 32);
-        for (unsigned int i = 0; i < n; ++i) {
-            unsigned int h[5] = { sq[i].hType, sq[i].hContainer, sq[i].hContainerSerial,
-                                  sq[i].hIndex, sq[i].hSerial };
-            InvItemEntry ent[INV_ITEMS_MAX];
-            unsigned int ni = engine::captureContainerContents(gw, h, ent, INV_ITEMS_MAX, 0);
-            for (unsigned int k = 0; k < ni; ++k) {
-                if (!engine::isContainerItemType(ent[k].itemType)) continue;
-                for (int j = 0; j < 5; ++j) out[j] = h[j];
-                return true;
-            }
-        }
-        return false;
-    }
-
-    bool          passed_, have_, isHost_;
-    unsigned int  type_;
-    int           step_;
-    int           added_;
-    int           nestedBase_, nestedPeak_, nestedFinal_;
-    unsigned long lastLogMs_;
-    unsigned int  hand_[5];
-    char          sid_[48];
-};
-
 // world_item_burst (W1 batch overflow): drop SEVERAL non-gear items in ONE tick, more than the
 // per-tick send batch holds (shrunk by KENSHICOOP_WI_BATCH_MAX so a test can reach it at all).
 // The overflow used to be marked as sent without being sent, so the tail of a burst stayed
@@ -1128,7 +1011,6 @@ const float WorldItemBurstScenario::RADIUS = 60.0f;
 Scenario* makeWorldItemScenario(const std::string& name) {
     if (name == "drop_probe")   return new DropProbeScenario();
     if (name == "world_item_burst") return new WorldItemBurstScenario();
-    if (name == "inv_nested_bag")   return new InvNestedBagScenario();
     if (name == "world_item_sync") return new WorldItemSyncScenario();
     if (name == "world_item_drop") return new WorldItemDropScenario();
     if (name == "world_item_join") return new WorldItemSyncScenario(/*joinAuthor*/ true);

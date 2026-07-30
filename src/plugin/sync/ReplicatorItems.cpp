@@ -79,8 +79,11 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
         if (engine::resolveObjectByHand(cHand) == 0) continue;
         u32 hash = 0;
         bool trunc = false;
+        // includeNested (protocol 48): the ONLY capture that wants a worn container's own
+        // contents, because this snapshot is what tells the peer where a bagged item lives.
+        // Every other reader leaves it off - a nested entry describes a different inventory.
         unsigned int n = engine::captureContainerContents(gw, cHand, items, INV_ITEMS_MAX,
-                                                          &hash, &trunc);
+                                                          &hash, &trunc, /*includeNested=*/true);
         // Total UNITS across the capture: the removal-settle signal (see InvPub).
         unsigned int units = 0;
         for (unsigned int ui = 0; ui < n; ++ui)

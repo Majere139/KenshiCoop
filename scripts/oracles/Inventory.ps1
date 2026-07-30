@@ -950,52 +950,81 @@ function Test-GearRepickup {
 # the fixture's own contents with nothing having crossed the wire.
 function Test-NestedBag {
     param([string]$HostFile, [string]$JoinFile)
-    $rx = "NEST verdict role=(host|join) pass=(\d+) sid='([^']*)' want=(-?\d+) added=(-?\d+) base=(-?\d+) inBag=(-?\d+) delta=(-?\d+) peak=(-?\d+)"
+    $rx = "NEST verdict role=(host|join) pass=(\d+) sid='([^']*)' bags=(-?\d+) minted=(-?\d+) want='([^']*)' base='([^']*)' inBags='([^']*)' delta='([^']*)' total=(-?\d+)"
     $read = {
         param($file, $role)
-        $r = [pscustomobject]@{ found = $false; pass = $false; sid = ''; want = 0
-                                added = -1; base = -1; inBag = -1; delta = -1 }
+        $r = [pscustomobject]@{ found = $false; pass = $false; sid = ''; bags = -1; minted = -1
+                                want = ''; base = ''; inBags = ''; delta = ''; total = 0 }
         if (-not (Test-Path $file)) { return $r }
         $m = Select-String -Path $file -Pattern $rx -ErrorAction SilentlyContinue |
              Where-Object { $_.Matches[0].Groups[1].Value -eq $role } | Select-Object -Last 1
         if ($null -eq $m) { return $r }
         $g = $m.Matches[0].Groups
         $r.found = $true; $r.pass = ([int]$g[2].Value -eq 1); $r.sid = $g[3].Value
-        $r.want = [int]$g[4].Value; $r.added = [int]$g[5].Value; $r.base = [int]$g[6].Value
-        $r.inBag = [int]$g[7].Value; $r.delta = [int]$g[8].Value
+        $r.bags = [int]$g[4].Value; $r.minted = [int]$g[5].Value
+        $r.want = $g[6].Value; $r.base = $g[7].Value; $r.inBags = $g[8].Value
+        $r.delta = $g[9].Value; $r.total = [int]$g[10].Value
         return $r
     }
     $h = & $read $HostFile 'host'
     $j = & $read $JoinFile 'join'
-    if (-not $h.found) { Write-Host "  NESTED-BAG [host] FAIL - no NEST verdict" }
-    else {
-        Write-Host ("  NESTED-BAG [host] " + $(if ($h.pass) { "PASS" } else { "FAIL" }) +
-                    " - author put $($h.want)x '$($h.sid)' in the bag (added=$($h.added) base=$($h.base) inBag=$($h.inBag) delta=$($h.delta))")
-        if ($h.added -lt $h.want) {
-            Write-Host "    NOTE: the author never got the item into the bag, so the join had nothing to converge to - this is a setup failure, not a sync result"
+    foreach ($side in @(@('host', $h), @('join', $j))) {
+        $role = $side[0]; $s = $side[1]
+        if (-not $s.found) { Write-Host "  NESTED-BAG [$role] FAIL - no NEST verdict"; continue }
+        Write-Host ("  NESTED-BAG [$role] " + $(if ($s.pass) { "PASS" } else { "FAIL" }) +
+                    " - bags=$($s.bags) per-bag gain of '$($s.sid)' was '$($s.delta)', wanted '$($s.want)' (base '$($s.base)' -> '$($s.inBags)')")
+        if ($s.bags -eq 1) {
+            Write-Host "    NOTE: one container on the carrier ($role minted=$($s.minted)); Kenshi refuses a spare bag inside the worn bag, so the same-template collapse is not reachable here and only the placement is under test"
+        } elseif ($s.delta -eq '0,0') {
+            Write-Host "    NOTE: nothing reached a bag on this side - a worn container's contents are described by the snapshot only if the capture walks into it"
+        } elseif ($s.delta -ne $s.want) {
+            Write-Host "    NOTE: the gain landed in the wrong distribution - both parents' contents collapsing into one bag looks exactly like this"
         }
     }
-    if (-not $j.found) { Write-Host "  NESTED-BAG [join] FAIL - no NEST verdict" }
-    else {
-        Write-Host ("  NESTED-BAG [join] " + $(if ($j.pass) { "PASS" } else { "FAIL" }) +
-                    " - peer's bag gained $($j.delta) (want=$($j.want) base=$($j.base) inBag=$($j.inBag))")
-        if ($j.base -lt 0) {
-            Write-Host "    NOTE: the join found no container at all on that character, so nothing could be nested"
-        } elseif ($j.delta -eq 0) {
-            Write-Host "    NOTE: the bagged item never reached the peer's bag - a worn container's contents are described by the snapshot only if readInvItems walks into it"
-        } elseif ($j.delta -gt $j.want) {
-            Write-Host "    NOTE: the peer's bag gained MORE than was placed - the nested entries were applied twice (once nested, once at top level)"
-        }
+    if ($h.found -and $j.found -and $h.inBags -ne $j.inBags) {
+        Write-Host "    NOTE: host holds '$($h.inBags)' but the join holds '$($j.inBags)' (bag order may differ between clients; the per-bag gain is what must match)"
     }
     $skip = (Test-Path $JoinFile) -and (Select-String -Path $JoinFile -Pattern '\[recon\] NESTED-SKIP' -Quiet)
     Write-Host "  NESTED-BAG trace: join skipped a nested apply for a missing container=$skip"
     $ok = $h.found -and $j.found -and $h.pass -and $j.pass
+
+    # CHURN: the TOP-LEVEL reconcile must never judge a bagged item to be a surplus of the
+    # CHARACTER's own inventory. The count delta alone cannot see this - destroying an item and
+    # recreating it satisfies the delta, which is how this gate first passed over the bug. The
+    # signature is the reconcile's own group line: it wants zero of the probe at the top level
+    # while its local read reports some, which only happens if the read walked into the bag.
+    # That is a removal aimed at a foreign Inventory, once per apply tick.
+    $grpRx = "\[recon\] grp type=\d+ sid='([^']*)' desire\(eq=(-?\d+),loose=(-?\d+)\) cur\(eq=(-?\d+),loose=(-?\d+)\)"
+    $grpLines = @()
+    if (Test-Path $JoinFile) {
+        $grpLines = @(Select-String -Path $JoinFile -Pattern $grpRx -ErrorAction SilentlyContinue)
+    }
+    if ($grpLines.Count -eq 0) {
+        Write-Host "  NESTED-BAG FAIL - no '[recon] grp' lines in the join log, so the churn check could not run (this scenario's manifest sets KENSHICOOP_INV_DUMP=1; without it the gate is blind to a destroy/recreate loop)"
+        $ok = $false
+        $churn = -1
+    } else {
+        $churn = 0
+        foreach ($m in $grpLines) {
+            $g = $m.Matches[0].Groups
+            if ($g[1].Value -ne $j.sid) { continue }
+            $desired = [int]$g[2].Value + [int]$g[3].Value
+            $current = [int]$g[4].Value + [int]$g[5].Value
+            if ($desired -eq 0 -and $current -gt 0) { $churn++ }
+        }
+        Write-Host "  NESTED-BAG trace: top-level passes judging the bagged probe a surplus=$churn"
+        if ($churn -gt 0) {
+            Write-Host "    NOTE: the top-level reconcile counted the bag's contents as the character's own and ran a removal against the wrong Inventory - the delta still converges because the nested pass puts them back, so only this check sees it"
+            $ok = $false
+        }
+    }
     Write-Host ("  NESTED-BAG " + $(if ($ok) { "PASS" } else { "FAIL" }))
     return (Add-GateResult -Name "nested_bag" -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
                 -Metrics @{ hostOk = $h.pass; joinOk = $j.pass; want = $j.want
-                            hostAdded = $h.added; hostBase = $h.base; hostInBag = $h.inBag
-                            joinBase = $j.base; joinInBag = $j.inBag; joinDelta = $j.delta
-                            nestedSkip = $skip })
+                            bags = $j.bags; hostDelta = $h.delta; joinDelta = $j.delta
+                            hostInBags = $h.inBags; joinInBags = $j.inBags
+                            joinBase = $j.base; joinTotal = $j.total
+                            nestedSkip = $skip; topLevelChurn = $churn })
 }
 
 function Test-WorldItemBurst {

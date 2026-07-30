@@ -64,9 +64,16 @@ void fillItemProvenance(Item* it, InvItemEntry& e) {
 // When *outTruncated is provided it is set true if any qualifying item did NOT fit in
 // out[] - the caller must then treat the result as an INCOMPLETE description of the
 // container and never let a reconcile delete against it (see applyContainerContents).
+//
+// includeNested (protocol 48) additionally appends what worn CONTAINERS hold, each tagged
+// with parentIdx. It is OFF by default and only the inventory PUBLISHER turns it on, because
+// a nested entry does not describe THIS inventory: a caller that counts or reconciles against
+// the result would read a bagged item as a loose one. That mistake is not theoretical - the
+// top-level reconcile did exactly that, saw every bagged item as surplus, and ran a removal
+// for it against the wrong Inventory on every single apply.
 // External linkage (EngineInternal.h): the world TU's vendor probe shares it.
 unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
-                          unsigned int maxOut, bool* outTruncated) {
+                          unsigned int maxOut, bool* outTruncated, bool includeNested) {
     if (outTruncated) *outTruncated = false;
     if (!inv || !out || maxOut == 0) return 0;
     unsigned int n = 0;
@@ -223,7 +230,22 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
     // items themselves were captured above, so this scans a snapshot of the count taken BEFORE
     // appending - `nTop` - or it would walk its own output.
     const unsigned int nTop = (n < MIRROR_MAX) ? n : MIRROR_MAX;
-    if (g_getSectionsFn) {
+    if (includeNested && g_getSectionsFn) {
+        // Nested contents come LAST, so on a full inventory they are the part the cap cuts -
+        // and then a bag's contents replicate not at all, which looks exactly like the bug this
+        // capture exists to fix. Truncation itself is handled (the reconcile degrades to
+        // additive-only); say it once per session so it is not a mystery.
+        if (n >= maxOut) {
+            static bool told = false;
+            if (!told) {
+                told = true;
+                char b[220]; _snprintf(b, sizeof(b) - 1,
+                    "[inv] NESTED-CAPPED: the top level already filled the %u-entry snapshot, so "
+                    "no container contents fit. Bagged items will not replicate for this "
+                    "character until it carries less.", maxOut);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
         for (unsigned int p = 0; p < nTop && n < maxOut; ++p) {
             Item* parent = mine[p];
             if (!parent) continue;
@@ -502,7 +524,8 @@ int correctWeaponSlot(Inventory* inv, const char* sid, unsigned int type,
 
 unsigned int captureContainerContents(GameWorld* gw, const unsigned int cHand[5],
                                       InvItemEntry* out, unsigned int maxOut,
-                                      unsigned int* outHash, bool* outTruncated) {
+                                      unsigned int* outHash, bool* outTruncated,
+                                      bool includeNested) {
     if (outHash) *outHash = 0;
     if (outTruncated) *outTruncated = false;
     if (!gw || !out || maxOut == 0) return 0;
@@ -510,7 +533,7 @@ unsigned int captureContainerContents(GameWorld* gw, const unsigned int cHand[5]
     if (!ro) return 0;
     Inventory* inv = invOf(ro);
     if (!inv) return 0;
-    unsigned int n = readInvItems(inv, out, 0, maxOut, outTruncated);
+    unsigned int n = readInvItems(inv, out, 0, maxOut, outTruncated, includeNested);
     if (outHash) {
         unsigned int h = 0;
         for (unsigned int i = 0; i < n; ++i) h += invEntryHash(out[i]);
@@ -722,9 +745,12 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
 }
 
 namespace {
-// The private Inventory of the first CONTAINER item held at cHand (a worn backpack), or 0.
+// The private Inventory of the CONTAINER item held at cHand at position `which` in carry
+// order (0 = the first one), or 0 when the character carries fewer than which+1 containers.
+// The read is top-level by default, so every entry examined here is genuinely this
+// character's own - a nested entry would describe a bag's contents, not a bag.
 // Caller holds SEH via the public wrappers below.
-Inventory* nestedInventoryOf(GameWorld* gw, const unsigned int cHand[5]) {
+Inventory* nestedInventoryOf(GameWorld* gw, const unsigned int cHand[5], unsigned int which) {
     if (!gw) return 0;
     RootObject* ro = resolveObjectByHand(cHand);
     if (!ro) return 0;
@@ -733,42 +759,71 @@ Inventory* nestedInventoryOf(GameWorld* gw, const unsigned int cHand[5]) {
     InvItemEntry cur[INV_ITEMS_MAX];
     Item* curItems[INV_ITEMS_MAX];
     unsigned int n = readInvItems(inv, cur, curItems, INV_ITEMS_MAX, 0);
+    unsigned int seen = 0;
     for (unsigned int i = 0; i < n; ++i) {
-        if (!curItems[i] || cur[i].parentIdx != 0) continue;
+        if (!curItems[i]) continue;
         Inventory* sub = 0;
         __try { sub = curItems[i]->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { sub = 0; }
-        if (sub && sub != inv) return sub;
+        if (!sub || sub == inv) continue;
+        if (seen == which) return sub;
+        ++seen;
     }
     return 0;
 }
 } // namespace
 
+// SEH-guarded: how many CONTAINERS the character at cHand carries (worn or loose). The
+// two-bag gate needs this to tell "the second bag is not here" apart from "it is here and
+// empty" - and same-template bags are exactly the case the apply side can confuse.
+int nestedContainerCount(GameWorld* gw, const unsigned int cHand[5]) {
+    if (!gw) return -1;
+    int total = -1;
+    __try {
+        RootObject* ro = resolveObjectByHand(cHand);
+        if (!ro) return -1;
+        Inventory* inv = invOf(ro);
+        if (!inv) return -1;
+        InvItemEntry cur[INV_ITEMS_MAX];
+        Item* curItems[INV_ITEMS_MAX];
+        unsigned int n = readInvItems(inv, cur, curItems, INV_ITEMS_MAX, 0);
+        total = 0;
+        for (unsigned int i = 0; i < n; ++i) {
+            if (!curItems[i]) continue;
+            Inventory* sub = 0;
+            __try { sub = curItems[i]->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { sub = 0; }
+            if (sub && sub != inv) ++total;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { total = -1; }
+    return total;
+}
+
 // SEH-guarded: put `qty` of (sid,type) INSIDE the container the character at cHand carries
 // (its worn backpack's private inventory), not merely into the character's own grid. The
 // nested-contents gate needs to create exactly the state a player creates by dragging
-// something into their bag, and no other primitive can reach that inventory.
+// something into their bag, and no other primitive can reach that inventory. `which` selects
+// among several carried containers in carry order.
 int addItemToNestedContainer(GameWorld* gw, const unsigned int cHand[5], const char* sid,
-                             unsigned int typeCat, int qty) {
+                             unsigned int typeCat, int qty, unsigned int which) {
     if (!gw || !sid || !sid[0] || qty <= 0) return 0;
     int added = 0;
     __try {
-        Inventory* sub = nestedInventoryOf(gw, cHand);
+        Inventory* sub = nestedInventoryOf(gw, cHand, which);
         if (!sub) return 0;
         if (createItemAndAdd(gw, sub, sid, typeCat, qty, 0, /*equip=*/false)) added = qty;
     } __except (EXCEPTION_EXECUTE_HANDLER) { added = 0; }
     return added;
 }
 
-// SEH-guarded: how many of (sid,type) sit INSIDE the carried container (summed quantities).
-// -1 when the character holds no container at all, so a gate can tell "the bag is not here"
-// apart from "the bag is here and empty" - the difference between an unfinished relocation and
-// lost contents.
+// SEH-guarded: how many of (sid,type) sit INSIDE the carried container `which` (summed
+// quantities). -1 when the character holds no such container, so a gate can tell "the bag is
+// not here" apart from "the bag is here and empty" - the difference between an unfinished
+// relocation and lost contents.
 int countInNestedContainer(GameWorld* gw, const unsigned int cHand[5], const char* sid,
-                           unsigned int typeCat) {
+                           unsigned int typeCat, unsigned int which) {
     if (!gw || !sid || !sid[0]) return -1;
     int total = -1;
     __try {
-        Inventory* sub = nestedInventoryOf(gw, cHand);
+        Inventory* sub = nestedInventoryOf(gw, cHand, which);
         if (!sub) return -1;
         InvItemEntry ent[INV_ITEMS_MAX];
         unsigned int n = readInvItems(sub, ent, 0, INV_ITEMS_MAX, 0);
@@ -800,14 +855,14 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
     InvItemEntry top[INV_ITEMS_MAX];
     unsigned char topSrcIdx[INV_ITEMS_MAX]; // original index, so children can find their parent
     unsigned int nTop = 0;
-    bool anyNested = false;
+    unsigned int nNested = 0;
     for (unsigned int i = 0; i < count && nTop < INV_ITEMS_MAX; ++i) {
-        if (items[i].parentIdx != 0) { anyNested = true; continue; }
+        if (items[i].parentIdx != 0) { ++nNested; continue; }
         topSrcIdx[nTop] = (unsigned char)i;
         top[nTop++] = items[i];
     }
     bool changed = applyToInventory(gw, inv, nTop ? top : 0, nTop, truncated);
-    if (!anyNested) return changed;
+    if (nNested == 0) return changed;
 
     // Re-read AFTER the top-level pass: it may have created or moved the very bag we are about
     // to fill, and a bag identified from the stale read would be the wrong object (or gone).
@@ -818,6 +873,14 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
     static int dbg = -1;
     if (dbg < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dbg = (e && e[0] == '1') ? 1 : 0; }
 
+    // Containers already reconciled in this pass. Two bags of the SAME template are otherwise
+    // indistinguishable by (sid,type), and a plain first-match rule pointed BOTH parents'
+    // contents at whichever we happened to read first: the second apply reconciled away what
+    // the first had just placed, and the other bag was never reconciled at all.
+    Inventory* used[INV_ITEMS_MAX];
+    unsigned int nUsed = 0;
+    unsigned int claimed = 0; // nested entries some parent accounted for
+
     for (unsigned int t = 0; t < nTop; ++t) {
         // Gather this parent's children. The wire names the parent by its index in the
         // ORIGINAL entry array, which survives the split via topSrcIdx.
@@ -826,19 +889,48 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
         for (unsigned int i = 0; i < count && nk < INV_ITEMS_MAX; ++i)
             if (items[i].parentIdx == (unsigned char)(topSrcIdx[t] + 1)) kids[nk++] = items[i];
         if (nk == 0) continue;
+        claimed += nk;
 
-        // Find OUR copy of the bag. Only entries the local read reports as this same template
-        // qualify, and only one that actually owns an inventory - matching on template alone
-        // could hand us a same-sid item that is not the container.
-        Inventory* sub = 0;
-        for (unsigned int c = 0; c < ncur && !sub; ++c) {
+        // Which copy of this template is it, in the SENDER's order? The sender's Nth bag of a
+        // template binds to our Nth, so identical bags keep their own contents.
+        unsigned int rank = 0;
+        for (unsigned int u = 0; u < t; ++u)
+            if (top[u].itemType == top[t].itemType &&
+                strcmp(top[u].stringID, top[t].stringID) == 0) ++rank;
+
+        // OUR copies of that template, in local carry order. Only an entry that actually owns
+        // an inventory qualifies - matching on template alone could hand us a same-sid item
+        // that is not a container at all.
+        Inventory* cands[INV_ITEMS_MAX];
+        unsigned int ncand = 0;
+        for (unsigned int c = 0; c < ncur && ncand < INV_ITEMS_MAX; ++c) {
             if (cur[c].itemType != top[t].itemType) continue;
             if (strcmp(cur[c].stringID, top[t].stringID) != 0) continue;
             if (!curItems[c]) continue;
+            Inventory* s = 0;
             __try {
-                Inventory* s = curItems[c]->getInventory();
-                if (s && s != inv) sub = s;
-            } __except (EXCEPTION_EXECUTE_HANDLER) { sub = 0; }
+                s = curItems[c]->getInventory();
+            } __except (EXCEPTION_EXECUTE_HANDLER) { s = 0; }
+            if (s && s != inv) cands[ncand++] = s;
+        }
+        // Rank-aligned when we can, but NEVER a bag already reconciled this pass: our carry
+        // order need not match the sender's, and reconciling one bag against two different
+        // desired lists destroys the first list's items.
+        Inventory* sub = (rank < ncand) ? cands[rank] : 0;
+        for (unsigned int j = 0; j < nUsed; ++j) if (used[j] == sub) { sub = 0; break; }
+        if (!sub) {
+            for (unsigned int k = 0; k < ncand && !sub; ++k) {
+                bool taken = false;
+                for (unsigned int j = 0; j < nUsed; ++j) if (used[j] == cands[k]) { taken = true; break; }
+                if (!taken) sub = cands[k];
+            }
+            if (sub && ncand > 1) {
+                char b[220]; _snprintf(b, sizeof(b) - 1,
+                    "[recon] NESTED-REBIND sid='%s' type=%u rank=%u local=%u (carry order differs "
+                    "from the sender's; bound the first bag not already reconciled)",
+                    top[t].stringID, top[t].itemType, rank, ncand);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
         }
         if (!sub) {
             // The bag is not here (still relocating over the conservation channel, or this
@@ -851,10 +943,22 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             continue;
         }
-        if (dbg) { char b[200]; _snprintf(b, sizeof(b) - 1,
-            "[recon] NESTED sid='%s' type=%u kids=%u", top[t].stringID, top[t].itemType, nk);
+        if (nUsed < INV_ITEMS_MAX) used[nUsed++] = sub;
+        if (dbg) { char b[220]; _snprintf(b, sizeof(b) - 1,
+            "[recon] NESTED sid='%s' type=%u kids=%u rank=%u local=%u",
+            top[t].stringID, top[t].itemType, nk, rank, ncand);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
         if (applyToInventory(gw, sub, kids, nk, truncated)) changed = true;
+    }
+    // Nested entries no top-level entry claimed. Their parent reference points at nothing we
+    // can see, so they are reconciled NOWHERE - the same silent hole as a missing container,
+    // and worth the same noise (a mismatched sender/receiver split would show up here).
+    if (claimed < nNested) {
+        char b[220]; _snprintf(b, sizeof(b) - 1,
+            "[recon] NESTED-ORPHAN entries=%u (of %u nested; parentIdx names no top-level item "
+            "in this snapshot, so their contents are reconciled nowhere)",
+            nNested - claimed, nNested);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
     return changed;
 }

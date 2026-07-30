@@ -1881,6 +1881,195 @@ private:
 };
 const float InventoryRegearScenario::RADIUS = 60.0f;
 
+// inv_nested_bag (protocol 48): items placed INSIDE worn containers must land inside the PEER's
+// copy of the RIGHT container. A worn bag owns a private Inventory that no section of the
+// wearer's own inventory mentions, so a bagged item used to be described by no snapshot at all:
+// it existed for its author and nowhere else, and a bag that travelled arrived without its
+// contents. Two properties are asserted, because each one hides a different bug:
+//
+//  1) PLACE, not presence. The item must be IN the bag - landing it loose on the character
+//     would satisfy "the peer has it" while leaving the bag empty for the next relocation.
+//  2) The right bag, and only that bag - PER BAG, with a different quantity in each. Bags of
+//     the same template are indistinguishable by (sid,type), and the apply side used to point
+//     every parent's contents at whichever copy it read first: the second apply reconciled away
+//     what the first had just placed and the other bag was never reconciled at all. Comparing
+//     the per-bag deltas as a SORTED multiset catches that collapse without needing the two
+//     clients to agree on carry order.
+//
+//     The run TRIES to arrange two same-template bags (each client mints its own, since a
+//     fabricated container never replicates - an empty bag would swallow the contents it stood
+//     in for). Kenshi refuses: a character's loose storage IS its worn backpack, so a spare bag
+//     would be a bag inside a bag ("[mk] tryAddItem-fail ... type=46"). The multi-bag assertion
+//     therefore engages only where the engine allows several containers in one inventory; on a
+//     one-bag carrier the run still asserts (1), and `bags` in the verdict records which case
+//     was actually under test rather than leaving it to be guessed.
+//
+// Everything is measured as a DELTA against each side's own baseline: the probe is a common
+// template the fixture's bag may already hold, so an absolute count would pass on the save's
+// own contents with nothing having crossed the wire.
+class InvNestedBagScenario : public Scenario {
+public:
+    InvNestedBagScenario()
+        : passed_(false), have_(false), isHost_(false), type_(0), bagType_(0), step_(0),
+          bags_(0), minted_(0), lastLogMs_(0) {
+        for (int i = 0; i < 5; ++i) hand_[i] = 0;
+        sid_[0] = '\0'; bagSid_[0] = '\0';
+        for (int i = 0; i < BAGS_MAX; ++i) { base_[i] = -1; cur_[i] = -1; added_[i] = 0; }
+    }
+
+    virtual const char* name() const { return "inv_nested_bag"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        isHost_ = ctx.isHost;
+        // The bag carrier: whichever squad member actually carries a container. Both clients
+        // load the same save, so they resolve the SAME character and the same bag.
+        have_ = findBagCarrier(ctx.gw, hand_, bagSid_, sizeof(bagSid_), &bagType_);
+        engine::commonTestItemSid(ctx.gw, sid_, sizeof(sid_), &type_);
+        // TRY to mint a second container LOCALLY on both clients (each side arranging its own is
+        // the only way to put two identical bags in play, since a fabricated container never
+        // replicates). Kenshi normally refuses - a spare bag inside the worn bag - and then the
+        // run asserts the one-bag case; `minted` records which way it went.
+        if (have_ && bagSid_[0]) {
+            minted_ = engine::addItemsToContainerBySid(ctx.gw, hand_, bagSid_, bagType_, 1, 0, "", "");
+        }
+        bags_ = have_ ? engine::nestedContainerCount(ctx.gw, hand_) : -1;
+        if (bags_ > BAGS_MAX) bags_ = BAGS_MAX;
+        for (int b = 0; b < bags_; ++b)
+            base_[b] = engine::countInNestedContainer(ctx.gw, hand_, sid_, type_, (unsigned int)b);
+        char d[64]; distStr(base_, d, sizeof(d));
+        char b[300];
+        _snprintf(b, sizeof(b) - 1,
+            "SCENARIO NEST anchor host=%d have=%d hand=%u,%u,%u,%u,%u sid='%s' type=%u "
+            "bag='%s' bagType=%u minted=%d bags=%d base='%s'",
+            isHost_ ? 1 : 0, have_ ? 1 : 0, hand_[0], hand_[1], hand_[2], hand_[3], hand_[4],
+            sid_[0] ? sid_ : "(none)", type_, bagSid_[0] ? bagSid_ : "(none)", bagType_,
+            minted_, bags_, d);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        // HOST @8s: fill the two bags with DIFFERENT quantities. Late enough that both sides
+        // have seeded their inventory publishers, so this is a real edge rather than part of
+        // the initial convergence; different quantities make a collapse into one bag visible.
+        if (isHost_ && ready() && step_ == 0 && ctx.elapsedMs >= 8000) {
+            step_ = 1;
+            for (int b = 0; b < bags_ && b < (int)(sizeof(WANT) / sizeof(WANT[0])); ++b)
+                added_[b] = engine::addItemToNestedContainer(ctx.gw, hand_, sid_, type_,
+                                                             WANT[b], (unsigned int)b);
+            char d[64]; distStr(added_, d, sizeof(d));
+            char b[220];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO NEST ADD sid='%s' type=%u added='%s'",
+                      sid_, type_, d);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        if (ready() && (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0)) {
+            lastLogMs_ = ctx.elapsedMs;
+            for (int b = 0; b < bags_; ++b)
+                cur_[b] = engine::countInNestedContainer(ctx.gw, hand_, sid_, type_, (unsigned int)b);
+            char d[64]; distStr(cur_, d, sizeof(d));
+            char b[220];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO NEST %s t=%lu inBags='%s' bags=%d",
+                      isHost_ ? "HOST" : "JOIN", (unsigned long)ctx.elapsedMs, d, bags_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        unsigned long dur = isHost_ ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            // The per-bag deltas, SORTED: a multiset comparison needs no agreement between the
+            // clients about which bag is which, but still catches both groups landing in one.
+            int dl[BAGS_MAX];
+            int total = 0;
+            for (int b = 0; b < bags_; ++b) {
+                dl[b] = (cur_[b] >= 0 && base_[b] >= 0) ? (cur_[b] - base_[b]) : -999;
+                total += dl[b];
+            }
+            sortAsc(dl, bags_);
+            char dd[64]; distStrN(dl, bags_, dd, sizeof(dd));
+            char wd[64];
+            { int w[BAGS_MAX]; for (int b = 0; b < bags_; ++b) w[b] = WANT[b];
+              sortAsc(w, bags_); distStrN(w, bags_, wd, sizeof(wd)); }
+            bool converged = ready() && (strcmp(dd, wd) == 0);
+            // The host must also prove it performed every placement: a failed setup would
+            // otherwise leave both sides equal and read as convergence.
+            bool authored = true;
+            for (int b = 0; b < bags_; ++b) if (added_[b] != WANT[b]) authored = false;
+            passed_ = isHost_ ? (converged && authored) : converged;
+            char cd[64]; distStr(cur_, cd, sizeof(cd));
+            char bd[64]; distStr(base_, bd, sizeof(bd));
+            char b[340];
+            _snprintf(b, sizeof(b) - 1,
+                "SCENARIO NEST verdict role=%s pass=%d sid='%s' bags=%d minted=%d want='%s' "
+                "base='%s' inBags='%s' delta='%s' total=%d",
+                isHost_ ? "host" : "join", passed_ ? 1 : 0, sid_[0] ? sid_ : "(none)",
+                bags_, minted_, wd, bd, cd, dd, total);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    enum { BAGS_MAX = 4 };
+    static const int           WANT[2];          // per-bag placements (deliberately unequal)
+    static const unsigned long HOST_DURATION_MS = 30000;
+    static const unsigned long JOIN_DURATION_MS = 28000;
+
+    // At least one container and a probe template to put in it, or there is nothing to assert.
+    bool ready() const { return have_ && sid_[0] && bags_ >= 1; }
+
+    static void sortAsc(int* a, int n) {
+        for (int i = 1; i < n; ++i)
+            for (int j = i; j > 0 && a[j] < a[j - 1]; --j) { int t = a[j]; a[j] = a[j - 1]; a[j - 1] = t; }
+    }
+    void distStr(const int* a, char* out, unsigned int len) const { distStrN(a, bags_, out, len); }
+    static void distStrN(const int* a, int n, char* out, unsigned int len) {
+        out[0] = '\0';
+        for (int i = 0; i < n; ++i) {
+            char one[24];
+            _snprintf(one, sizeof(one) - 1, (i == 0) ? "%d" : ",%d", a[i]);
+            one[sizeof(one) - 1] = '\0';
+            if (strlen(out) + strlen(one) + 1 >= len) break;
+            strcat(out, one);
+        }
+    }
+
+    // First player character carrying a CONTAINER, plus that container's template. Both
+    // clients walk the squad in the same order from the same save, so they agree on it.
+    static bool findBagCarrier(GameWorld* gw, unsigned int out[5], char* outSid,
+                               unsigned int outLen, unsigned int* outType) {
+        EntityState sq[32];
+        unsigned int n = engine::captureSquad(gw, /*leaderOnly*/ false, sq, 32);
+        for (unsigned int i = 0; i < n; ++i) {
+            unsigned int h[5] = { sq[i].hType, sq[i].hContainer, sq[i].hContainerSerial,
+                                  sq[i].hIndex, sq[i].hSerial };
+            InvItemEntry ent[INV_ITEMS_MAX];
+            unsigned int ni = engine::captureContainerContents(gw, h, ent, INV_ITEMS_MAX, 0);
+            for (unsigned int k = 0; k < ni; ++k) {
+                if (!engine::isContainerItemType(ent[k].itemType)) continue;
+                for (int j = 0; j < 5; ++j) out[j] = h[j];
+                strncpy(outSid, ent[k].stringID, outLen - 1); outSid[outLen - 1] = '\0';
+                if (outType) *outType = ent[k].itemType;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool          passed_, have_, isHost_;
+    unsigned int  type_, bagType_;
+    int           step_;
+    int           bags_, minted_;
+    int           base_[BAGS_MAX], cur_[BAGS_MAX], added_[BAGS_MAX];
+    unsigned long lastLogMs_;
+    unsigned int  hand_[5];
+    char          sid_[48];
+    char          bagSid_[48];
+};
+const int InvNestedBagScenario::WANT[2] = { 2, 1 };
+
 Scenario* makeInventoryScenario(const std::string& name) {
     // Same scenario twice: the plain run proves the round trip converges, and the
     // _refuse run drives it with the first re-home refused (KENSHICOOP_WD_REFUSE_REHOME),
@@ -1897,6 +2086,7 @@ Scenario* makeInventoryScenario(const std::string& name) {
     // picked-up item stayed on the other side's ground, and the only exit is the site-anchored
     // recovery (re-home a same-sid free ground item at the pickup location).
     if (name == "inv_regear_forget")      return new InventoryRegearScenario("inv_regear_forget");
+    if (name == "inv_nested_bag") return new InvNestedBagScenario();
     if (name == "inv_order")    return new InventorySyncScenario();
     if (name == "inv_overflow") return new InventoryOverflowScenario();
     if (name == "inv_dropfull") return new InventoryDropFullScenario();
