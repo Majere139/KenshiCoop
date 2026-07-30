@@ -184,20 +184,52 @@ const unsigned long STEALTH_RESEND_MS = 2000; // unchanged-map safety resend (un
 const unsigned int  TRUST_STREAK_FRAMES = 150;  // sustained agreement before trusting
 const float         TRUST_DRIFT_MAX     = 4.0f; // trusted body must stay this close
 
+// Absolute ceiling on how long publishInventories will hold a container's snapshot while
+// the W2 gear census adjudicates a drop (see Replicator::wdPendingDrop). The census retry
+// budget is frame-denominated AND re-armable by xferPendingLoss, so it can cycle for as long
+// as the transfer detector keeps an unresolved loss - without this cap a single unresolved
+// gear decrease starves the peer's view of that bag indefinitely.
+const unsigned long WD_HOLD_MAX_MS = 1500;
+
+// Consecutive ZERO-ROW container reads before an EMPTY gear baseline is accepted. A
+// container that is merely still resolving fills in within a tick or two; one that is
+// genuinely empty never does, and must eventually get a baseline or its owner's first
+// pickup is never detected. Committing the FIRST zero read was what produced the burst
+// of identity-less PICKUP intents at connect.
+const unsigned int  WD_EMPTY_SEED_TICKS = 5;
+
+// How long the author keeps retrying a FAILED conservation re-home (peer picked our
+// dropped gear up, but our own bag refused the object - occupied equip slot, no room,
+// container still resolving) before it may resolve the split by destroying its ground
+// copy. Only ever destroys after SEEING the item in the target container, so the item
+// cannot be lost; the cap exists so a permanently-refusing bag does not leave a
+// duplicate lying around forever.
+const unsigned long WD_REHOME_MAX_MS = 8000;
+
+// Consecutive ticks a tracked ground object must fail to read as a free ground item before
+// its track is retired. Forgetting a track that is actually still on the ground is the
+// expensive mistake - the author then has no answer for the peer's pickup and its copy stays
+// there forever - so the read has to agree with itself first.
+const unsigned int  WD_DEAD_READS_MAX = 3;
+
+// Radius for the LAST-RESORT spatial re-home: an identified pickup arrived for a drop we no
+// longer have tracked, so the object is found by (sid,type) near the picking character
+// instead. Only ever used for an intent that NAMES a drop, never for an identity-less one.
+const float         WD_REHOME_SCAN_R = 60.0f;
+
 float dist3(float ax, float ay, float az, float bx, float by, float bz) {
     float dx = ax - bx, dy = ay - by, dz = az - bz;
     return std::sqrt(dx * dx + dy * dy + dz * dz);
 }
 
 
-// Conservation channel item types. itemType 2 = WEAPON and 3 = ARMOUR/clothing.
-// Both are non-stackable EQUIPPABLE gear, so each unit is a distinct
-// object the peer already mirrors (weapons via shared save; armour also reconstructed by inv
-// sync) - the real object can be relocated bag<->ground on every client and re-homed on pickup
-// WITHOUT fabrication. The W1 host-authored proxy stream handles everything else (stacks, loot)
-// and skips these. Routing gear through conservation also fixes a host-dropped item lingering
-// on the host ground after the JOIN picks it up (the W1 cull only removes the join's proxy).
-inline bool isGearType(unsigned int t) { return t == 2u || t == 3u; }
+// Conservation channel item types - see engine::isConservedItemType for the
+// definition and rationale. It lives in the engine layer because the engine's
+// own capture (captureWeaponPtrs) applies the SAME gate, and the two copies
+// drifted: the engine list omitted the worn container (46), so dropping a
+// backpack authored no relocate intent while the inventory snapshot still
+// authored a REMOVE - the peer destroyed its backpack with no ground copy.
+inline bool isGearType(unsigned int t) { return engine::isConservedItemType(t); }
 } // namespace
 
 } // namespace coop

@@ -1344,6 +1344,28 @@
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'smoke'; WanVariant = $true
         }
+        # Protocol 46 item-loss regressions. inv_overflow gates the container-overflow
+        # class (truncated snapshots used to read as authoritative deletes and wipe every
+        # item past the cap - the "backpacks lose items" report); inv_dropfull gates the
+        # W2 drop-vs-snapshot race that let a dropped weapon exist only on the dropper's
+        # ground. Both are smoke tier: they cover the two ways inventory silently lost
+        # items, so a regression must not wait for a full run to surface.
+        inv_overflow = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1' }
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'inv_overflow'
+            Gating   = @('inv_overflow', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'smoke'; WanVariant = $false
+        }
+        inv_dropfull = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'inv_dropfull'
+            Gating   = @('inv_dropfull', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'smoke'; WanVariant = $false
+        }
         inv_equip = @{
             DiagEnv = @{ KENSHICOOP_INV_SYNC = '1' }
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
@@ -1479,6 +1501,116 @@
             Gating   = @('armor_drop', 'clock_sync')
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'full'; WanVariant = $true
+        }
+        # Protocol 47. inv_backpack_drop is the third variant of the same conservation
+        # contract (itemType 46 = worn container): the peer must RELOCATE its backpack to
+        # the ground, never destroy it. Backpacks were excluded from the gear census, so the
+        # inventory snapshot's REMOVE ran with no drop intent to explain it and the peer's
+        # backpack - contents and all - was annihilated. Reuses the WDROP oracle.
+        # world_pickup_mirror gates the CLAIM half: a NON-gear item the peer picks up off
+        # the proxy stream must disappear from the AUTHOR's ground too, instead of being
+        # duplicated. Both smoke tier - they are the two item-LOSS/DUPE classes the manual
+        # session surfaced, so a regression must not wait for a full run.
+        inv_backpack_drop = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
+            # squad2, NOT squad1: the gate needs a leader who WEARS a container, and squad1
+            # has none (it reads back have=0 and the scenario cannot author a drop at all).
+            Save = 'squad2'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'backpack_drop'
+            Gating   = @('backpack_drop', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'smoke'; WanVariant = $false
+        }
+        world_pickup_mirror = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'pickup_mirror'
+            Gating   = @('pickup_mirror', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'smoke'; WanVariant = $false
+        }
+        # inv_regear gates the W2 round trip's ONE-INSTANCE invariant: after the peer picks
+        # up gear WE dropped, the item is in its bag AND gone from our ground - the manual
+        # session's "a few items stayed on the host's ground" was the duplicate outcome.
+        # no_phantom_pickups rides along on the same logs: the gear census used to commit a
+        # still-resolving container's zero-row read as its baseline, so every worn item read
+        # as a pickup a tick later and fired an identity-less PICKUP intent at connect.
+        # Two tabs required (the host drops from tab 0, the join picks up into tab 1).
+        inv_regear = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'gear_repickup'
+            Gating   = @('gear_repickup', 'no_phantom_pickups', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'smoke'; WanVariant = $false
+        }
+        # Same round trip with the author's FIRST re-home refused. That is the case that
+        # used to strand the item in both places forever - the author tried once, off a
+        # cached pointer, and never revisited it. Now it retries and, once it can READ the
+        # item in the peer's bag, retires its own ground copy; the gate additionally
+        # requires evidence that this recovery ran (retry/dedupe), so a regression that
+        # quietly reverts to the single-shot re-home cannot pass by luck.
+        inv_regear_refuse = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1'
+                         KENSHICOOP_WD_REFUSE_REHOME = '1' }
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'gear_repickup_retry'
+            Gating   = @('gear_repickup_retry', 'no_phantom_pickups', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'smoke'; WanVariant = $false
+        }
+        # Every attempt refused, so the retry cannot save it either: the item can only reach
+        # the bag over the snapshot channel, after which the author retires its ground copy
+        # against a bag it has actually READ. That read is the whole safety argument for
+        # destroying anything, so it gets its own gate (full tier - smoke already covers the
+        # retry, and this one has to wait out WD_REHOME_MAX_MS).
+        inv_regear_refuse_all = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1'
+                         KENSHICOOP_WD_REFUSE_REHOME_ALL = '1' }
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'gear_repickup_dedupe'
+            Gating   = @('gear_repickup_dedupe', 'no_phantom_pickups', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+        # An item placed INSIDE a worn backpack. A bag owns a private inventory that no section
+        # of the wearer's own inventory names, so before protocol 48 a bagged item was described
+        # by no snapshot at all and only ever existed for the author - which is why dropping a
+        # bag handed the other side a bag missing its contents. squad2 carries the backpacks.
+        inv_nested_bag = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'
+                         KENSHICOOP_INV_DUMP = '1' }
+            Save = 'squad2'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'nested_bag'
+            Gating   = @('nested_bag', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'smoke'; WanVariant = $false
+        }
+        # A BURST of non-gear drops in one tick, overflowing the per-tick W1 send batch (shrunk
+        # to 2 so five drops reach it). The overflow used to be booked as sent without being
+        # sent, so the tail of the burst was invisible until the 5 s safety resend - the
+        # "dropped it here, never showed up there" report.
+        world_item_burst = @{
+            DiagEnv = @{ KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1'
+                         KENSHICOOP_WI_BATCH_MAX = '2' }
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'world_item_burst'
+            Gating   = @('world_item_burst', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'smoke'; WanVariant = $false
+        }
+        # The author FORGETS its ground track (KENSHICOOP_WD_FORGET_TRACK), so the peer's pickup
+        # names a drop it cannot match. Answering "untracked" and standing still is what left a
+        # picked-up item lying on the other side's ground; the run must instead converge through
+        # the site-anchored recovery. Smoke tier: this is the duplicate players actually hit.
+        inv_regear_forget = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1'
+                         KENSHICOOP_WD_FORGET_TRACK = '1' }
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'gear_repickup_recover'
+            Gating   = @('gear_repickup_recover', 'no_phantom_pickups', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'smoke'; WanVariant = $false
         }
 
         # ---- diagnostics (never in a tier) --------------------------------------------

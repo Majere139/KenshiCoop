@@ -24,7 +24,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 45;
+const u16 PROTOCOL_VERSION = 48;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -69,7 +69,8 @@ enum PacketType {
     PKT_INV_XFER         = 39,// RELIABLE cross-owner transfer intent (protocol 37); InvXferPacket
     PKT_RESEARCH         = 40,// RELIABLE host-authoritative known-research row (protocol 38); ResearchPacket
     PKT_CAM_HINT         = 41,// UNRELIABLE join camera center hint (protocol 43, join -> host); CamHintPacket
-    PKT_COMBAT_HIT       = 42 // RELIABLE join-dealt authoritative damage report (join -> host, protocol 45); CombatHitPacket
+    PKT_COMBAT_HIT       = 42,// RELIABLE join-dealt authoritative damage report (join -> host, protocol 45); CombatHitPacket
+    PKT_WORLD_ITEM_CLAIM = 43 // RELIABLE proxy-consumed notice (protocol 47); WorldItemClaimHeader
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -390,9 +391,17 @@ struct InvItemEntry {
     // for the lock state; a peer's local lockpick must not desync it (see the
     // non-owner unlock guard in ReplicatorDrive). Cage occupancy (IN_PRISON) masks
     // the chained furniture kind, so this rides the inventory snapshot as an
-    // occupancy-independent lock signal. lockReserved keeps `section` 2-byte aligned.
+    // occupancy-independent lock signal. parentIdx (below) keeps `section` 2-byte aligned.
     u8   locked;
-    u8   lockReserved; // reserved (0)
+    // PARENT REFERENCE (protocol 48): 0 = this item sits directly in the container being
+    // described; N > 0 = it is NESTED inside the item at index N-1 of this same entry array.
+    // A worn backpack does not extend its wearer's inventory - it owns a private Inventory
+    // (section 'backpack_content') that nothing in the wearer's own sections mentions, so a
+    // bagged item was described by no snapshot at all and simply did not exist for the peer:
+    // put something in a bag, drop the bag, and the other side picked up a bag without it.
+    // An index (rather than a sid) keeps two identical bags distinguishable and costs the byte
+    // that was already reserved here, so the entry size does not move.
+    u8   parentIdx;
     u16  section;    // hash of the equip SECTION name (0 = loose / none). Distinguishes
                      // the two weapon slots ('hip' vs 'back'), which share AttachSlot
                      // ATTACH_WEAPON and so are identical in `slot`; lets the peer place
@@ -422,6 +431,14 @@ struct InvSnapshotHeader {
     // map) and the receiver resolves through its own (peer key -> minted
     // local hand; own key -> own hand) - the PKT_PROD identity approach.
     u8  keyKind;
+    // Snapshot flags (protocol 46). INV_FLAG_TRUNCATED means the author's container
+    // did NOT fit in INV_ITEMS_MAX entries, so this list is an INCOMPLETE description:
+    // the receiver must reconcile ADDITIVE-ONLY (fill shortfalls, destroy nothing),
+    // because an absent entry means "unknown", not "gone". Before this flag existed a
+    // truncated snapshot read as an authoritative delete and wiped every item past the
+    // cap - the backpack item-loss bug (a backpack routinely pushes a character past
+    // the entry cap).
+    u8  flags;
     // container key (whose inventory; hand or placer key per keyKind)
     u32 cType;
     u32 cContainer;
@@ -431,11 +448,20 @@ struct InvSnapshotHeader {
     u8  count;   // number of InvItemEntry that follow
 };
 
+// InvSnapshotHeader::flags bits.
+const u8 INV_FLAG_TRUNCATED = 0x01;
+
 // A full snapshot ([header][InvItemEntry*count]) can now exceed one datagram (each entry
 // carries two 48-byte template ids), but inv snapshots ride the RELIABLE channel, which
 // ENet fragments + reassembles transparently. They are change-driven (rare), so the extra
-// bytes cost nothing in steady state. 20 worn+loose entries covers a squad member.
-const unsigned int INV_ITEMS_MAX = 20;
+// bytes cost nothing in steady state.
+//
+// Raised 20 -> 64 in protocol 46 to match the receiver's own read depth (MAXC in
+// applyContainerContents). At 20 a backpacked character overflowed constantly, and every
+// overflow was an item-loss event; 64 covers a realistically loaded squad member so
+// INV_FLAG_TRUNCATED becomes the rare fallback (big storage chests) rather than the
+// routine case. Bounded by the u8 `count` field (255).
+const unsigned int INV_ITEMS_MAX = 64;
 
 // ---- Phase W1: world-item (ground drop) snapshot ---------------------------
 // Generalizes the Phase 4a content-snapshot/reconcile model from CONTAINERS to the open
@@ -481,6 +507,25 @@ struct WorldItemRemoveHeader {
     u8  type;    // = PKT_WORLD_ITEM_REMOVE
     u32 ownerId; // authoring sender (culls are scoped to this owner's netId space)
     u8  count;   // number of u32 netIds that follow
+};
+
+// A world-item CLAIM is: [WorldItemClaimHeader][u32 netId * count] - the pickup mirror the
+// W1 stream lacked (protocol 47). W1 mirrors a drop by minting a template PROXY on the peer,
+// but nothing told the AUTHOR when that proxy was consumed: the author's cull is liveness-
+// based on its OWN real item, which is still lying on its ground, so it never fired. The peer
+// kept the item in its bag while the author kept a copy on the ground - a duplicate, and the
+// reported "join picked it up but the host still sees it there". Now the client that consumed
+// a proxy claims it, and the author destroys its real ground object (which emits the ordinary
+// PKT_WORLD_ITEM_REMOVE cull, so any third peer converges too).
+//
+// authorId scopes the netIds: they belong to the AUTHOR's netId space, not the claimer's.
+// v1 claims a WHOLE stack; a partial-stack pickup (take 3 of 10) needs quantity accounting
+// and still leaves the author's remainder on the ground.
+struct WorldItemClaimHeader {
+    u8  type;     // = PKT_WORLD_ITEM_CLAIM
+    u32 ownerId;  // the CLAIMING sender (who consumed the proxy)
+    u32 authorId; // the item's author (whose netId space the ids below belong to)
+    u8  count;    // number of u32 netIds that follow
 };
 
 // 16 * sizeof(WorldItemEntry)=1168 + header(6) stays under a 1400 B datagram.

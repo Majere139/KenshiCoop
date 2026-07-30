@@ -457,21 +457,40 @@ bool readObjectHand(RootObject* obj, unsigned int out[5]);
 // containerSerial, index, serial) to this machine's local RootObject*, or 0.
 RootObject* resolveObjectByHand(const unsigned int cHand[5]);
 
-// SEH-guarded: capture the LOOSE contents of the container identified by cHand into
-// out[] (up to maxOut), filling template stringID + itemType + quantity + quality
-// per item (equipped gear skipped in v1). *outHash receives an order-independent
+// SEH-guarded: capture the contents of the container identified by cHand into out[]
+// (up to maxOut), filling template stringID + itemType + quantity + quality per item.
+// EQUIPPED gear is captured FIRST, then loose items, so an overflowing container sheds
+// clutter rather than the irreplaceable worn kit. *outHash receives an order-independent
 // content fingerprint (0 == empty) so the caller only re-sends on real change.
+// *outTruncated (optional) is set when the container did not fit in maxOut - the result
+// is then an INCOMPLETE description and must not be reconciled against destructively.
 // Returns the number of item entries written.
 unsigned int captureContainerContents(GameWorld* gw, const unsigned int cHand[5],
                                       InvItemEntry* out, unsigned int maxOut,
-                                      unsigned int* outHash);
+                                      unsigned int* outHash, bool* outTruncated = 0);
 
 // SEH-guarded: reconcile the local container (cHand) to the desired item multiset:
 // add any shortfall (createItem of the template + tryAddItem) and remove any excess
 // (removeItemAutoDestroy), per (stringID, itemType) key. count==0 empties it.
+// When `truncated` is true the desired list is known to be an INCOMPLETE description
+// of the author's container, so the reconcile is ADDITIVE-ONLY: shortfalls are still
+// filled but nothing is ever destroyed (an absent entry means "unknown", not "gone").
 // Returns true if anything changed.
 bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
-                            const InvItemEntry* items, unsigned int count);
+                            const InvItemEntry* items, unsigned int count,
+                            bool truncated = false);
+
+// SEH-guarded (protocol 48): create `qty` of (sid,type) INSIDE the container the character at
+// cHand carries - a worn backpack's own private inventory, which is a different Inventory from
+// the character's and the only place a "bagged" item actually lives. Returns the number added.
+int addItemToNestedContainer(GameWorld* gw, const unsigned int cHand[5], const char* sid,
+                            unsigned int typeCat, int qty);
+
+// SEH-guarded (protocol 48): summed quantity of (sid,type) INSIDE the carried container.
+// Returns -1 when the character carries no container, so a caller can distinguish "the bag has
+// not arrived yet" from "the bag is here and the item is missing".
+int countInNestedContainer(GameWorld* gw, const unsigned int cHand[5], const char* sid,
+                           unsigned int typeCat);
 
 // 'inventory' setup scene (Phase 4a bake): spawn a save-stable storage container in
 // front of the leader and seed it with a couple of items, so both clients load an
@@ -588,9 +607,14 @@ int probeAddAnyToContainer(GameWorld* gw, const unsigned int cHand[5], int qty,
 // Returns the number dropped.
 // outLastDropped (optional): receives the Item* of the last item dropped (the now-grounded
 // object), so the conservation channel can track that real handle for a later pickup.
+// allowEquipped: also accept a WORN item as the victim, dropping it straight from its slot
+// to the ground. Off by default so existing callers keep the loose-only meaning. Needed for
+// a worn CONTAINER (backpack): unequip-to-loose cannot stage it first, because no loose
+// section has room for a bag that large, and the fallback add re-equips it - yet the UI
+// drags a worn backpack to the ground just fine, so dropItem accepts a worn item directly.
 int dropItemFromInventory(GameWorld* gw, const unsigned int cHand[5],
                           const char* sid, unsigned int typeCat, int qty,
-                          void** outLastDropped = 0);
+                          void** outLastDropped = 0, bool allowEquipped = false);
 
 // SEH-guarded DIAGNOSTIC: enumerate WEAPON/ARMOUR/ITEM/CONTAINER world objects near the
 // local leader and log each (itemType / sid / hand / pos), so we can characterize what a
@@ -648,12 +672,41 @@ bool installItemDropHook();
 // the number written.
 unsigned int drainItemDrops(ItemDropEdge* out, unsigned int maxOut);
 
+// ---- Conservation channel item types (single source of truth) --------------
+// itemType 2 = WEAPON, 3 = ARMOUR/clothing, 46 = worn CONTAINER (backpack). All
+// are non-stackable EQUIPPABLE gear, so each unit is a distinct object the peer
+// already mirrors via the shared save - the real object can be relocated
+// bag<->ground on every client and re-homed on pickup WITHOUT fabrication. The
+// W1 template-proxy stream handles everything else (stacks, loot) and skips
+// these. Defined here, in the engine layer, because BOTH the engine capture
+// (captureWeaponPtrs) and the Replicator census must agree; two copies of this
+// predicate drifted before and silently excluded backpacks from conservation.
+inline bool isConservedItemType(unsigned int t) {
+    return t == 2u || t == 3u || t == 46u;
+}
+
+// A worn CONTAINER (backpack) carries a NESTED inventory that no channel
+// replicates. Relocating the real object bag<->ground preserves those contents;
+// FABRICATING one from the template produces an EMPTY bag, so a fabrication
+// backstop must never fire for it (that trades a missing item for a silently
+// emptied backpack plus a duplicate). Callers that fabricate must check this.
+inline bool isContainerItemType(unsigned int t) { return t == 46u; }
+
 // Handle-based liveness of a tracked ground item (query-free cull): resolve the
 // item's local engine hand and return 1 if it is still a FREE ground item (it
 // exists AND is not inside an inventory), filling outPos[3] with its current
 // world position; return 0 if it is gone (destroyed) or has been picked up (now
 // in an inventory). Replaces the "vanished from the spatial scan" cull test.
 int groundItemLiveness(const unsigned int itemHand[5], float outPos[3]);
+
+// Object-level half of groundItemLiveness, for a ground item we hold only as a
+// pointer (a W1 proxy we spawned has no hand we recorded). Returns 1 while the
+// object is still a FREE ground item, filling outPos[3]; 0 once it is destroyed
+// or has entered an inventory. outPickedUp (optional) separates those two: true
+// ONLY when the object still reads but is now inside a bag, which is the single
+// case that licenses a W1 claim - claiming because a proxy was merely destroyed
+// would delete the author's real item for no reason.
+int groundObjectLiveness(RootObject* obj, float outPos[3], bool* outPickedUp);
 
 // SEH-guarded (join): spawn a LOCAL proxy ground item from the template (sid, typeCat) at
 // world position (x,y,z), so the join renders a host-dropped item where the host sees it.
@@ -711,6 +764,17 @@ int itemWorldPos(void* item, float out[3]);
 int relocateWeaponToGround(GameWorld* gw, const unsigned int ownerHand[5],
                            const char* sid, unsigned int typeCat,
                            float x, float y, float z, void** outDropped = 0);
+
+// SEH-guarded CONSERVATION BACKSTOP (Phase W2): relocateWeaponToGround found no local copy
+// to move, so rebuild the item from the drop intent's own provenance (quality/manufacturer/
+// material all ride WorldDropPacket) into the owner's bag and drop THAT. Heals the case
+// where the peer's copy was already destroyed - e.g. a bag snapshot that overtook the
+// intent. The caller must first confirm the owner hand resolves locally; weapon
+// fabrication still honours KENSHICOOP_WEAPON_FAB. Returns the number relocated.
+int fabricateWeaponToGround(GameWorld* gw, const unsigned int ownerHand[5],
+                            const char* sid, unsigned int typeCat, int qualityBucket,
+                            const char* manufacturer, const char* material,
+                            float x, float y, float z, void** outDropped = 0);
 
 // SEH-guarded (Phase W3): capture the WEAPON items the object at cHand holds, with their real
 // Item* handles, so the drop detector can track the exact dropped object for a later pickup.

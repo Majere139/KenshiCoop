@@ -202,15 +202,23 @@ public:
     // reuse a netId per item (keyed by its local engine hand), and queue a reliable
     // snapshot for new/changed items + a reliable cull for items that vanished. A settled
     // world produces no traffic (change-detected), with a slow periodic safety resend.
-    // Known carried-over W1 edge: non-gear proxies have no pickup intent - a pickup on
-    // the proxy side leaves the author's real item until the author's own next scan
-    // culls it (self-healing); gear rides the W2/W3 conservation intents instead.
+    // Also emits the protocol-47 CLAIM half: any proxy WE hold that has just entered a
+    // local bag is reported to its author, which then destroys its real ground copy. Before
+    // this, a non-gear pickup left the author's item lying there indefinitely (its own cull
+    // is liveness-based on that still-live object) - the item was duplicated, and the host
+    // "kept seeing" what the join had already picked up.
     void publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId);
 
     // AFTER engine (BOTH clients): drain received world-item snapshots/culls and
     // reconcile local proxies - spawn a proxy for a new (ownerId, netId), move it if it
     // changed, destroy it on cull. netId spaces are per-sender, culls owner-scoped.
     void applyWorldItems(GameWorld* gw, Inbound& in);
+
+    // AFTER engine (protocol 47, BOTH clients): drain received world-item CLAIMS - a peer
+    // consumed the proxy it held for one of OUR netIds, so destroy our real ground object
+    // and drop its track. Erasing the track makes the ordinary cull path announce the
+    // removal to any third peer, so everyone converges on the single surviving copy.
+    void applyWorldClaims(GameWorld* gw, Inbound& in, u32 localId);
 
     // BEFORE engine (Phase W2/W3, runs on EVERY client): diff each OWNED character's WEAPON
     // census. A sustained count DECREASE is a DROP (the weapon left the bag; we never mutate
@@ -233,6 +241,17 @@ public:
     // never acts on a character we own (we already picked it up locally). Runs BEFORE
     // applyInventories so the re-home beats the inventory reconcile.
     void applyWeaponPickups(GameWorld* gw, Inbound& in);
+
+    // BEFORE engine, every tick (Phase W3 convergence): keep groundedWeapons_ honest.
+    // Nothing used to prune it, so a cached ground Item* survived the object's despawn and
+    // a later re-home handed a dead pointer to the engine. Two jobs:
+    //   1) PRUNE tracks whose object no longer resolves as a free ground item. Nothing is
+    //      left on the ground, so there is nothing to duplicate.
+    //   2) RETRY a re-home that failed (bag refused the object) and, once past
+    //      WD_REHOME_MAX_MS, resolve the split - but ONLY after reading the item in the
+    //      target container, so the ground copy is destroyed strictly as a duplicate and
+    //      never as the last instance.
+    void reconcileGroundGear(GameWorld* gw);
 
     // BEFORE engine, after publishInventories (protocol 37, BOTH clients): detect a
     // COMPLETED cross-owner drag. Every tracked container (own + received) keeps a
@@ -1013,14 +1032,23 @@ private:
     //   to DESTROY a worn item it cannot refabricate (createItemAndAdd fails for weapons),
     //   losing it permanently. Settled states (the only ones a user actually rests at)
     //   still replicate, just ~one settle-window later.
-    // lastSentN = entry count of the last SENT snapshot. A capture with FEWER entries is a
-    //   REMOVAL (something left the inventory) and must settle far longer than an addition
-    //   or an equip<->loose MOVE (same count): mid-drag the cursor holds the item OUT of the
-    //   inventory for up to ~1 s, a transient "gone" the peer would act on by DESTROYING a
-    //   worn item it cannot refabricate. Equip/unequip-to-bag keep the count, so they still
-    //   replicate fast; only genuine removals (and the cursor flicker) wait.
-    struct InvPub { u32 hash; unsigned long lastSendMs; u32 pendingHash; unsigned long pendingSince; unsigned int lastSentN; };
-    struct InvRecv { u32 ownerId; std::vector<InvItemEntry> items; bool dirty; };
+    // lastSentN = entry count of the last SENT snapshot (retained for the log fields).
+    // lastSentUnits = total UNIT count (sum of stack quantities) of the last SENT snapshot.
+    //   A capture with FEWER units is a REMOVAL (something left the inventory) and must
+    //   settle far longer than an addition or an equip<->loose MOVE (same units): mid-drag
+    //   the cursor holds the item OUT of the inventory for up to ~1 s, a transient "gone"
+    //   the peer would act on by DESTROYING a worn item it cannot refabricate. Equip and
+    //   unequip-to-bag keep the unit total, so they still replicate fast; only genuine
+    //   removals (and the cursor flicker) wait.
+    //   Units rather than ENTRIES (protocol 46): the entry count is clamped at
+    //   INV_ITEMS_MAX, so a container sitting at the cap kept the SAME entry count across
+    //   a removal and silently took the fast path - which is what let a bag snapshot beat
+    //   the debounced W2 drop intent and lose the dropped item. Unit totals also catch a
+    //   partial-stack removal (drop 5 of 10), which never changed the entry count at all.
+    struct InvPub { u32 hash; unsigned long lastSendMs; u32 pendingHash; unsigned long pendingSince; unsigned int lastSentN; unsigned int lastSentUnits; };
+    // truncated (protocol 46): the author's container did not fit in INV_ITEMS_MAX, so
+    // `items` is an INCOMPLETE description - reconcile additive-only, never delete.
+    struct InvRecv { u32 ownerId; std::vector<InvItemEntry> items; bool dirty; bool truncated; };
     std::set<Key>          ownedContainers_;
     std::map<Key, InvPub>  invPub_;
     std::map<Key, InvRecv> invRecv_;
@@ -1076,11 +1104,30 @@ private:
     //   record the baseline without emitting a spurious drop). nextDropId_ hands out per-
     //   sender monotonic ids. appliedDrops_ dedupes received intents by (ownerId,dropId).
     struct WCensusItem { char manufacturer[48]; char material[48]; u16 quality; int count; unsigned int itemType; };
+    // NOTE the constructor. weaponCensus_[key] VALUE-initializes this struct, but because
+    // the std::map members make its implicit default constructor non-trivial, the C++03
+    // rules this toolchain follows do NOT zero the scalars first - `seeded` came up as
+    // whatever the allocator's memory held. A garbage TRUE meant the census skipped its
+    // baseline entirely and then read the character's whole worn kit as INCREASES, firing
+    // one identity-less PICKUP intent per gear item (and it fired again later in a session,
+    // as heap reuse made the garbage more likely). Zeroed pages hid this most of the time.
     struct WCensus {
+        WCensus() : seeded(false), zeroReads(0) {}
         std::map<std::string, WCensusItem> items;
         std::map<std::string, int>         retries; // per-sid ground-correlation retry budget
+        // Wall-clock ms at which each sid's retry budget was FIRST armed. The budget is
+        // frame-denominated and xferPendingLoss re-arms it, so it can cycle for as long as
+        // the transfer detector holds an unresolved loss (observed: 29->1->29 repeatedly).
+        // That is fine for the drop verdict itself, but wdPendingDrop gates the whole
+        // inventory snapshot on it, so the hold needs an absolute ceiling - see WD_HOLD_MAX_MS.
+        std::map<std::string, unsigned long> retryArmMs;
         std::map<std::string, std::deque<void*> > ptrs;        // current weapon Item* per sid
         bool seeded;
+        // Consecutive ZERO-ROW reads of this container. A zero-row read carries no
+        // information (mid-reload), so it is never committed as a baseline - but a
+        // genuinely empty character reads zero forever and still needs one, so an empty
+        // baseline is accepted only after the read REPEATS (WD_EMPTY_SEED_TICKS).
+        unsigned int zeroReads;
     };
     std::map<Key, WCensus>            weaponCensus_;
     u32                               nextDropId_;
@@ -1095,10 +1142,45 @@ private:
     //   re-home. This disambiguates two same-sid weapons on the ground (one dropped by each
     //   client): FIFO-by-sid would otherwise re-home the wrong copy on the peer.
     // nextPickupId_ hands out per-sender monotonic ids; appliedPickups_ dedupes received ones.
-    struct GroundWeapon { u32 dropOwnerId; u32 dropId; void* item; };
+    // A cached ground Item* goes STALE (the engine despawns/streams the object out) and
+    // nothing used to prune this list, so a later re-home handed addItemPtrToInventory a
+    // dead pointer. `hand` is the object's save-stable engine hand, so the re-home can
+    // RE-RESOLVE the object and test its liveness instead of trusting `item`.
+    //
+    // pending*: a re-home that FAILED (the object is alive but the bag refused it - an
+    // occupied equip slot, no room, a container still resolving). The entry is retried by
+    // reconcileGroundGear until pendingSinceMs + WD_REHOME_MAX_MS, and only then may the
+    // author destroy its ground copy - and ONLY after it has SEEN the item in the target
+    // container. Destroying on faith would lose the item outright wherever the reconcile
+    // cannot recreate it (a truncated read, KENSHICOOP_WEAPON_FAB=0, or a backpack, which
+    // must never be fabricated because the copy would be empty).
+    struct GroundWeapon {
+        u32           dropOwnerId;
+        u32           dropId;
+        void*         item;
+        unsigned int  hand[5];
+        unsigned int  pendingHand[5];   // re-home target container (all-zero = none pending)
+        unsigned int  pendingType;      // itemType of the pending re-home
+        unsigned long pendingSinceMs;   // when the first re-home attempt failed
+        // Consecutive ticks this object failed to read as a live free ground item. A track is
+        // only dropped once that REPEATS: discarding it on a single bad read is how the author
+        // ended up with no answer for a real pickup, and the cost of being wrong is asymmetric
+        // (a forgotten track means a permanent duplicate, whereas keeping a dead one costs a
+        // pointer until the next read).
+        unsigned int  deadReads;
+    };
     std::map<std::string, std::deque<GroundWeapon> > groundedWeapons_;
     u32                               nextPickupId_;
     std::set<std::pair<u32, u32> >    appliedPickups_;
+
+    // Start tracking a just-grounded conservation item: records the drop identity both
+    // clients share, the raw Item*, AND the object's engine hand (so a later re-home
+    // re-resolves rather than trusting the pointer), with the pending re-home state clear.
+    // `authored` distinguishes a drop WE detected locally from one we mirrored for a peer;
+    // only the test forget-lever reads it (it must blind the author without blinding the
+    // picker, or no identified pickup is ever sent at all).
+    void trackGroundGear(const std::string& sid, u32 dropOwnerId, u32 dropId, void* item,
+                         bool authored);
 
     // Protocol 37 cross-owner transfer state.
     // xferBase_: last-known per-item totals (sid,type)->qty per tracked container - the
@@ -1137,6 +1219,11 @@ private:
     // container `k` - the W2 census fallback defers its drop verdict for it.
     bool xferPendingLoss(const Key& k, const char* sid);
     bool wdSuppressed(const Key& k, const char* sid, unsigned long now);
+    // True while the W2 gear census still has an unresolved DECREASE for container `k`
+    // (a drop intent is debouncing its ground correlation). publishInventories holds the
+    // container's snapshot until then, so the post-drop bag can never reach the peer
+    // ahead of the intent that explains it.
+    bool wdPendingDrop(const Key& k) const;
 
     // Smoothness accumulators (measured from the body's actual motion while its
     // source is moving): how often did the rendered body advance per frame?

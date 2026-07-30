@@ -1,6 +1,7 @@
 // ScenarioInventory.cpp - container/inventory scenarios (monolith split from
 // Scenario.cpp, 2026-07-12): inv_order, inv_bidir, trade_probe, trade_peer,
-// inv_equip/inv_reequip, inv_wpnseq, inv_addequip, wpn_relocate. Classes are
+// inv_equip/inv_reequip, inv_wpnseq, inv_addequip, wpn_relocate, and the
+// protocol-46 item-loss regressions inv_overflow / inv_dropfull. Classes are
 // TU-private (anonymous namespace); only makeInventoryScenario
 // (ScenarioSupport.h) is exported.
 // Must NOT: change any SCENARIO log string (oracle API, resources/CODE_MAP.md).
@@ -1322,8 +1323,583 @@ private:
 
 } // namespace
 
+// Shared squad-tab rank helpers for the scenarios below (the older classes in this TU
+// each carry their own private copies; new code uses these).
+bool ovlCtnrEq(const EntityState& a, const EntityState& b) {
+    return a.hContainer == b.hContainer && a.hContainerSerial == b.hContainerSerial;
+}
+bool ovlHandLess(const EntityState& a, const EntityState& b) {
+    if (a.hType != b.hType) return a.hType < b.hType;
+    if (a.hContainer != b.hContainer) return a.hContainer < b.hContainer;
+    if (a.hContainerSerial != b.hContainerSerial) return a.hContainerSerial < b.hContainerSerial;
+    if (a.hIndex != b.hIndex) return a.hIndex < b.hIndex;
+    return a.hSerial < b.hSerial;
+}
+int ovlContainerRankOf(const EntityState* sq, unsigned int n, unsigned int i) {
+    const unsigned int MAXS = 32;
+    EntityState distinct[MAXS]; unsigned int dn = 0;
+    for (unsigned int a = 0; a < n; ++a) {
+        bool seen = false;
+        for (unsigned int b = 0; b < dn; ++b) if (ovlCtnrEq(distinct[b], sq[a])) { seen = true; break; }
+        if (!seen && dn < MAXS) distinct[dn++] = sq[a];
+    }
+    for (unsigned int a = 1; a < dn; ++a)
+        for (unsigned int b = a; b > 0 && ovlHandLess(distinct[b], distinct[b-1]); --b) {
+            EntityState t = distinct[b]; distinct[b] = distinct[b-1]; distinct[b-1] = t;
+        }
+    for (unsigned int r = 0; r < dn; ++r) if (ovlCtnrEq(distinct[r], sq[i])) return (int)r;
+    return -1;
+}
+// Lowest-hand member of the given squad-tab rank; its object hand IS its personal
+// inventory container hand (the same key the Replicator partitions and streams on).
+bool ovlRankContainer(GameWorld* gw, unsigned int rank, unsigned int out[5]) {
+    const unsigned int MAXS = 32;
+    for (int i = 0; i < 5; ++i) out[i] = 0;
+    EntityState sq[MAXS];
+    unsigned int n = engine::captureSquad(gw, /*leaderOnly*/ false, sq, MAXS);
+    if (n == 0) return false;
+    int best = -1;
+    for (unsigned int i = 0; i < n; ++i) {
+        int cr = ovlContainerRankOf(sq, n, i);
+        if (cr < 0 || (unsigned int)cr != rank) continue;
+        if (best < 0 || ovlHandLess(sq[i], sq[best])) best = (int)i;
+    }
+    if (best < 0) return false;
+    out[0] = sq[best].hType; out[1] = sq[best].hContainer;
+    out[2] = sq[best].hContainerSerial; out[3] = sq[best].hIndex; out[4] = sq[best].hSerial;
+    return true;
+}
+
+// inv_overflow (protocol 46 regression): the CONTAINER-OVERFLOW item-loss class. A
+// character carrying more entries than the wire can describe used to lose everything past
+// the cap, because (a) the capture filled its buffer with LOOSE items and emitted zero
+// EQUIPPED entries, and (b) the peer read that truncated list as an authoritative delete
+// and destroyed the surplus - including the entire worn kit. A backpack is what routinely
+// pushes a character over the cap, which is why this reproduced as "backpacks lose items".
+//
+// Rather than manufacture 65+ distinct templates, this drives the two invariants directly
+// through a deliberately SMALL capture cap - the cap is a parameter, so a 2-entry cap on a
+// richer container exercises exactly the same code path INV_ITEMS_MAX does:
+//   1) GEAR-FIRST: a capture that cannot fit everything still spends its budget on
+//      EQUIPPED entries first, so worn gear is never the thing that gets cut.
+//      Asserted as eqSmall == min(eqFull, cap).
+//   2) TRUNCATION IS FLAGGED and ADDITIVE-ONLY: the overflow sets the truncated flag, and
+//      reconciling the container against that short list destroys NOTHING (count before ==
+//      count after). Pre-fix this call deleted every entry not in the list.
+// Both clients run the check against a container they OWN, so the assertions are local and
+// deterministic (no cross-client timing); the INVOF log lines are the oracle contract.
+class InventoryOverflowScenario : public TimedScenario {
+public:
+    InventoryOverflowScenario()
+        : TimedScenario("inv_overflow", 0), have_(false), seeded_(false), probed_(false),
+          additive_(false), lastLogMs_(0), ownRank_(0),
+          nFull_(0), eqFull_(0), nSmall_(0), eqSmall_(0), truncSmall_(0),
+          beforeN_(0), afterN_(0), gearOk_(false), truncOk_(false), additiveOk_(false) {
+        for (int i = 0; i < 5; ++i) hand_[i] = 0;
+        gearSid_[0] = '\0';
+    }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        ownRank_ = ctx.isHost ? 0u : 1u;
+        have_ = ovlRankContainer(ctx.gw, ownRank_, hand_);
+        char b[200];
+        _snprintf(b, sizeof(b) - 1,
+            "SCENARIO INVOF anchor own_rank=%u have=%d hand=%u,%u,%u,%u,%u cap=%u",
+            ownRank_, have_ ? 1 : 0, hand_[0], hand_[1], hand_[2], hand_[3], hand_[4],
+            SMALL_CAP);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!have_) { if (ctx.elapsedMs >= 6000) { passed_ = false; return true; } return false; }
+
+        // SEED (@5s): guarantee the container holds BOTH worn gear and loose items, so the
+        // small-cap capture has a real choice to make between them.
+        if (!seeded_ && ctx.elapsedMs >= SEED_MS) {
+            seeded_ = true;
+            unsigned int gearType = 0; int eqCount = 0;
+            int found = engine::findEquippedItemKey(ctx.gw, hand_, gearSid_, sizeof(gearSid_),
+                                                    &gearType, &eqCount);
+            int worn = eqCount;
+            if (found == 0 || eqCount <= 0) {
+                // Naked member: give it something to wear so the gear-first check is real.
+                if (engine::seedEquippedItem(ctx.gw, hand_, gearSid_, sizeof(gearSid_),
+                                             &gearType))
+                    worn = 1;
+            }
+            char sid[48]; sid[0] = '\0';
+            int added = engine::addTestItemsToContainer(ctx.gw, hand_, 2, sid, sizeof(sid));
+            char b[220]; _snprintf(b, sizeof(b) - 1,
+                "SCENARIO INVOF seed worn=%d gearSid='%s' looseAdded=%d looseSid='%s'",
+                worn, gearSid_[0] ? gearSid_ : "(none)", added, sid[0] ? sid : "(none)");
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        // PROBE (@9s): full capture vs small-cap capture.
+        if (seeded_ && !probed_ && ctx.elapsedMs >= PROBE_MS) {
+            probed_ = true;
+            InvItemEntry full[INV_ITEMS_MAX];
+            bool tFull = false;
+            nFull_ = engine::captureContainerContents(ctx.gw, hand_, full, INV_ITEMS_MAX,
+                                                      0, &tFull);
+            eqFull_ = 0;
+            for (unsigned int i = 0; i < nFull_; ++i) if (full[i].equipped) ++eqFull_;
+
+            bool tSmall = false;
+            nSmall_ = engine::captureContainerContents(ctx.gw, hand_, small_, SMALL_CAP,
+                                                       0, &tSmall);
+            truncSmall_ = tSmall ? 1 : 0;
+            eqSmall_ = 0;
+            for (unsigned int i = 0; i < nSmall_; ++i) if (small_[i].equipped) ++eqSmall_;
+
+            // Gear-first: the small budget must be spent on equipped entries first.
+            unsigned int wantEq = (eqFull_ < SMALL_CAP) ? eqFull_ : SMALL_CAP;
+            gearOk_  = (eqSmall_ == wantEq);
+            // Overflow must be reported (only meaningful when there IS more than the cap).
+            truncOk_ = (nFull_ > SMALL_CAP) ? (truncSmall_ == 1) : (truncSmall_ == 0);
+
+            char b[240]; _snprintf(b, sizeof(b) - 1,
+                "SCENARIO INVOF capture full=%u eqFull=%u small=%u eqSmall=%u wantEq=%u "
+                "trunc=%d gearOk=%d truncOk=%d",
+                nFull_, eqFull_, nSmall_, eqSmall_, wantEq, truncSmall_,
+                gearOk_ ? 1 : 0, truncOk_ ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        // ADDITIVE (@13s): reconcile against the TRUNCATED short list. Nothing may die.
+        if (probed_ && !additive_ && ctx.elapsedMs >= ADDITIVE_MS) {
+            additive_ = true;
+            InvItemEntry tmp[INV_ITEMS_MAX];
+            beforeN_ = engine::captureContainerContents(ctx.gw, hand_, tmp, INV_ITEMS_MAX, 0);
+            engine::applyContainerContents(ctx.gw, hand_, nSmall_ ? small_ : 0, nSmall_,
+                                           /*truncated*/ true);
+            afterN_ = engine::captureContainerContents(ctx.gw, hand_, tmp, INV_ITEMS_MAX, 0);
+            additiveOk_ = (afterN_ >= beforeN_);
+            char b[220]; _snprintf(b, sizeof(b) - 1,
+                "SCENARIO INVOF additive desired=%u before=%u after=%u destroyed=%d ok=%d",
+                nSmall_, beforeN_, afterN_,
+                (beforeN_ > afterN_) ? (int)(beforeN_ - afterN_) : 0,
+                additiveOk_ ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        // Periodic content trace so the oracle can see the container never shrinks.
+        if (ctx.elapsedMs - lastLogMs_ >= 1000 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            InvItemEntry tmp[INV_ITEMS_MAX];
+            unsigned int hash = 0;
+            unsigned int n = engine::captureContainerContents(ctx.gw, hand_, tmp,
+                                                              INV_ITEMS_MAX, &hash);
+            unsigned int eq = 0;
+            for (unsigned int i = 0; i < n; ++i) if (tmp[i].equipped) ++eq;
+            char b[180]; _snprintf(b, sizeof(b) - 1,
+                "SCENARIO INVOF r=%u t=%lu count=%u equipped=%u hash=%u",
+                ownRank_, (unsigned long)ctx.elapsedMs, n, eq, hash);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        if (ctx.elapsedMs >= DURATION_MS) {
+            passed_ = have_ && probed_ && additive_ && gearOk_ && truncOk_ && additiveOk_;
+            char b[240]; _snprintf(b, sizeof(b) - 1,
+                "SCENARIO INVOF verdict pass=%d gearOk=%d truncOk=%d additiveOk=%d "
+                "full=%u eqFull=%u small=%u eqSmall=%u before=%u after=%u",
+                passed_ ? 1 : 0, gearOk_ ? 1 : 0, truncOk_ ? 1 : 0, additiveOk_ ? 1 : 0,
+                nFull_, eqFull_, nSmall_, eqSmall_, beforeN_, afterN_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            return true;
+        }
+        return false;
+    }
+
+private:
+    // A 2-entry budget on a container holding gear + loose clutter forces the same
+    // decision INV_ITEMS_MAX forces on a backpacked character.
+    static const unsigned int  SMALL_CAP    = 2;
+    static const unsigned long SEED_MS      = 5000;
+    static const unsigned long PROBE_MS     = 9000;
+    static const unsigned long ADDITIVE_MS  = 13000;
+    static const unsigned long DURATION_MS  = 22000;
+
+    bool          have_, seeded_, probed_, additive_;
+    unsigned long lastLogMs_;
+    unsigned int  ownRank_;
+    unsigned int  hand_[5];
+    char          gearSid_[48];
+    InvItemEntry  small_[SMALL_CAP];
+    unsigned int  nFull_, eqFull_, nSmall_, eqSmall_;
+    int           truncSmall_;
+    unsigned int  beforeN_, afterN_;
+    bool          gearOk_, truncOk_, additiveOk_;
+};
+
+// Ground-scan radius for the drop observer (matches the WDROP scenarios).
+const float INVDF_RADIUS = 18.0f;
+
+// inv_dropfull (protocol 46 regression): the W2 DROP-vs-SNAPSHOT race that silently lost
+// items. The dropper's own bag snapshot (gear already gone) could reach the peer BEFORE the
+// drop intent did; the peer's reconcile destroyed its bag copy first, so the late intent's
+// relocateWeaponToGround had nothing to move (moved=0) and the gear ended up existing only
+// on the dropper's ground. The trigger was the drop intent debouncing its ground
+// correlation (the spatial query fails in towns) while the snapshot took the FAST settle
+// path - which is what a full inventory guaranteed, since the entry count could not fall
+// once it was pinned at the cap.
+//
+// This drives the race deliberately: the HOST churns its leader's LOOSE inventory
+// continuously (forcing the snapshot channel to publish that same container over and over)
+// and drops an EQUIPPED gear piece in the middle of that churn. The JOIN - which does not
+// own the leader - must still end up with the gear OFF its leader and ON the ground, i.e.
+// conserved. The oracle additionally reads the [wd] APPLY lines for moved>0 and asserts no
+// APPLY-LOST appears. INVDF log contract.
+class InventoryDropFullScenario : public Scenario {
+public:
+    InventoryDropFullScenario()
+        : passed_(false), have_(false), isHost_(false), gearType_(0), step_(0),
+          lastChurnMs_(0), churns_(0), invBase_(0), invAfter_(-1), grndAfter_(-1),
+          invMin_(9999), grndMax_(0) {
+        for (int i = 0; i < 5; ++i) hand_[i] = 0;
+        gearSid_[0] = '\0';
+    }
+    virtual const char* name() const { return "inv_dropfull"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        isHost_ = ctx.isHost;
+        // Target the host-owned tab-0 member, deterministic on both clients (same save):
+        // the host owns it and drops, the join mirrors by conservation.
+        have_ = ovlRankContainer(ctx.gw, 0u, hand_);
+        if (have_) have_ = pickGear(ctx.gw);
+        if (have_) {
+            invBase_ = gearCount(ctx.gw);
+            invMin_  = invBase_;
+            grndMax_ = engine::countFreeGroundItemsNear(ctx.gw, hand_, gearSid_, gearType_,
+                                                        INVDF_RADIUS);
+        }
+        char b[240];
+        _snprintf(b, sizeof(b) - 1,
+            "SCENARIO INVDF start role=%s have=%d sid='%s' type=%u invBase=%d "
+            "hand=%u,%u,%u,%u,%u",
+            isHost_ ? "host" : "join", have_ ? 1 : 0,
+            gearSid_[0] ? gearSid_ : "(none)", gearType_, invBase_,
+            hand_[0], hand_[1], hand_[2], hand_[3], hand_[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!have_ || !gearSid_[0]) {
+            if (ctx.elapsedMs >= 6000) { passed_ = false; return true; }
+            return false;
+        }
+
+        if (isHost_) {
+            // CHURN: keep the inventory snapshot channel busy on the SAME container across
+            // the whole drop window, so the drop intent has to compete with it.
+            if (ctx.elapsedMs >= CHURN_FROM_MS && ctx.elapsedMs < CHURN_TO_MS &&
+                (ctx.elapsedMs - lastChurnMs_ >= CHURN_EVERY_MS)) {
+                lastChurnMs_ = ctx.elapsedMs;
+                char sid[48]; sid[0] = '\0';
+                int n;
+                if ((churns_ & 1) == 0) n = engine::addTestItemsToContainer(ctx.gw, hand_, 1,
+                                                                           sid, sizeof(sid));
+                else                    n = engine::removeTestItemsFromContainer(ctx.gw, hand_, 1);
+                ++churns_;
+                char b[180]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO INVDF churn i=%u op=%s n=%d",
+                    churns_, ((churns_ & 1) == 1) ? "add" : "remove", n);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            // DROP (@11s): mid-churn, unequip-to-loose then drop, the real player action.
+            if (step_ == 0 && ctx.elapsedMs >= DROP_MS) {
+                step_ = 1;
+                int dr = engine::dropItemFromInventory(ctx.gw, hand_, gearSid_, gearType_, 1);
+                if (dr == 0) {
+                    int un = engine::unequipItemToLoose(ctx.gw, hand_, gearSid_, gearType_, 1);
+                    if (un > 0) dr = engine::dropItemFromInventory(ctx.gw, hand_, gearSid_,
+                                                                   gearType_, 1);
+                }
+                invAfter_  = gearCount(ctx.gw);
+                grndAfter_ = engine::countFreeGroundItemsNear(ctx.gw, hand_, gearSid_,
+                                                              gearType_, INVDF_RADIUS);
+                char b[200]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO INVDF host-dropped n=%d inv=%d ground=%d churns=%u",
+                    dr, invAfter_, grndAfter_, churns_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        } else {
+            // OBSERVER: the conservation signature is bag LOSES it and ground GAINS it.
+            int inv  = gearCount(ctx.gw);
+            int grnd = engine::countFreeGroundItemsNear(ctx.gw, hand_, gearSid_, gearType_,
+                                                        INVDF_RADIUS);
+            if (inv  < invMin_)  invMin_  = inv;
+            if (grnd > grndMax_) grndMax_ = grnd;
+        }
+
+        if (ctx.elapsedMs >= DURATION_MS) {
+            if (isHost_) {
+                bool dropped = (invAfter_ >= 0) && (invAfter_ <= invBase_ - 1);
+                passed_ = have_ && (invBase_ >= 1) && dropped && (churns_ > 0);
+                char b[240]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO INVDF verdict role=host pass=%d sid='%s' invBase=%d "
+                    "invAfter=%d grndAfter=%d churns=%u",
+                    passed_ ? 1 : 0, gearSid_, invBase_, invAfter_, grndAfter_, churns_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            } else {
+                bool leftBag  = (invMin_ <= invBase_ - 1);
+                bool onGround = (grndMax_ >= 1);
+                passed_ = have_ && (invBase_ >= 1) && leftBag && onGround;
+                char b[240]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO INVDF verdict role=join pass=%d sid='%s' invBase=%d "
+                    "invMin=%d grndMax=%d conserved=%d",
+                    passed_ ? 1 : 0, gearSid_, invBase_, invMin_, grndMax_,
+                    (leftBag && onGround) ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            return true;
+        }
+        return false;
+    }
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long CHURN_FROM_MS  = 7000;
+    static const unsigned long CHURN_TO_MS    = 18000;
+    static const unsigned long CHURN_EVERY_MS = 700;
+    static const unsigned long DROP_MS        = 11000;
+    static const unsigned long DURATION_MS    = 26000;
+
+    int gearCount(GameWorld* gw) {
+        InvItemEntry it[INV_ITEMS_MAX];
+        unsigned int n = engine::captureContainerContents(gw, hand_, it, INV_ITEMS_MAX, 0);
+        int c = 0;
+        for (unsigned int i = 0; i < n; ++i)
+            if (it[i].itemType == gearType_ && strcmp(it[i].stringID, gearSid_) == 0) ++c;
+        return c;
+    }
+    // First GEAR piece (WEAPON=2 preferred, else ARMOUR=3), preferring an EQUIPPED one -
+    // equipped gear is the case the reconcile could not refabricate, so it is the one the
+    // race actually destroyed. Deterministic across clients (same save).
+    bool pickGear(GameWorld* gw) {
+        InvItemEntry it[INV_ITEMS_MAX];
+        unsigned int n = engine::captureContainerContents(gw, hand_, it, INV_ITEMS_MAX, 0);
+        const unsigned int cats[2] = { 2u, 3u }; // WEAPON, ARMOUR
+        for (unsigned int pass = 0; pass < 2; ++pass)
+            for (unsigned int c = 0; c < 2; ++c)
+                for (unsigned int i = 0; i < n; ++i) {
+                    if (it[i].itemType != cats[c]) continue;
+                    if (pass == 0 && !it[i].equipped) continue;
+                    strncpy(gearSid_, it[i].stringID, sizeof(gearSid_) - 1);
+                    gearSid_[sizeof(gearSid_) - 1] = '\0';
+                    gearType_ = it[i].itemType;
+                    return true;
+                }
+        return false;
+    }
+
+    bool          passed_, have_, isHost_;
+    unsigned int  hand_[5];
+    char          gearSid_[48];
+    unsigned int  gearType_;
+    int           step_;
+    unsigned long lastChurnMs_;
+    unsigned int  churns_;
+    int           invBase_, invAfter_, grndAfter_;
+    int           invMin_, grndMax_;
+};
+
+// inv_regear (protocol 47 regression): the ONE-INSTANCE invariant across a full W2
+// round trip - the author's gear is dropped, the PEER picks it up, and the item must end
+// up in exactly ONE place. The reported failure was the other outcome: "join picked the
+// items up and had them in inventory, but the host still saw copies on the ground". The
+// author's re-home ran once, off a CACHED Item* and with no retry, so any refusal (the
+// object had been despawned, or the target bag would not take it) left the item in the
+// peer's bag AND on the author's ground - a duplicate, permanently, because nothing
+// revisited the decision.
+//
+// HOST owns tab 0 and drops one of its gear pieces. The JOIN relocates its own copy by
+// conservation, then picks that ground item up into the tab-1 member it OWNS (so its gear
+// census authors a real PICKUP intent naming the shared drop identity). The HOST then has
+// to converge: its ground copy must be GONE and its copy of the tab-1 bag must HOLD the
+// item. Asserting both is what makes this an invariant rather than two one-sided checks -
+// ground=0 alone is satisfied by losing the item, bag=1 alone by duplicating it.
+// WGRP log contract; judged by Test-GearRepickup.
+class InventoryRegearScenario : public Scenario {
+public:
+    explicit InventoryRegearScenario(const char* scenarioName)
+        : passed_(false), have_(false), isHost_(false), gearType_(0), step_(0),
+          dropped_(0), pickedUp_(0), lastTryMs_(0), tries_(0), lastLogMs_(0),
+          grndPeak_(0), grndFinal_(-1), bagFinal_(-1), bagBase_(0),
+          scenarioName_(scenarioName) {
+        for (int i = 0; i < 5; ++i) { r0_[i] = 0; r1_[i] = 0; }
+        gearSid_[0] = '\0';
+    }
+    virtual const char* name() const { return scenarioName_; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        isHost_ = ctx.isHost;
+        // Both tabs on BOTH clients: the host drops from tab 0 and must later read tab 1's
+        // bag (the container it does NOT own) to prove the item landed there.
+        have_ = ovlRankContainer(ctx.gw, 0u, r0_) && ovlRankContainer(ctx.gw, 1u, r1_);
+        if (have_) have_ = pickGear(ctx.gw);
+        // Tab 1 may already carry the same template (squad members share starting kit), so
+        // the invariant is measured as a DELTA of exactly +1 - "at least one" would accept a
+        // second copy appearing inside the bag.
+        if (have_) bagBase_ = gearCount(ctx.gw, r1_);
+        char b[260]; _snprintf(b, sizeof(b) - 1,
+            "WGRP start role=%s have=%d sid='%s' type=%u bagBase=%d r0=%u,%u,%u,%u,%u r1=%u,%u,%u,%u,%u",
+            isHost_ ? "host" : "join", have_ ? 1 : 0, gearSid_[0] ? gearSid_ : "(none)",
+            gearType_, bagBase_, r0_[0], r0_[1], r0_[2], r0_[3], r0_[4],
+            r1_[0], r1_[1], r1_[2], r1_[3], r1_[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!have_ || !gearSid_[0]) {
+            if (ctx.elapsedMs >= 6000) { passed_ = false; return true; }
+            return false;
+        }
+
+        if (isHost_ && step_ == 0 && ctx.elapsedMs >= DROP_MS) {
+            step_ = 1;
+            dropped_ = engine::dropItemFromInventory(ctx.gw, r0_, gearSid_, gearType_, 1);
+            if (dropped_ == 0) {
+                int un = engine::unequipItemToLoose(ctx.gw, r0_, gearSid_, gearType_, 1);
+                if (un > 0) dropped_ = engine::dropItemFromInventory(ctx.gw, r0_, gearSid_,
+                                                                    gearType_, 1);
+                if (dropped_ == 0)
+                    dropped_ = engine::dropItemFromInventory(ctx.gw, r0_, gearSid_, gearType_,
+                                                             1, 0, /*allowEquipped*/ true);
+            }
+            char b[180]; _snprintf(b, sizeof(b) - 1,
+                "WGRP host-dropped n=%d ground=%d", dropped_,
+                engine::countFreeGroundItemsNear(ctx.gw, r0_, gearSid_, gearType_, RADIUS));
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        // JOIN picks the relocated item up into the member it OWNS. Retried: the peer's
+        // conservation relocation has to land first, and it is debounced.
+        if (!isHost_ && pickedUp_ == 0 && ctx.elapsedMs >= PICKUP_MS &&
+            tries_ < MAX_TRIES && (ctx.elapsedMs - lastTryMs_ >= TRY_EVERY_MS)) {
+            lastTryMs_ = ctx.elapsedMs;
+            ++tries_;
+            pickedUp_ = engine::pickupWorldItemIntoInventory(ctx.gw, r1_, gearSid_,
+                                                             gearType_, RADIUS);
+            char b[180]; _snprintf(b, sizeof(b) - 1,
+                "WGRP join-pickup try=%u got=%d ground=%d", tries_, pickedUp_,
+                engine::countFreeGroundItemsNear(ctx.gw, r1_, gearSid_, gearType_, RADIUS));
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        // The AUTHOR's series is the evidence: its ground count must rise on the drop and
+        // come back to zero once the peer's pickup is honoured.
+        if (isHost_ && (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0)) {
+            lastLogMs_ = ctx.elapsedMs;
+            int grnd = engine::countFreeGroundItemsNear(ctx.gw, r0_, gearSid_, gearType_, RADIUS);
+            if (grnd > grndPeak_) grndPeak_ = grnd;
+            char b[180]; _snprintf(b, sizeof(b) - 1,
+                "WGRP host t=%lu ground=%d peak=%d bagR1=%d",
+                (unsigned long)ctx.elapsedMs, grnd, grndPeak_, gearCount(ctx.gw, r1_));
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        unsigned long dur = isHost_ ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            bagFinal_ = gearCount(ctx.gw, r1_);
+            if (isHost_) {
+                grndFinal_ = engine::countFreeGroundItemsNear(ctx.gw, r0_, gearSid_,
+                                                              gearType_, RADIUS);
+                passed_ = (dropped_ > 0) && (grndPeak_ >= 1) && (grndFinal_ == 0) &&
+                          (bagFinal_ == bagBase_ + 1);
+                char b[260]; _snprintf(b, sizeof(b) - 1,
+                    "WGRP verdict role=host pass=%d sid='%s' dropped=%d grndPeak=%d "
+                    "grndFinal=%d bagR1=%d bagBase=%d",
+                    passed_ ? 1 : 0, gearSid_, dropped_, grndPeak_, grndFinal_, bagFinal_,
+                    bagBase_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            } else {
+                passed_ = (pickedUp_ > 0) && (bagFinal_ == bagBase_ + 1);
+                char b[240]; _snprintf(b, sizeof(b) - 1,
+                    "WGRP verdict role=join pass=%d sid='%s' pickedUp=%d tries=%u bagR1=%d bagBase=%d",
+                    passed_ ? 1 : 0, gearSid_, pickedUp_, tries_, bagFinal_, bagBase_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            return true;
+        }
+        return false;
+    }
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long DROP_MS          = 8000;
+    static const unsigned long PICKUP_MS        = 16000;
+    static const unsigned long TRY_EVERY_MS     = 1500;
+    static const unsigned int  MAX_TRIES        = 5;
+    static const unsigned long JOIN_DURATION_MS = 30000;
+    // Outlive the join by the author's full re-home window (WD_REHOME_MAX_MS) plus slack:
+    // a refused re-home is retried for that long, and only then may the author retire its
+    // ground copy against the bag it can now read.
+    static const unsigned long HOST_DURATION_MS = 40000;
+    static const float         RADIUS;
+
+    int gearCount(GameWorld* gw, const unsigned int cHand[5]) {
+        InvItemEntry it[INV_ITEMS_MAX];
+        unsigned int n = engine::captureContainerContents(gw, cHand, it, INV_ITEMS_MAX, 0);
+        int c = 0;
+        for (unsigned int i = 0; i < n; ++i)
+            if (it[i].itemType == gearType_ && strcmp(it[i].stringID, gearSid_) == 0) ++c;
+        return c;
+    }
+    // Tab 0's first WEAPON or ARMOUR piece, equipped preferred - deliberately NOT a
+    // container: a backpack is unfabricable by design, so a refused re-home of one has no
+    // convergent end state to assert (the author keeps its ground copy rather than risk
+    // destroying the only instance).
+    bool pickGear(GameWorld* gw) {
+        InvItemEntry it[INV_ITEMS_MAX];
+        unsigned int n = engine::captureContainerContents(gw, r0_, it, INV_ITEMS_MAX, 0);
+        const unsigned int cats[2] = { 2u, 3u };
+        for (unsigned int pass = 0; pass < 2; ++pass)
+            for (unsigned int c = 0; c < 2; ++c)
+                for (unsigned int i = 0; i < n; ++i) {
+                    if (it[i].itemType != cats[c]) continue;
+                    if (pass == 0 && !it[i].equipped) continue;
+                    strncpy(gearSid_, it[i].stringID, sizeof(gearSid_) - 1);
+                    gearSid_[sizeof(gearSid_) - 1] = '\0';
+                    gearType_ = it[i].itemType;
+                    return true;
+                }
+        return false;
+    }
+
+    bool          passed_, have_, isHost_;
+    unsigned int  r0_[5], r1_[5];
+    char          gearSid_[48];
+    unsigned int  gearType_;
+    int           step_;
+    int           dropped_, pickedUp_;
+    unsigned long lastTryMs_;
+    unsigned int  tries_;
+    unsigned long lastLogMs_;
+    int           grndPeak_, grndFinal_, bagFinal_, bagBase_;
+    const char*   scenarioName_;
+};
+const float InventoryRegearScenario::RADIUS = 60.0f;
+
 Scenario* makeInventoryScenario(const std::string& name) {
+    // Same scenario twice: the plain run proves the round trip converges, and the
+    // _refuse run drives it with the first re-home refused (KENSHICOOP_WD_REFUSE_REHOME),
+    // which is the only deterministic way to exercise the retry + verify-then-destroy
+    // recovery - the path whose absence turned a refusal into a permanent duplicate.
+    // _refuse_all refuses EVERY attempt, so the only way out is the verify-then-destroy
+    // branch: the item reaches the bag over the snapshot channel and the author then
+    // retires its ground copy against a bag it can actually read.
+    if (name == "inv_regear")            return new InventoryRegearScenario("inv_regear");
+    if (name == "inv_regear_refuse")     return new InventoryRegearScenario("inv_regear_refuse");
+    if (name == "inv_regear_refuse_all") return new InventoryRegearScenario("inv_regear_refuse_all");
+    // _forget discards the author's ground track the instant it is made, so the peer's pickup
+    // arrives NAMED but unmatchable. That is the state the player's session was in when a
+    // picked-up item stayed on the other side's ground, and the only exit is the site-anchored
+    // recovery (re-home a same-sid free ground item at the pickup location).
+    if (name == "inv_regear_forget")      return new InventoryRegearScenario("inv_regear_forget");
     if (name == "inv_order")    return new InventorySyncScenario();
+    if (name == "inv_overflow") return new InventoryOverflowScenario();
+    if (name == "inv_dropfull") return new InventoryDropFullScenario();
     if (name == "inv_bidir")    return new InventoryBidirScenario();
     if (name == "trade_probe")  return new TradeScenario(/*peer=*/false);
     if (name == "trade_peer")   return new TradeScenario(/*peer=*/true);

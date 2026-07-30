@@ -1030,6 +1030,24 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
     }
     if (worldLive) {
         g_repl.publishOwned(gw, g_net, g_net.localId());
+        // Phase W2: BOTH clients watch their OWNED characters for a WEAPON drop and author a
+        // reliable conservation intent so the peer relocates its own copy of that weapon (a
+        // weapon can't be rebuilt via the W1 proxy path). Bidirectional; gated on worldSync.
+        // Ordered BEFORE publishInventories: the gear census is what tells the inventory
+        // publisher a drop is still being adjudicated (wdPendingDrop), and running it first
+        // means that signal is current rather than one tick stale. Otherwise a bag snapshot
+        // can be authored ahead of the intent that explains it, and the peer's reconcile
+        // destroys the copy the intent was going to relocate.
+        if (g_cfg.worldSync)
+            g_repl.detectAndPublishWeaponDrops(gw, g_net, g_net.localId());
+        // Phase W3 convergence: prune ground-gear tracks whose object is gone (a stale
+        // Item* is how a re-home silently no-ops, leaving the author's copy on the ground
+        // as a duplicate) and finish any re-home the peer's pickup could not complete yet.
+        // Ordered before publishInventories so a completed re-home ships in THIS tick's
+        // snapshot; it only ever touches PEER-owned containers, so it cannot feed the
+        // owned-character census above and loop.
+        if (g_cfg.worldSync)
+            g_repl.reconcileGroundGear(gw);
         // Both clients stream the contents of every squad member they OWN (host tab 0,
         // join tab 1) on content-change - bidirectional, disjoint by the same tab
         // partition as positional sync. Gated on invSync so ordinary co-op sessions add
@@ -1054,11 +1072,6 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
         // (applyWorldItems, also both sides now).
         if (g_cfg.worldSync)
             g_repl.publishWorldItems(gw, g_net, g_net.localId());
-        // Phase W2: BOTH clients watch their OWNED characters for a WEAPON drop and author a
-        // reliable conservation intent so the peer relocates its own copy of that weapon (a
-        // weapon can't be rebuilt via the W1 proxy path). Bidirectional; gated on worldSync.
-        if (g_cfg.worldSync)
-            g_repl.detectAndPublishWeaponDrops(gw, g_net, g_net.localId());
         // Phase 2 (player combat + medical): owner-authoritative vitals sync for
         // player-squad members, both directions. publishMedical streams OUR
         // members' medical model (change-gated, reliable); applyMedical writes
@@ -1260,8 +1273,13 @@ void tickReplicateApply(GameWorld* gw, bool worldLive) {
         // Phase W1 (bidirectional): BOTH clients spawn/update/cull local proxies for
         // the peer's streamed ground items, keyed (ownerId, netId) so the per-sender
         // netId spaces never collide.
-        if (g_cfg.worldSync)
+        if (g_cfg.worldSync) {
             g_repl.applyWorldItems(gw, g_inbound);
+            // Protocol 47: a peer consumed a proxy it held for one of OUR ground items,
+            // so destroy our real copy. Runs AFTER applyWorldItems so a snapshot and the
+            // claim that retires it in the same batch resolve in authored order.
+            g_repl.applyWorldClaims(gw, g_inbound, g_net.localId());
+        }
         // Host-authoritative world: only the JOIN hides/freezes any local NPC the
         // host isn't streaming (so the join can't run a divergent copy). The host IS
         // the world authority, so it never suppresses.

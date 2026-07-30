@@ -374,9 +374,10 @@ void Replicator::ingestInv(Inbound& in) {
             }
         }
         InvRecv& r = invRecv_[k];
-        r.ownerId = it->ownerId;
-        r.items   = it->items; // latest snapshot supersedes
-        r.dirty   = true;
+        r.ownerId   = it->ownerId;
+        r.items     = it->items; // latest snapshot supersedes
+        r.dirty     = true;
+        r.truncated = (it->flags & INV_FLAG_TRUNCATED) != 0;
     }
 }
 

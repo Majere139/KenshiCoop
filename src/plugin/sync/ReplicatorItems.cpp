@@ -51,7 +51,14 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
         owned.insert(censusContainers_.begin(), censusContainers_.end());
     }
     if (owned.empty()) return;
-    const unsigned long INV_RESEND_MS = 5000; // periodic safety resend (loss/late join)
+    // Periodic safety resend (late join / a container returning to interest). The channel
+    // is RELIABLE, so this is not loss recovery - it is a cheap re-assert. With
+    // INV_ITEMS_MAX at 64 a full snapshot is ~10 KB, so a censused chest farm re-asserting
+    // every 5 s would cost real bandwidth for nothing; big snapshots re-assert on the slow
+    // interval instead. Small ones keep the historical cadence.
+    const unsigned long INV_RESEND_MS      = 5000;
+    const unsigned long INV_RESEND_BIG_MS  = 30000;
+    const unsigned int  INV_RESEND_BIG_N   = 24;   // entries above which "big" applies
     // A changed snapshot must be STABLE this long before we publish it. A change that only
     // REARRANGES or ADDS (entry count >= last sent) settles fast. A change that REMOVES an
     // entry settles much longer: mid-drag the UI holds the dragged item on the CURSOR, out
@@ -71,14 +78,20 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
         // so we never blast a spurious "empty" snapshot that would wipe baked contents.
         if (engine::resolveObjectByHand(cHand) == 0) continue;
         u32 hash = 0;
-        unsigned int n = engine::captureContainerContents(gw, cHand, items, INV_ITEMS_MAX, &hash);
+        bool trunc = false;
+        unsigned int n = engine::captureContainerContents(gw, cHand, items, INV_ITEMS_MAX,
+                                                          &hash, &trunc);
+        // Total UNITS across the capture: the removal-settle signal (see InvPub).
+        unsigned int units = 0;
+        for (unsigned int ui = 0; ui < n; ++ui)
+            units += (items[ui].quantity < 1) ? 1u : (unsigned int)items[ui].quantity;
         std::map<Key, InvPub>::iterator pit = invPub_.find(*it);
         bool first = (pit == invPub_.end());
         if (first) {
             // Track from now; let it settle before the initial publish (cheap, and avoids
             // emitting a half-built inventory captured mid-load).
             InvPub p; p.hash = 0; p.lastSendMs = 0; p.pendingHash = hash; p.pendingSince = now;
-            p.lastSentN = 0;
+            p.lastSentN = 0; p.lastSentUnits = 0;
             invPub_[*it] = p;
             pit = invPub_.find(*it);
         }
@@ -87,13 +100,36 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
         bool differs = !sent || (pub.hash != hash);
         // Maintain the settle timer: restart it whenever the captured fingerprint moves.
         if (hash != pub.pendingHash) { pub.pendingHash = hash; pub.pendingSince = now; }
-        // A removal (fewer entries than last sent) waits out the long window; everything
-        // else (additions, equip<->loose moves) settles fast.
-        unsigned long settleMs = (sent && n < pub.lastSentN) ? INV_REMOVE_SETTLE_MS : INV_SETTLE_MS;
+        // A removal (fewer UNITS than last sent) waits out the long window; everything
+        // else (additions, equip<->loose moves) settles fast. Units not entries: at the
+        // INV_ITEMS_MAX cap the entry count cannot fall, which silently disabled this
+        // guard for exactly the full inventories that need it most.
+        unsigned long settleMs = (sent && units < pub.lastSentUnits) ? INV_REMOVE_SETTLE_MS
+                                                                    : INV_SETTLE_MS;
         bool settled  = (now - pub.pendingSince >= settleMs);
         bool changed  = differs && settled;
-        bool periodic = sent && !differs && (now - pub.lastSendMs >= INV_RESEND_MS);
+        unsigned long resendMs = (n >= INV_RESEND_BIG_N) ? INV_RESEND_BIG_MS : INV_RESEND_MS;
+        bool periodic = sent && !differs && (now - pub.lastSendMs >= resendMs);
         if (!changed && !periodic) continue;
+        // W2 race guard: while the gear census has an unresolved DECREASE pending for this
+        // container, a drop intent for it may still be debouncing (the spatial ground query
+        // fails in towns, so detectAndPublishWeaponDrops retries for up to MAX_RETRY ticks).
+        // Publishing the post-drop bag NOW would reach the peer first, its reconcile would
+        // destroy the bag copy, and the late intent's relocateWeaponToGround would find
+        // nothing to move (moved=0) - the item would exist only on the dropper's ground.
+        // Hold the snapshot until the drop plane has spoken. Same cross-plane gating
+        // pattern as wdSuppressed / xferPendingLoss. No worldSync gate needed: the census
+        // this reads is only ever populated by detectAndPublishWeaponDrops, which the tick
+        // skips entirely when world sync is off - so the predicate is false by construction.
+        if (wdPendingDrop(*it)) {
+            static int dumpHold = -1;
+            if (dumpHold < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dumpHold = (e && e[0] == '1') ? 1 : 0; }
+            if (dumpHold) { char b[160]; _snprintf(b, sizeof(b) - 1,
+                "[inv] HOLD hand=%u,%u,%u,%u,%u (gear decrease pending drop adjudication)",
+                it->t, it->c, it->cs, it->i, it->s);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+            continue;
+        }
         // Protocol 34 wire identity: a session-placed building rides its
         // protocol-27 placer key (own placement = our hand; a minted proxy =
         // the reverse map). Characters / baked containers stay raw (kind 0).
@@ -110,8 +146,9 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
                 wireKey[4] = mit->second.s;
             }
         }
-        net.queueInvSnapshot(ownerId, keyKind, wireKey, items, n);
-        pub.hash = hash; pub.lastSendMs = now; pub.lastSentN = n;
+        u8 sflags = trunc ? INV_FLAG_TRUNCATED : (u8)0;
+        net.queueInvSnapshot(ownerId, keyKind, wireKey, items, n, sflags);
+        pub.hash = hash; pub.lastSendMs = now; pub.lastSentN = n; pub.lastSentUnits = units;
         if (changed) {
             char b[200];
             _snprintf(b, sizeof(b) - 1,
@@ -120,6 +157,15 @@ void Replicator::publishInventories(GameWorld* gw, NetLink& net, u32 ownerId) {
                 wireKey[0], wireKey[1], wireKey[2], wireKey[3], wireKey[4],
                 n, hash);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            // Additive-only on the peer from here: surface it so the oracles can see when
+            // a container is too big to describe (and therefore diverging, not converging).
+            if (trunc) {
+                char t[160]; _snprintf(t, sizeof(t) - 1,
+                    "[inv] SEND-TRUNCATED hand=%u,%u,%u,%u,%u items=%u cap=%u "
+                    "(peer reconcile is additive-only)",
+                    it->t, it->c, it->cs, it->i, it->s, n, INV_ITEMS_MAX);
+                t[sizeof(t) - 1] = '\0'; coop::logLine(t);
+            }
             static int dumpInv = -1;
             if (dumpInv < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dumpInv = (e && e[0] == '1') ? 1 : 0; }
             if (dumpInv) { coop::logLine("[inv] SEND-state:"); engine::dumpInventory(gw, cHand); }
@@ -254,7 +300,7 @@ void Replicator::applyInventories(GameWorld* gw) {
             items = adj.empty() ? 0 : &adj[0];
             n = (unsigned int)adj.size();
         }
-        engine::applyContainerContents(gw, cHand, items, n);
+        engine::applyContainerContents(gw, cHand, items, n, it->second.truncated);
         // Keep the transfer detector blind to the reconcile we just performed.
         xferRebase(gw, k);
         char b[160];
@@ -262,6 +308,12 @@ void Replicator::applyInventories(GameWorld* gw) {
             "[inv] APPLY hand=%u,%u,%u,%u,%u items=%u",
             k.t, k.c, k.cs, k.i, k.s, n);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (it->second.truncated) {
+            char t[160]; _snprintf(t, sizeof(t) - 1,
+                "[inv] APPLY-TRUNCATED hand=%u,%u,%u,%u,%u items=%u (additive-only; no deletes)",
+                k.t, k.c, k.cs, k.i, k.s, n);
+            t[sizeof(t) - 1] = '\0'; coop::logLine(t);
+        }
         static int dumpInvA = -1;
         if (dumpInvA < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dumpInvA = (e && e[0] == '1') ? 1 : 0; }
         if (dumpInvA) { coop::logLine("[inv] APPLY-result:"); engine::dumpInventory(gw, cHand); }
@@ -356,7 +408,19 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
         unsigned int nde = engine::drainItemDrops(de, 64);
         for (unsigned int i = 0; i < nde; ++i) {
             if (isGearType(de[i].itemType)) continue;
-            if (de[i].itemHand[3] == 0 && de[i].itemHand[4] == 0) continue; // unresolved hand
+            if (de[i].itemHand[3] == 0 && de[i].itemHand[4] == 0) {
+                // Unresolved hand: this drop cannot be keyed, so the reliable discovery path
+                // gives up on it and only the (town-unreliable) spatial scan can still find
+                // it. That is the one way a non-gear drop silently never reaches the peer, so
+                // say so unconditionally - it is rare, and guessing at it from a silent log is
+                // what made "dropped here, absent there" impossible to pin down.
+                char b[200]; _snprintf(b, sizeof(b) - 1,
+                    "[wi] DROP-CAP-SKIP sid='%s' qty=%u pos=%.2f,%.2f,%.2f (unresolved item "
+                    "hand; spatial scan is the only remaining chance)",
+                    de[i].stringID, de[i].quantity, de[i].x, de[i].y, de[i].z);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                continue;
+            }
             // A drop from a PEER-owned squad copy is the peer's to author (it streams
             // its own drop); authoring it here too would duplicate the proxy. World
             // NPC (class 0) and our own squad (class 1) drops still stream.
@@ -411,6 +475,17 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
     // ---- Stream new/changed + HANDLE-based cull over every track -----------
     WorldItemEntry send[WORLD_ITEMS_MAX]; unsigned int ns = 0;
     u32 removed[256]; unsigned int nr = 0;
+    unsigned int deferred = 0;
+    // TEST-ONLY: shrink the per-tick batch (KENSHICOOP_WI_BATCH_MAX) so a scenario can overflow
+    // it with a handful of drops. Filling the real 16-entry batch needs a crowd of simultaneous
+    // ground items, which is precisely the situation a deterministic test cannot arrange.
+    static int batchCap = -1;
+    if (batchCap < 0) {
+        const char* e = getenv("KENSHICOOP_WI_BATCH_MAX");
+        int v = e ? atoi(e) : 0;
+        batchCap = (v > 0 && v < (int)WORLD_ITEMS_MAX) ? v : (int)WORLD_ITEMS_MAX;
+    }
+    const unsigned int cap = (unsigned int)batchCap;
     for (std::map<Key, WorldTrack>::iterator it = worldTrack_.begin(); it != worldTrack_.end(); ) {
         WorldTrack& tr = it->second;
         unsigned int ihand[5] = { it->first.t, it->first.c, it->first.cs, it->first.i, it->first.s };
@@ -435,8 +510,14 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
         u32 h = worldTrackHash(tr.stringID, tr.itemType, tr.quantity, tr.quality);
         bool changed = !sent || (tr.hash != h) || moved;
         bool periodic = sent && !changed && (now - tr.lastSendMs >= WI_RESEND_MS);
+        // One datagram holds WORLD_ITEMS_MAX entries. Anything that does not fit must keep its
+        // "unsent" bookkeeping so the NEXT tick sends it: marking the track sent regardless -
+        // stamping tr.hash/lastSendMs and the position outside this test - made the batch's
+        // overflow permanently invisible until the 5 s safety resend happened to pick it up,
+        // which is a drop the other side simply does not see. Drop a squad's bags out at once
+        // and the tail of the burst is exactly what goes missing.
         if (changed || periodic) {
-            if (ns < WORLD_ITEMS_MAX) {
+            if (ns < cap) {
                 WorldItemEntry& e = send[ns++];
                 e.netId = tr.netId;
                 strncpy(e.stringID, tr.stringID, sizeof(e.stringID) - 1);
@@ -446,21 +527,66 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
                 e.quality  = tr.quality;
                 e.x = pos[0]; e.y = pos[1]; e.z = pos[2];
                 e.state = 0;
+                tr.hash = h; tr.lastSendMs = now;
+                tr.x = pos[0]; tr.y = pos[1]; tr.z = pos[2];
+                if (changed && dumpWi) {
+                    char b[200]; _snprintf(b, sizeof(b) - 1,
+                        "[wi] SEND netId=%u sid='%s' qty=%u pos=%.2f,%.2f,%.2f hash=%u",
+                        tr.netId, tr.stringID, tr.quantity, pos[0], pos[1], pos[2], h);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            } else {
+                ++deferred; // retried next tick, still flagged changed
             }
-            tr.hash = h; tr.lastSendMs = now;
-            if (changed && dumpWi) {
-                char b[200]; _snprintf(b, sizeof(b) - 1,
-                    "[wi] SEND netId=%u sid='%s' qty=%u pos=%.2f,%.2f,%.2f hash=%u",
-                    tr.netId, tr.stringID, tr.quantity, pos[0], pos[1], pos[2], h);
-                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-            }
+        } else {
+            tr.x = pos[0]; tr.y = pos[1]; tr.z = pos[2];
         }
-        tr.x = pos[0]; tr.y = pos[1]; tr.z = pos[2];
         ++it;
+    }
+    if (deferred > 0) {
+        // Unconditional, and at most one line per tick: a deferred item is one the peer cannot
+        // see yet, which is the hardest W1 symptom to tell apart from a drop that was never
+        // detected at all.
+        char b[140]; _snprintf(b, sizeof(b) - 1,
+            "[wi] SEND-DEFER n=%u (batch full at %u; retried next tick)", deferred, cap);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
     if (ns > 0) net.queueWorldItems(ownerId, send, ns);
     if (nr > 0) net.queueWorldRemove(ownerId, removed, nr);
+
+    // ---- CLAIM half (protocol 47): a proxy WE hold just went into a local bag ----
+    // W1 mirrors a drop but never mirrored the PICKUP: the author's cull tests the liveness
+    // of its OWN real item, which is still on its ground, so it never fired. Report each
+    // consumed proxy to its author so it destroys the real copy. Only a proxy that still
+    // reads AND is now inside an inventory counts - a merely destroyed proxy is dropped
+    // silently, because claiming on it would delete the author's item for no reason.
+    // Claims are grouped per author (netIds live in the AUTHOR's id space).
+    {
+        std::map<u32, std::vector<u32> > claims;
+        for (std::map<std::pair<u32, u32>, WorldProxy>::iterator pi = worldProxies_.begin();
+             pi != worldProxies_.end(); ) {
+            bool pickedUp = false;
+            if (engine::groundObjectLiveness(pi->second.obj, 0, &pickedUp)) { ++pi; continue; }
+            if (pickedUp) {
+                claims[pi->first.first].push_back(pi->first.second);
+                if (dumpWi) { char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[wi] CLAIM author=%u netId=%u (proxy consumed locally)",
+                    pi->first.first, pi->first.second);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+            } else if (dumpWi) { char b[160]; _snprintf(b, sizeof(b) - 1,
+                "[wi] PROXY-GONE author=%u netId=%u (destroyed, not claimed)",
+                pi->first.first, pi->first.second);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+            // Either way the proxy is no longer ours to track. A later cull for this
+            // netId simply finds nothing and is ignored.
+            worldProxies_.erase(pi++);
+        }
+        for (std::map<u32, std::vector<u32> >::iterator ci = claims.begin();
+             ci != claims.end(); ++ci)
+            net.queueWorldClaim(ownerId, ci->first, &ci->second[0],
+                                (unsigned int)ci->second.size());
+    }
 }
 
 void Replicator::applyWorldItems(GameWorld* gw, Inbound& in) {
@@ -518,6 +644,43 @@ void Replicator::applyWorldItems(GameWorld* gw, Inbound& in) {
     }
 }
 
+void Replicator::applyWorldClaims(GameWorld* gw, Inbound& in, u32 localId) {
+    std::deque<InboundWorldClaim> got;
+    in.drainWorldClaim(got);
+    if (got.empty()) return;
+    static int dumpWi = -1;
+    if (dumpWi < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dumpWi = (e && e[0] == '1') ? 1 : 0; }
+    for (std::deque<InboundWorldClaim>::iterator b = got.begin(); b != got.end(); ++b) {
+        if (b->ownerId == localId) continue;      // our own claim echoed back (relay safety)
+        if (b->authorId != localId) continue;     // addressed to a different author
+        for (std::vector<u32>::iterator id = b->netIds.begin(); id != b->netIds.end(); ++id) {
+            std::map<Key, WorldTrack>::iterator tit = worldTrack_.begin();
+            for (; tit != worldTrack_.end(); ++tit)
+                if (tit->second.netId == *id) break;
+            if (tit == worldTrack_.end()) {
+                if (dumpWi) { char b2[160]; _snprintf(b2, sizeof(b2) - 1,
+                    "[wi] CLAIM-APPLY netId=%u from=%u (no track; already gone)",
+                    *id, b->ownerId); b2[sizeof(b2) - 1] = '\0'; coop::logLine(b2); }
+                continue;
+            }
+            unsigned int ihand[5] = { tit->first.t, tit->first.c, tit->first.cs,
+                                      tit->first.i, tit->first.s };
+            RootObject* ro = engine::resolveObjectByHand(ihand);
+            bool destroyed = (ro != 0) && engine::removeWorldItemProxy(gw, ro);
+            char b2[200]; _snprintf(b2, sizeof(b2) - 1,
+                "[wi] CLAIM-APPLY netId=%u from=%u sid='%s' destroyed=%d",
+                *id, b->ownerId, tit->second.stringID, destroyed ? 1 : 0);
+            b2[sizeof(b2) - 1] = '\0'; coop::logLine(b2);
+            // On success LEAVE the track: the next publish pass finds its liveness gone
+            // and emits the ordinary cull, so a THIRD peer drops its proxy too, then
+            // erases the track itself. Only when the object could NOT be destroyed do we
+            // erase here - otherwise we would keep streaming an item the claimer already
+            // took, and it would re-spawn as a fresh proxy (the duplicate we are fixing).
+            if (!destroyed) worldTrack_.erase(tit);
+        }
+    }
+}
+
 void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ownerId) {
     if (ownHands_.empty()) return;
     // Correlate the bag-loss with a FREE ground item anywhere in the interest sphere (not just
@@ -557,6 +720,42 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
         for (unsigned int i = 0; i < nwp; ++i) curPtrs[std::string(wsids[i])].push_back(wptrs[i]);
 
         WCensus& prevC = weaponCensus_[*it];
+        // ZERO-ROW READ = NO INFORMATION. A container that yields NO rows at all is
+        // mid-reload / not fully resolved, not stripped, so nothing may be concluded from
+        // it - neither an edge NOR a baseline. Note the test is the RAW row count, not the
+        // gear-only census: a character who really does drop all their gear but still
+        // carries food reads rows>0 with an empty gear map, and that IS a real full-strip
+        // the drop pass must see (gating on the gear map hid it).
+        //
+        // Committing a zero-row read as the baseline is the worse half. It used to happen
+        // on the FIRST read of every container, right at connect while inventories were
+        // still resolving: the baseline went in empty, and the next tick's real contents
+        // read as an INCREASE for every worn item - the burst of ref=0/0 PICKUPs at
+        // 20:59:54 in the logs (one per gear item per character). Those carry no drop
+        // identity, so the receiver could re-home an arbitrary same-sid ground item into
+        // the bag. Seeding is therefore deferred until a read we can trust.
+        if (n == 0) {
+            ++prevC.zeroReads;
+            // A character genuinely carrying NOTHING also reads zero rows forever, and must
+            // eventually get a baseline or their first real pickup is never detected. Accept
+            // the empty baseline only once the zero read has REPEATED - a resolving container
+            // fills in within a tick or two, a truly empty one never does.
+            if (!prevC.seeded && prevC.zeroReads >= WD_EMPTY_SEED_TICKS) {
+                prevC.items.clear(); prevC.ptrs.clear(); prevC.seeded = true;
+                if (dumpWd) { char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[wd] census-seed-empty hand=%u,%u,%u,%u,%u (%u consecutive zero reads)",
+                    it->t, it->c, it->cs, it->i, it->s, prevC.zeroReads);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                continue;
+            }
+            if (dumpWd) { char b[180]; _snprintf(b, sizeof(b) - 1,
+                "[wd] census-skip hand=%u,%u,%u,%u,%u (zero-row read #%u; seeded=%d had %u kinds)",
+                it->t, it->c, it->cs, it->i, it->s, prevC.zeroReads,
+                prevC.seeded ? 1 : 0, (unsigned)prevC.items.size());
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+            continue;
+        }
+        prevC.zeroReads = 0; // the read is trustworthy again
         if (!prevC.seeded) {
             prevC.items = cur; prevC.ptrs = curPtrs; prevC.seeded = true; // baseline; never emit
             if (dumpWd) { char b[140]; _snprintf(b, sizeof(b) - 1,
@@ -575,10 +774,11 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
             std::map<std::string, WCensusItem>::iterator pp = prevC.items.find(ce->first);
             int prevCount = (pp != prevC.items.end()) ? pp->second.count : 0;
             int inc = ce->second.count - prevCount;
+            if (inc <= 0) continue;
             // Protocol 37: a pending/applied cross-owner gear transfer must not be
             // read as a ground PICKUP of the same sid (the count edge is the trade).
             // The end-of-loop baseline update absorbs the new count silently.
-            if (inc > 0 && wdSuppressed(*it, ce->first.c_str(), nowMs())) {
+            if (wdSuppressed(*it, ce->first.c_str(), nowMs())) {
                 if (dumpWd) { char b[160]; _snprintf(b, sizeof(b) - 1,
                     "[wd] increase-suppressed (xfer) sid='%s' inc=%d", ce->first.c_str(), inc);
                     b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
@@ -604,6 +804,22 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
                         if (prevSet.count(*q) == 0) added.push_back(*q);
             }
             std::deque<GroundWeapon>& q = groundedWeapons_[ce->first];
+            // NO EVIDENCE, NO INTENT. A count increase alone does not prove an object moved
+            // from the ground into this bag: captureContainerContents can miss a worn item
+            // for a tick and then report it again, and that flicker reads as an increase.
+            // Emitting anyway produced identity-less (ref=0/0) intents the receiver can only
+            // act on by guessing which same-sid ground item to swallow. The pointer match
+            // below IS the evidence, so an unmatched increase is dropped here - the mirror of
+            // the receiver refusing to guess. The bag itself still converges over the
+            // inventory snapshot channel; only the ground-side relocation needs identity.
+            if (added.empty()) {
+                if (dumpWd) { char b[200]; _snprintf(b, sizeof(b) - 1,
+                    "[wd] increase-unexplained sid='%s' inc=%d prev=%d now=%d (no new Item* "
+                    "arrived; census flicker, not a pickup)",
+                    ce->first.c_str(), inc, prevCount, ce->second.count);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                continue;
+            }
             for (int k = 0; k < inc; ++k) {
                 WorldPickupPacket pkt; memset(&pkt, 0, sizeof(pkt));
                 pkt.type = (u8)PKT_WORLD_PICKUP; pkt.ownerId = ownerId;
@@ -627,6 +843,19 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
                     pkt.refDropOwnerId = q.front().dropOwnerId; pkt.refDropId = q.front().dropId;
                     q.pop_front();
                 }
+                // Still no identity: this bag gained a real object we never tracked on the
+                // ground (a save-native ground item, or loot). The peer has nothing to
+                // re-home, so an intent would only invite it to guess. Stay silent.
+                    if (pkt.refDropId == 0) {
+                        // Unconditional: a real object entered this bag and we cannot name it,
+                        // so the peer will never be told to give up its ground copy. Rare, and
+                        // the direct precursor of a duplicate - it must not be dump-gated.
+                        char b[200]; _snprintf(b, sizeof(b) - 1,
+                            "[wd] increase-untracked sid='%s' inc=%d (real arrival, but no tracked "
+                            "ground instance to name)", ce->first.c_str(), inc);
+                        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                        continue;
+                    }
                 net.queueWorldPickup(pkt);
                 if (dumpWd) { char b[220]; _snprintf(b, sizeof(b) - 1,
                     "[wd] PICKUP id=%u sid='%s' owner=%u,%u,%u,%u,%u ref=%u/%u prev=%d now=%d trackedLeft=%u",
@@ -641,12 +870,15 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
             std::map<std::string, WCensusItem>::iterator ce = cur.find(pe->first);
             int now = (ce != cur.end()) ? ce->second.count : 0;
             int delta = pe->second.count - now;
-            if (delta <= 0) { prevC.retries.erase(pe->first); continue; }
+            if (delta <= 0) {
+                prevC.retries.erase(pe->first); prevC.retryArmMs.erase(pe->first);
+                continue;
+            }
             // Protocol 37: a pending/applied cross-owner gear transfer must not be
             // read as a ground DROP of the same sid (the count edge is the trade;
             // the baseline update below absorbs it silently).
             if (wdSuppressed(*it, pe->first.c_str(), nowMs())) {
-                prevC.retries.erase(pe->first);
+                prevC.retries.erase(pe->first); prevC.retryArmMs.erase(pe->first);
                 if (dumpWd) { char b[160]; _snprintf(b, sizeof(b) - 1,
                     "[wd] decrease-suppressed (xfer) sid='%s' delta=%d", pe->first.c_str(), delta);
                     b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
@@ -664,6 +896,7 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
                 int& r = prevC.retries[pe->first];
                 if (r == 0) {
                     r = MAX_RETRY;
+                    prevC.retryArmMs[pe->first] = nowMs(); // start the absolute hold ceiling
                     if (dumpWd) engine::diagGroundScan(gw, cHand, pe->first.c_str(), GROUND_R);
                 }
                 // Protocol 37: while the transfer detector is still watching an
@@ -686,7 +919,7 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
                 // at the OWNER's position as the mirror target - the weapon was dropped at its
                 // feet, so the peer relocating its own copy there reproduces the drop. (A rare
                 // intra-squad trade would be mirrored as a drop here; reconcile then corrects it.)
-                prevC.retries.erase(pe->first);
+                prevC.retries.erase(pe->first); prevC.retryArmMs.erase(pe->first);
                 if (!engine::objectWorldPos(cHand, pos)) {
                     if (dumpWd) { char b[160]; _snprintf(b, sizeof(b) - 1,
                         "[wd] decrease-nopos hand=%u,%u,%u,%u,%u sid='%s' (owner pos unresolved; skip)",
@@ -699,7 +932,7 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
                     it->t, it->c, it->cs, it->i, it->s, pe->first.c_str(), pos[0], pos[1], pos[2]);
                     b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
             } else {
-                prevC.retries.erase(pe->first);
+                prevC.retries.erase(pe->first); prevC.retryArmMs.erase(pe->first);
             }
             // The departed weapon's REAL Item* is the prior tick's handle for this sid; after a
             // UI drop it persists as the now-grounded object (conservation). Remember it so a
@@ -727,8 +960,7 @@ void Replicator::detectAndPublishWeaponDrops(GameWorld* gw, NetLink& net, u32 ow
                 pkt.x = dpos[0]; pkt.y = dpos[1]; pkt.z = dpos[2];
                 net.queueWorldDrop(pkt);
                 if (di) {
-                    GroundWeapon gw2; gw2.dropOwnerId = ownerId; gw2.dropId = pkt.dropId; gw2.item = di;
-                    groundedWeapons_[pe->first].push_back(gw2);
+                    trackGroundGear(pe->first, ownerId, pkt.dropId, di, /*authored*/ true);
                     departed.pop_front();
                 }
                 char b[220]; _snprintf(b, sizeof(b) - 1,
@@ -763,13 +995,30 @@ void Replicator::applyWeaponDrops(GameWorld* gw, Inbound& in) {
         void* dropped = 0;
         int moved = engine::relocateWeaponToGround(gw, ownerHand, p.stringID, p.itemType,
                                                    p.x, p.y, p.z, &dropped);
+        // BACKSTOP: no local copy to relocate. If the owner container does not resolve here
+        // at all, the bag simply is not loaded yet - do nothing (fabricating would mint into
+        // a container we cannot see, and the sender's resend will retry). But if it DOES
+        // resolve, then this client genuinely lacks the item, which historically meant the
+        // drop was silently lost (moved=0 and the weapon existed only on the dropper's
+        // ground). Rebuild it from the intent's own provenance and drop that.
+        // A worn CONTAINER (backpack) is exempt: fabricating one mints an EMPTY bag, so a
+        // "heal" would trade a missing backpack for a silently emptied one PLUS a duplicate
+        // once the real object turns up. Only relocation preserves the nested contents, so a
+        // container that cannot be relocated is reported LOST rather than rebuilt.
+        bool healed = false;
+        if (moved == 0 && !engine::isContainerItemType(p.itemType) &&
+            engine::resolveObjectByHand(ownerHand) != 0) {
+            moved = engine::fabricateWeaponToGround(gw, ownerHand, p.stringID, p.itemType,
+                                                    (int)p.quality, p.manufacturer, p.material,
+                                                    p.x, p.y, p.z, &dropped);
+            healed = (moved > 0);
+        }
         // Track the relocated REAL object under the drop's SHARED identity so a later PICKUP
         // intent naming (ownerId, dropId) re-homes this exact handle back into the owner's bag
         // (no spatial re-query, which fails in towns; no FIFO-by-sid guess between duplicates).
-        if (moved > 0 && dropped) {
-            GroundWeapon gw2; gw2.dropOwnerId = p.ownerId; gw2.dropId = p.dropId; gw2.item = dropped;
-            groundedWeapons_[std::string(p.stringID)].push_back(gw2);
-        }
+        if (moved > 0 && dropped)
+            trackGroundGear(std::string(p.stringID), p.ownerId, p.dropId, dropped,
+                            /*authored*/ false);
         // Keep the transfer detector blind to the relocation we just made.
         if (moved > 0) xferRebase(gw, ok);
         char b[240]; _snprintf(b, sizeof(b) - 1,
@@ -778,6 +1027,204 @@ void Replicator::applyWeaponDrops(GameWorld* gw, Inbound& in) {
             p.oSerial, moved, p.x, p.y, p.z,
             (unsigned)groundedWeapons_[std::string(p.stringID)].size());
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        // Distinguish "conserved" from "rebuilt" and from "still lost": a HEAL means the
+        // race beat the publish hold, and a LOST means even fabrication failed.
+        if (healed) {
+            char h[200]; _snprintf(h, sizeof(h) - 1,
+                "[wd] APPLY-HEALED id=%u sid='%s' (no local copy; rebuilt from intent provenance)",
+                p.dropId, p.stringID);
+            h[sizeof(h) - 1] = '\0'; coop::logLine(h);
+        } else if (moved == 0) {
+            char h[200]; _snprintf(h, sizeof(h) - 1,
+                "[wd] APPLY-LOST id=%u sid='%s' (no local copy and no rebuild; drop not mirrored)",
+                p.dropId, p.stringID);
+            h[sizeof(h) - 1] = '\0'; coop::logLine(h);
+        }
+    }
+}
+
+// TEST-ONLY fault injection: KENSHICOOP_WD_FORGET_TRACK=1 makes the DROP AUTHOR discard its
+// ground track the moment it is created, reproducing the state the player's session was
+// actually in - a real, identified pickup arrives and the author has no handle for the object.
+// Without this lever there is no deterministic way to gate the site-anchored recovery, because
+// losing a track in the wild depends on the engine streaming an object out from under us.
+//
+// Only the AUTHORED side forgets, and that asymmetry is the whole point: the PICKER needs its
+// own track to put an identity on the intent at all. Forgetting on both sides instead
+// reproduced a different bug - the picker could name nothing, suppressed the intent as
+// increase-untracked, and the author was never even asked.
+static bool injectForgetTrack(bool authored) {
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("KENSHICOOP_WD_FORGET_TRACK"); on = (e && e[0] == '1') ? 1 : 0; }
+    return on == 1 && authored;
+}
+
+void Replicator::trackGroundGear(const std::string& sid, u32 dropOwnerId, u32 dropId,
+                                 void* item, bool authored) {
+    if (injectForgetTrack(authored)) {
+        char b[160]; _snprintf(b, sizeof(b) - 1,
+            "[wd] TRACK-FORGET-INJECTED sid='%s' drop=%u/%u (test lever)",
+            sid.c_str(), dropOwnerId, dropId);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        return;
+    }
+    GroundWeapon g;
+    g.dropOwnerId = dropOwnerId; g.dropId = dropId; g.item = item;
+    for (int k = 0; k < 5; ++k) { g.hand[k] = 0; g.pendingHand[k] = 0; }
+    g.pendingType = 0; g.pendingSinceMs = 0; g.deadReads = 0;
+    // The object's save-stable hand, so the re-home can re-resolve it. A runtime-minted
+    // item may have no useful hand; the raw pointer stays as the fallback.
+    if (item) engine::readObjectHand(reinterpret_cast<RootObject*>(item), g.hand);
+    groundedWeapons_[sid].push_back(g);
+}
+
+namespace {
+// Does the container at cHand hold (sid, type)? Tri-state on purpose: a container that
+// yields NO rows is UNREADABLE (mid-resolve), which must never be read as "does not hold
+// it" - that is the misreading that would license destroying the last copy.
+//   1 = holds it, 0 = readable and does NOT hold it, -1 = unreadable.
+int containerHoldsItemState(GameWorld* gw, const unsigned int cHand[5], const char* sid,
+                            unsigned int typeCat) {
+    if (!sid || !sid[0]) return -1;
+    InvItemEntry items[INV_ITEMS_MAX];
+    unsigned int n = engine::captureContainerContents(gw, cHand, items, INV_ITEMS_MAX, 0);
+    if (n == 0) return -1;
+    for (unsigned int i = 0; i < n; ++i) {
+        if (typeCat != 0 && items[i].itemType != typeCat) continue;
+        if (strcmp(items[i].stringID, sid) == 0) return 1;
+    }
+    return 0;
+}
+
+// TEST-ONLY fault injection. A live re-home refusal depends on the state of a bag we do not
+// control (an occupied equip slot, no room), so these levers are the only way to gate the
+// recovery deterministically - and the absence of that recovery is precisely what turned a
+// refusal into a permanent duplicate.
+//   KENSHICOOP_WD_REFUSE_REHOME=1     refuse ONCE   -> exercises the retry
+//   KENSHICOOP_WD_REFUSE_REHOME_ALL=1 refuse ALWAYS -> exercises verify-then-destroy, the
+//                                     branch that retires our ground copy against the bag
+//                                     we can actually read
+// Consulted by BOTH re-home attempts (the pickup apply and the reconcile retry), or "refuse
+// always" would be quietly satisfied by the retry.
+bool injectRehomeRefusal() {
+    static int mode = -1; // 0 = off, 1 = first only, 2 = always
+    if (mode < 0) {
+        const char* all = getenv("KENSHICOOP_WD_REFUSE_REHOME_ALL");
+        const char* one = getenv("KENSHICOOP_WD_REFUSE_REHOME");
+        mode = (all && all[0] == '1') ? 2 : ((one && one[0] == '1') ? 1 : 0);
+    }
+    if (mode == 0) return false;
+    if (mode == 1) mode = 0;
+    coop::logLine("[wd] REHOME-REFUSE-INJECTED (test lever: re-home refused)");
+    return true;
+}
+
+// Resolve a tracked ground item to a LIVE free ground object, or 0 if it is no longer one.
+// The CACHED pointer is tried first and on purpose: it is the object we actually relocated,
+// and the liveness probe is SEH-guarded so a dangling pointer simply reads as dead. Trusting
+// the HAND first was wrong - a ground item's hand does not necessarily resolve back to that
+// item (runtime-minted items have host-only hands), and whatever it did resolve to was then
+// read through an Item* cast, so an unrelated object's bytes decided liveness. That is what
+// made the author discard live ground tracks and answer a real pickup with "untracked",
+// leaving its copy on the ground: the duplicate the player saw.
+RootObject* resolveGroundGear(const unsigned int hand[5], void* cached) {
+    bool pickedUp = false;
+    RootObject* ro = reinterpret_cast<RootObject*>(cached);
+    if (ro && engine::groundObjectLiveness(ro, 0, &pickedUp)) return ro;
+    if (pickedUp) return 0; // it really has entered a bag - not ours to re-home any more
+    // The cached pointer is dead or unreadable (the engine streamed the object out and back,
+    // say). The hand is the only other handle we have, so try it - but only now.
+    bool haveHand = false;
+    for (int k = 0; k < 5; ++k) if (hand[k] != 0) { haveHand = true; break; }
+    if (!haveHand) return 0;
+    RootObject* byHand = engine::resolveObjectByHand(hand);
+    if (!byHand || byHand == ro) return 0;
+    if (!engine::groundObjectLiveness(byHand, 0, &pickedUp)) return 0;
+    return byHand;
+}
+} // namespace
+
+void Replicator::reconcileGroundGear(GameWorld* gw) {
+    if (groundedWeapons_.empty()) return;
+    static int dumpWd = -1;
+    if (dumpWd < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dumpWd = (e && e[0] == '1') ? 1 : 0; }
+    unsigned long now = nowMs();
+    for (std::map<std::string, std::deque<GroundWeapon> >::iterator sit = groundedWeapons_.begin();
+         sit != groundedWeapons_.end(); ++sit) {
+        std::deque<GroundWeapon>& q = sit->second;
+        for (std::deque<GroundWeapon>::iterator g = q.begin(); g != q.end(); ) {
+            RootObject* ro = resolveGroundGear(g->hand, g->item);
+            if (!ro) {
+                // Not reading as a free ground item. Do NOT conclude anything yet - a single
+                // bad read is exactly what used to make us forget a live ground copy and
+                // answer a real pickup with "untracked". Only a REPEATED failure retires the
+                // track (nothing is on the ground then, so there is no duplicate to resolve).
+                if (++g->deadReads < WD_DEAD_READS_MAX) { ++g; continue; }
+                char b[200]; _snprintf(b, sizeof(b) - 1,
+                    "[wd] ground-prune sid='%s' drop=%u/%u (%u consecutive reads: not a free "
+                    "ground item)", sit->first.c_str(), g->dropOwnerId, g->dropId, g->deadReads);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                g = q.erase(g);
+                continue;
+            }
+            g->deadReads = 0;
+            bool pending = false;
+            for (int k = 0; k < 5; ++k) if (g->pendingHand[k] != 0) { pending = true; break; }
+            if (!pending) { ++g; continue; }
+            // A peer took this item but our own bag refused the object. Retry: the refusal is
+            // often transient (the container was still resolving, or a reconcile has since
+            // freed the equip slot).
+            int moved = injectRehomeRefusal() ? 0
+                                             : engine::addItemPtrToInventory(gw, g->pendingHand, ro);
+            if (moved) {
+                char b[200]; _snprintf(b, sizeof(b) - 1,
+                    "[wd] REHOME-RETRY-OK sid='%s' drop=%u/%u afterMs=%lu",
+                    sit->first.c_str(), g->dropOwnerId, g->dropId,
+                    (unsigned long)(now - g->pendingSinceMs));
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                Key tk; tk.t = g->pendingHand[0]; tk.c = g->pendingHand[1];
+                tk.cs = g->pendingHand[2]; tk.i = g->pendingHand[3]; tk.s = g->pendingHand[4];
+                xferRebase(gw, tk); // keep the drag detector blind to our own relocation
+                g = q.erase(g);
+                continue;
+            }
+            if (now - g->pendingSinceMs < WD_REHOME_MAX_MS) { ++g; continue; }
+            // Out of patience. The peer holds the item and we still have it on the ground:
+            // that is a DUPLICATE - but only once we can SEE our own copy in the target
+            // container may we destroy the ground one. Until then, keeping a duplicate beats
+            // destroying the only instance (the reconcile cannot rebuild a truncated read,
+            // a weapon with fabrication disabled, or a backpack at all).
+            int inBag = containerHoldsItemState(gw, g->pendingHand, sit->first.c_str(),
+                                                g->pendingType);
+            if (inBag == 1) {
+                bool destroyed = engine::removeWorldItemProxy(gw, ro);
+                char b[220]; _snprintf(b, sizeof(b) - 1,
+                    "[wd] REHOME-DEDUPE sid='%s' drop=%u/%u destroyed=%d (bag already holds it)",
+                    sit->first.c_str(), g->dropOwnerId, g->dropId, destroyed ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                if (destroyed) { g = q.erase(g); continue; }
+            } else if (inBag == -1) {
+                // Target unreadable (not loaded / mid-resolve). Neither conclusion is safe,
+                // so extend the window rather than decide on a blind read.
+                g->pendingSinceMs = now;
+                if (dumpWd) { char b[200]; _snprintf(b, sizeof(b) - 1,
+                    "[wd] REHOME-WAIT sid='%s' drop=%u/%u (target container unreadable)",
+                    sit->first.c_str(), g->dropOwnerId, g->dropId);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+                ++g;
+                continue;
+            } else {
+                char b[240]; _snprintf(b, sizeof(b) - 1,
+                    "[wd] REHOME-DUPE-RISK sid='%s' drop=%u/%u (bag refused it and does NOT "
+                    "hold it; leaving our ground copy rather than losing the item)",
+                    sit->first.c_str(), g->dropOwnerId, g->dropId);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            // Stop retrying; the track stays so the item is never orphaned.
+            for (int k = 0; k < 5; ++k) g->pendingHand[k] = 0;
+            g->pendingSinceMs = 0;
+            ++g;
+        }
     }
 }
 
@@ -805,18 +1252,60 @@ void Replicator::applyWeaponPickups(GameWorld* gw, Inbound& in) {
             // the very mistake this identity fixes; a genuine peer copy will match.
             for (std::deque<GroundWeapon>::iterator g = q.begin(); g != q.end(); ++g)
                 if (g->dropOwnerId == p.refDropOwnerId && g->dropId == p.refDropId) { pick = g; break; }
-        } else if (!q.empty()) {
-            pick = q.begin(); // legacy/no-identity: fall back to oldest same-sid copy
         }
+        const char* why = "ok";
         if (pick != q.end()) {
-            void* item = pick->item;
-            moved = engine::addItemPtrToInventory(gw, targetHand, item);
-            if (moved) q.erase(pick); // re-homed; stop tracking it on the ground
+            // Re-resolve rather than trust the cached Item*: it may name an object the engine
+            // has since despawned, and a dead pointer into addItemPtrToInventory is how a
+            // re-home "succeeded" at nothing while our ground copy stayed put.
+            RootObject* ro = resolveGroundGear(pick->hand, pick->item);
+            if (!ro) {
+                why = "gone";
+                q.erase(pick); // not on the ground any more; nothing to duplicate
+            } else {
+                moved = injectRehomeRefusal() ? 0
+                                             : engine::addItemPtrToInventory(gw, targetHand, ro);
+                if (moved) {
+                    q.erase(pick); // re-homed; stop tracking it on the ground
+                } else {
+                    // The object is alive but our bag refused it (occupied equip slot, no
+                    // room, container still resolving). Leaving it here is what showed up as
+                    // an item duplicated on the author's ground. Arm the bounded retry;
+                    // reconcileGroundGear finishes the job - and only ever destroys our
+                    // ground copy once it has read the item in the target bag.
+                    why = "refused";
+                    for (int k = 0; k < 5; ++k) pick->pendingHand[k] = targetHand[k];
+                    pick->pendingType    = p.itemType;
+                    pick->pendingSinceMs = nowMs();
+                }
+            }
+        } else if (p.refDropId != 0) {
+            // The picker NAMED a drop we no longer have tracked. The intent is trustworthy -
+            // a real object really did leave the ground over there - so answering "untracked"
+            // and doing nothing is not neutral: our copy stays on the ground and the item is
+            // duplicated for the rest of the session. That is what the player hit picking up
+            // boots on the join. Since the identity is real but our handle for it is not, fall
+            // back to WHERE rather than WHICH: relocate a free ground item of the same
+            // (sid,type) lying near the picking character. Unlike the FIFO guess this replaces,
+            // it is anchored to the pickup site, and it can only ever fire for an identified
+            // intent - an identity-less one still gets nothing.
+            moved = injectRehomeRefusal()
+                        ? 0
+                        : engine::pickupWorldItemIntoInventory(gw, targetHand, p.stringID,
+                                                               p.itemType, WD_REHOME_SCAN_R);
+            why = moved ? "recovered-by-site" : "untracked";
+        } else {
+            // NO FALLBACK for an identity-less pickup. Re-homing "the oldest same-sid copy" on
+            // a ref=0/0 intent means a bogus pickup TELEPORTS an unrelated ground item into a
+            // bag - the census used to emit a burst of exactly those at connect. Without an
+            // instance identity we cannot know which object was taken, so we do nothing: the
+            // peer's own snapshot still converges its bag, and our ground copy is left alone.
+            why = "no-identity";
         }
-        char b[240]; _snprintf(b, sizeof(b) - 1,
-            "[wd] PICKUP-APPLY id=%u sid='%s' owner=%u,%u,%u,%u,%u ref=%u/%u moved=%d trackedLeft=%u",
+        char b[260]; _snprintf(b, sizeof(b) - 1,
+            "[wd] PICKUP-APPLY id=%u sid='%s' owner=%u,%u,%u,%u,%u ref=%u/%u moved=%d why=%s trackedLeft=%u",
             p.pickupId, p.stringID, p.oType, p.oContainer, p.oContainerSerial, p.oIndex,
-            p.oSerial, p.refDropOwnerId, p.refDropId, moved, (unsigned)q.size());
+            p.oSerial, p.refDropOwnerId, p.refDropId, moved, why, (unsigned)q.size());
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         // Keep the transfer detector blind to the relocation we just made.
         Key tk; tk.t = p.oType; tk.c = p.oContainer; tk.cs = p.oContainerSerial;
@@ -858,6 +1347,30 @@ bool Replicator::wdSuppressed(const Key& k, const char* sid, unsigned long now) 
     if (it == wdSuppress_.end()) return false;
     if (now > it->second) { wdSuppress_.erase(it); return false; }
     return true;
+}
+
+bool Replicator::wdPendingDrop(const Key& k) const {
+    std::map<Key, WCensus>::const_iterator it = weaponCensus_.find(k);
+    if (it == weaponCensus_.end()) return false;
+    unsigned long now = nowMs();
+    // A non-zero retry budget means the census saw gear LEAVE this container and is still
+    // hunting the ground copy that would let it author the drop intent.
+    //
+    // But the budget is FRAME-denominated and xferPendingLoss re-arms it, so it can cycle
+    // indefinitely while the transfer detector holds an unresolved loss. The drop verdict can
+    // afford to wait; the inventory snapshot cannot, because this predicate gates the whole
+    // container. Honour the hold only within WD_HOLD_MAX_MS of the FIRST arm - past that we
+    // publish and accept the (recoverable, and heal-backstopped) race rather than starving
+    // the peer's view of the bag. Observed unbounded: 280 consecutive holds on one container.
+    for (std::map<std::string, int>::const_iterator r = it->second.retries.begin();
+         r != it->second.retries.end(); ++r) {
+        if (r->second <= 0) continue;
+        std::map<std::string, unsigned long>::const_iterator a =
+            it->second.retryArmMs.find(r->first);
+        if (a == it->second.retryArmMs.end()) return true; // armed without a stamp: honour it
+        if (now - a->second < WD_HOLD_MAX_MS) return true;
+    }
+    return false;
 }
 
 void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 ownerId) {
@@ -1057,9 +1570,12 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, u32 localId) {
             // wdSuppress_ keeps the W2 weapon census from reading the count edge as a
             // ground pickup. KENSHICOOP_WEAPON_FAB=0 restores gear-never-fabricates
             // (weapons also die inside createItemAndAdd on the same env).
+            // A worn CONTAINER (backpack) NEVER fabricates: the template mints an EMPTY bag,
+            // so the trade would land as a contents-less duplicate the moment our real copy
+            // resolves. A short container transfer stays short and reconcile corrects it.
             static int gearFab = -1;
             if (gearFab < 0) { const char* e = getenv("KENSHICOOP_WEAPON_FAB"); gearFab = (e && e[0] == '0') ? 0 : 1; }
-            if (!isGearType(p.itemType) || gearFab)
+            if ((!isGearType(p.itemType) || gearFab) && !engine::isContainerItemType(p.itemType))
                 fab = engine::addItemsToContainerBySid(gw, dHand, p.stringID, p.itemType,
                                                        (int)p.quantity - moved, (int)p.quality,
                                                        p.manufacturer, p.material);

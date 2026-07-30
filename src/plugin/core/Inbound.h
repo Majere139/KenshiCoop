@@ -42,6 +42,7 @@ struct InboundEvent {
 struct InboundInv {
     u32                       ownerId;
     u8                        keyKind;
+    u8                        flags;   // protocol 46: INV_FLAG_TRUNCATED (additive-only)
     u32                       cKey[5]; // type, container, containerSerial, index, serial
     std::vector<InvItemEntry> items;
 };
@@ -58,6 +59,15 @@ struct InboundWorldItems {
 // interest sphere, so the join destroys the matching proxies.
 struct InboundWorldRemove {
     u32              ownerId;
+    std::vector<u32> netIds;
+};
+
+// One received world-item CLAIM (protocol 47): a peer consumed the proxies it held for these
+// netIds, so WE (the author) must destroy our real ground objects. netIds are in OUR netId
+// space; authorId lets a receiver ignore a claim addressed to a different author.
+struct InboundWorldClaim {
+    u32              ownerId;  // the claiming peer
+    u32              authorId; // whose netId space the ids belong to
     std::vector<u32> netIds;
 };
 
@@ -370,7 +380,8 @@ public:
         // without bound. ent_ = ~12 s of a 20 Hz * 17-entity stream; stealth/cam
         // are ~1 Hz refreshes. Every other queue is reliable and stays unbounded.
         ent_(worldReset_, 4096),  evt_(worldReset_),        inv_(worldReset_),
-        wi_(worldReset_),         wir_(worldReset_),        npcCensus_(worldReset_),
+        wi_(worldReset_),         wir_(worldReset_),        wic_(worldReset_),
+        npcCensus_(worldReset_),
         wd_(worldReset_),         invXfer_(worldReset_),    wp_(worldReset_),
         med_(worldReset_),        treat_(worldReset_),      combatHit_(worldReset_),
         speed_(worldReset_),
@@ -421,10 +432,11 @@ public:
     }
     // NET thread: one received container-contents snapshot, owner-tagged.
     void pushInv(u32 ownerId, u8 keyKind, const u32 cKey[5],
-                 const InvItemEntry* items, unsigned int count) {
+                 const InvItemEntry* items, unsigned int count, u8 flags = 0) {
         InboundInv ii;
         ii.ownerId = ownerId;
         ii.keyKind = keyKind;
+        ii.flags   = flags;
         for (int k = 0; k < 5; ++k) ii.cKey[k] = cKey[k];
         if (items && count > 0) ii.items.assign(items, items + count);
         EnterCriticalSection(&cs_); inv_.push_back(ii); LeaveCriticalSection(&cs_);
@@ -442,6 +454,13 @@ public:
         wr.ownerId = ownerId;
         if (netIds && count > 0) wr.netIds.assign(netIds, netIds + count);
         EnterCriticalSection(&cs_); wir_.push_back(wr); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received world-item claim (protocol 47), owner-tagged.
+    void pushWorldClaim(u32 ownerId, u32 authorId, const u32* netIds, unsigned int count) {
+        InboundWorldClaim wc;
+        wc.ownerId = ownerId; wc.authorId = authorId;
+        if (netIds && count > 0) wc.netIds.assign(netIds, netIds + count);
+        EnterCriticalSection(&cs_); wic_.push_back(wc); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received NPC existence census (protocol 36), owner-tagged.
     void pushNpcCensus(u32 ownerId, const u32* hands, const float* pos,
@@ -627,6 +646,9 @@ public:
     void drainWorldRemove(std::deque<InboundWorldRemove>& out) {
         EnterCriticalSection(&cs_); out.swap(wir_); LeaveCriticalSection(&cs_);
     }
+    void drainWorldClaim(std::deque<InboundWorldClaim>& out) {
+        EnterCriticalSection(&cs_); out.swap(wic_); LeaveCriticalSection(&cs_);
+    }
     void drainNpcCensus(std::deque<InboundNpcCensus>& out) {
         EnterCriticalSection(&cs_); out.swap(npcCensus_); LeaveCriticalSection(&cs_);
     }
@@ -764,6 +786,7 @@ private:
     WorldQ<InboundInv>             inv_;
     WorldQ<InboundWorldItems>      wi_;
     WorldQ<InboundWorldRemove>     wir_;
+    WorldQ<InboundWorldClaim>      wic_;
     WorldQ<InboundNpcCensus>       npcCensus_;
     WorldQ<InboundWorldDrop>       wd_;
     WorldQ<InboundInvXfer>         invXfer_;

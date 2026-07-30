@@ -174,6 +174,8 @@ function Invoke-OneOracle {
         "split_interest" { return (Test-SplitInterest  -HostFile $HostLog -JoinFile $JoinLog -Tol $Tolerance) }
         "inv_sync"      { return (Test-InventorySync   -HostFile $HostLog -JoinFile $JoinLog) }
         "inv_bidir"     { return (Test-InventoryBidir  -HostFile $HostLog -JoinFile $JoinLog) }
+        "inv_overflow"  { return (Test-InventoryOverflow -HostFile $HostLog -JoinFile $JoinLog) }
+        "inv_dropfull"  { return (Test-InventoryDropFull -HostFile $HostLog -JoinFile $JoinLog) }
         "inv_equip"     { return (Test-InventoryEquip  -HostFile $HostLog -JoinFile $JoinLog) }
         "inv_reequip"   { return (Test-InventoryReequip -HostFile $HostLog -JoinFile $JoinLog) }
         "add_equip"     { return (Test-AddEquip        -HostFile $HostLog -JoinFile $JoinLog) }
@@ -185,6 +187,18 @@ function Invoke-OneOracle {
         "wpn_relocate"  { return (Test-WpnRelocate     -HostFile $HostLog -JoinFile $JoinLog) }
         "weapon_drop"   { return (Test-WeaponDrop      -HostFile $HostLog -JoinFile $JoinLog) }
         "armor_drop"    { return (Test-WeaponDrop      -HostFile $HostLog -JoinFile $JoinLog -GateName "armor_drop") }
+        "backpack_drop" { return (Test-WeaponDrop      -HostFile $HostLog -JoinFile $JoinLog -GateName "backpack_drop") }
+        "pickup_mirror" { return (Test-WorldPickupMirror -HostFile $HostLog -JoinFile $JoinLog) }
+        "gear_repickup" { return (Test-GearRepickup    -HostFile $HostLog -JoinFile $JoinLog) }
+        "gear_repickup_retry" { return (Test-GearRepickup -HostFile $HostLog -JoinFile $JoinLog `
+                                            -GateName "gear_repickup_retry" -RequireRetry) }
+        "gear_repickup_dedupe" { return (Test-GearRepickup -HostFile $HostLog -JoinFile $JoinLog `
+                                            -GateName "gear_repickup_dedupe" -RequireDedupe) }
+        "gear_repickup_recover" { return (Test-GearRepickup -HostFile $HostLog -JoinFile $JoinLog `
+                                            -GateName "gear_repickup_recover" -RequireSiteRecovery) }
+        "world_item_burst" { return (Test-WorldItemBurst -HostFile $HostLog -JoinFile $JoinLog) }
+        "nested_bag"    { return (Test-NestedBag       -HostFile $HostLog -JoinFile $JoinLog) }
+        "no_phantom_pickups" { return (Test-NoPhantomPickups -HostFile $HostLog -JoinFile $JoinLog) }
         "weapon_loot"   { return (Test-WeaponLoot      -HostFile $HostLog -JoinFile $JoinLog) }
         "rejoin_items"  { return (Test-RejoinItems     -HostFile $HostLog -JoinFile $JoinLog) }
         "smoothness"    { return (Test-Smoothness      -File $JoinLog) }
@@ -384,8 +398,11 @@ Export-ModuleMember -Function @(
     "Test-CombatCrowd",
     "Test-SplitInterest",
     "Test-InventorySync", "Test-InventoryBidir", "Test-InventoryEquip",
+    "Test-InventoryOverflow", "Test-InventoryDropFull",
     "Test-InventoryReequip", "Test-AddEquip", "Test-TradeProbe", "Test-TradePeer", "Test-DropProbe",
     "Test-WorldItemSync", "Test-RejoinItems", "Test-WpnRelocate", "Test-WeaponDrop",
+    "Test-WorldPickupMirror", "Test-GearRepickup", "Test-NoPhantomPickups", "Test-WorldItemBurst",
+    "Test-NestedBag",
     "Test-Smoothness", "Test-AnimTruth", "Test-MarchInPlace",
     "Test-SnapRate", "Test-SuppressChurn", "Test-RestFlap",
     "Test-ExistenceParity",

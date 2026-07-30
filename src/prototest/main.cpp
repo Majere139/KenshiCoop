@@ -77,11 +77,12 @@ static void testSizes() {
     CHECK_EQ("sizeof(EventPacket)",             sizeof(EventPacket),             54);
     CHECK_EQ("sizeof(EntityState)",             sizeof(EntityState),             79);
     CHECK_EQ("sizeof(EntityBatchHeader)",       sizeof(EntityBatchHeader),       14); // v35: +sendMs; v44: +epoch
-    CHECK_EQ("sizeof(InvItemEntry)",            sizeof(InvItemEntry),            158); // v42: +locked+lockReserved
-    CHECK_EQ("sizeof(InvSnapshotHeader)",       sizeof(InvSnapshotHeader),       27); // v33: +keyKind
+    CHECK_EQ("sizeof(InvItemEntry)",            sizeof(InvItemEntry),            158); // v42: +locked, v48: reserved byte became parentIdx (size unchanged)
+    CHECK_EQ("sizeof(InvSnapshotHeader)",       sizeof(InvSnapshotHeader),       28); // v33: +keyKind; v46: +flags
     CHECK_EQ("sizeof(WorldItemEntry)",          sizeof(WorldItemEntry),          73);
     CHECK_EQ("sizeof(WorldItemSnapshotHeader)", sizeof(WorldItemSnapshotHeader), 6);
     CHECK_EQ("sizeof(WorldItemRemoveHeader)",   sizeof(WorldItemRemoveHeader),   6);
+    CHECK_EQ("sizeof(WorldItemClaimHeader)",    sizeof(WorldItemClaimHeader),    10); // v47
     CHECK_EQ("sizeof(WorldDropPacket)",         sizeof(WorldDropPacket),         191);
     CHECK_EQ("sizeof(WorldPickupPacket)",       sizeof(WorldPickupPacket),       91); // v40: +item identity
     CHECK_EQ("sizeof(InvXferPacket)",           sizeof(InvXferPacket),           201); // v36
@@ -220,7 +221,69 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v45: join-dealt combat-hit report)", (int)PROTOCOL_VERSION, 45);
+    CHECK_EQ("PROTOCOL_VERSION (v48: nested container contents)",
+             (int)PROTOCOL_VERSION, 48);
+
+    // Protocol 48: the parent reference. A worn backpack owns a PRIVATE inventory, so a bagged
+    // item is described by no snapshot unless it can name its container. The byte was already
+    // reserved, so the entry must not have grown, and index 0 must keep meaning "top level" or
+    // every existing entry would silently claim a parent.
+    {
+        InvItemEntry pe; std::memset(&pe, 0, sizeof(pe));
+        CHECK_EQ("parentIdx defaults to top-level (0)", (int)pe.parentIdx, 0);
+        CHECK("parentIdx addresses every entry INV_ITEMS_MAX allows", INV_ITEMS_MAX < 256);
+    }
+
+    // Protocol 46 (inventory item-loss fixes). The entry cap must match the receiver's
+    // own read depth (MAXC in applyContainerContents) or a snapshot silently describes
+    // less than the peer holds, and it must stay inside the u8 `count` field.
+    CHECK_EQ("INV_ITEMS_MAX raised to the receiver's read depth", (int)INV_ITEMS_MAX, 64);
+    CHECK("INV_ITEMS_MAX fits the u8 count field", INV_ITEMS_MAX <= 255);
+    // The TRUNCATED bit is what stops a partial snapshot being read as a delete. It must
+    // be a single low bit so future flags can share the byte.
+    CHECK_EQ("INV_FLAG_TRUNCATED value", (int)INV_FLAG_TRUNCATED, 1);
+    CHECK("INV_FLAG_TRUNCATED is a single bit",
+          (INV_FLAG_TRUNCATED & (u8)(INV_FLAG_TRUNCATED - 1)) == 0);
+    // `count` must remain the LAST header field: the entry array is framed immediately
+    // after it, so inserting `flags` anywhere else would shift the payload.
+    {
+        InvSnapshotHeader h;
+        std::memset(&h, 0, sizeof(h));
+        const unsigned char* base = reinterpret_cast<const unsigned char*>(&h);
+        std::size_t offCount = (std::size_t)(reinterpret_cast<const unsigned char*>(&h.count) - base);
+        std::size_t offFlags = (std::size_t)(reinterpret_cast<const unsigned char*>(&h.flags) - base);
+        CHECK_EQ("InvSnapshotHeader::count is the last field",
+                 offCount, sizeof(InvSnapshotHeader) - 1);
+        CHECK("InvSnapshotHeader::flags precedes the container key", offFlags < offCount);
+    }
+
+    // Protocol 47 (world-item CLAIM: the W1 pickup mirror). The tag must be unique or a
+    // claim would be decoded as some other packet and silently destroy the wrong thing.
+    CHECK_EQ("PKT_WORLD_ITEM_CLAIM id", (int)PKT_WORLD_ITEM_CLAIM, 43);
+    CHECK("PKT_WORLD_ITEM_CLAIM distinct",
+          PKT_WORLD_ITEM_CLAIM != PKT_WORLD_ITEM &&
+          PKT_WORLD_ITEM_CLAIM != PKT_WORLD_ITEM_REMOVE &&
+          PKT_WORLD_ITEM_CLAIM != PKT_COMBAT_HIT &&
+          PKT_WORLD_ITEM_CLAIM != PKT_WORLD_DROP &&
+          PKT_WORLD_ITEM_CLAIM != PKT_WORLD_PICKUP);
+    {
+        // The netId array is framed immediately after `count`, exactly as in the cull
+        // header, so `count` must stay LAST. A claim also carries authorId (the netIds
+        // live in the AUTHOR's id space, not the claimer's) - it must sit BEFORE count.
+        WorldItemClaimHeader h;
+        std::memset(&h, 0, sizeof(h));
+        const unsigned char* base = reinterpret_cast<const unsigned char*>(&h);
+        std::size_t offCount  = (std::size_t)(reinterpret_cast<const unsigned char*>(&h.count) - base);
+        std::size_t offAuthor = (std::size_t)(reinterpret_cast<const unsigned char*>(&h.authorId) - base);
+        std::size_t offOwner  = (std::size_t)(reinterpret_cast<const unsigned char*>(&h.ownerId) - base);
+        CHECK_EQ("WorldItemClaimHeader::count is the last field",
+                 offCount, sizeof(WorldItemClaimHeader) - 1);
+        CHECK("WorldItemClaimHeader::authorId precedes count", offAuthor < offCount);
+        CHECK("WorldItemClaimHeader::ownerId precedes authorId", offOwner < offAuthor);
+    }
+    // A claim batch is capped by the u8 count; even a full one must fit a datagram.
+    CHECK("full world-item claim fits datagram",
+          sizeof(WorldItemClaimHeader) + 255 * sizeof(u32) <= 1400);
 }
 
 // ---- 2. readPacket / packetType round-trips -----------------------------------
@@ -704,6 +767,10 @@ static void testContentHash() {
     CHECK("locked perturbs hash",       invEntryHash(b) != base);
     b = makeEntry(); b.section = 1234;
     CHECK("section perturbs hash",      invEntryHash(b) != base);
+    // WHERE it sits is content: the same stack loose on the character vs inside a worn bag is
+    // otherwise field-for-field identical, so without this the move never publishes.
+    b = makeEntry(); b.parentIdx = 1;
+    CHECK("parentIdx perturbs hash",    invEntryHash(b) != base);
     b = makeEntry(); std::strcpy(b.manufacturer, "cross");
     CHECK("manufacturer perturbs hash", invEntryHash(b) != base);
     b = makeEntry(); std::strcpy(b.material, "iron");
@@ -1172,12 +1239,13 @@ static void testFlushWorldStateContract() {
     LoadReqPacket   lrq; std::memset(&lrq, 0, sizeof(lrq));
     LoadNackPacket  lnk; std::memset(&lnk, 0, sizeof(lnk));
 
-    // --- Push one sentinel into every WORLD-STATE queue (28).
+    // --- Push one sentinel into every WORLD-STATE queue (29).
     in.pushEntity(1, 0, e);
     in.pushEvent(1, ev);
     in.pushInv(1, 0, cKey, 0, 0);
     in.pushWorldItems(1, 0, 0);
     in.pushWorldRemove(1, 0, 0);
+    in.pushWorldClaim(1, 2, 0, 0);
     in.pushNpcCensus(1, 0, 0, 0);
     in.pushWorldDrop(1, wdp);
     in.pushWorldPickup(1, wpp);
@@ -1225,6 +1293,7 @@ static void testFlushWorldStateContract() {
     WS_EMPTY("inv",         InboundInv,         drainInv);
     WS_EMPTY("worldItems",  InboundWorldItems,  drainWorldItems);
     WS_EMPTY("worldRemove", InboundWorldRemove, drainWorldRemove);
+    WS_EMPTY("worldClaim",  InboundWorldClaim,  drainWorldClaim);
     WS_EMPTY("npcCensus",   InboundNpcCensus,   drainNpcCensus);
     WS_EMPTY("worldDrop",   InboundWorldDrop,   drainWorldDrops);
     WS_EMPTY("worldPickup", InboundWorldPickup, drainWorldPickups);

@@ -56,6 +56,18 @@ $script:CoopDiagEnvKeys = @(
     # Forces the join to NACK a MATCHing LOAD_GO so the real folder-transfer path
     # runs on one machine (bootstrap_stream / stream_test.ps1).
     'KENSHICOOP_FORCE_STREAM'
+    # --- test-only W2 fault injection (read in ReplicatorItems, not Config) ------
+    # Refuses the FIRST conservation re-home so inv_regear_refuse can exercise the
+    # retry + verify-then-destroy recovery. A real refusal depends on the receiving
+    # bag's state, which a scenario cannot arrange.
+    'KENSHICOOP_WD_REFUSE_REHOME'
+    'KENSHICOOP_WD_REFUSE_REHOME_ALL'
+    # Discards the author's ground track at birth, so a peer's pickup arrives NAMED but
+    # unmatchable - the state that leaves a picked-up item lying on the author's ground.
+    'KENSHICOOP_WD_FORGET_TRACK'
+    # Shrinks the per-tick W1 send batch so a handful of drops can overflow it. NOT a 0/1
+    # gate - it carries the cap itself.
+    'KENSHICOOP_WI_BATCH_MAX'
 )
 
 function Get-CoopDiagEnvKeys {

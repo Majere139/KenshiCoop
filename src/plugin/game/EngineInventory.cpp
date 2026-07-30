@@ -52,62 +52,52 @@ void fillItemProvenance(Item* it, InvItemEntry& e) {
 // the matching Item* for each entry (used by the reconcile to remove excess stacks).
 // Reads template stringID + type + stack quantity + quality bucket off each Item.
 // Returns the count written.
+//
+// CAPTURE ORDER IS LOAD-BEARING: worn gear (equip sections, then the held-weapon
+// pointers) is captured BEFORE the loose _allItems list. maxOut is a hard cap, and a
+// character carrying more than maxOut loose stacks (routine with a backpack) used to
+// fill the buffer with loose items and emit ZERO equipped entries - which the peer's
+// reconcile read as desiredEq==0 and answered by stripping the character's entire
+// kit. Gear is the irreplaceable part and the smallest set, so it goes first; loose
+// clutter is what gets cut when a container overflows.
+//
+// When *outTruncated is provided it is set true if any qualifying item did NOT fit in
+// out[] - the caller must then treat the result as an INCOMPLETE description of the
+// container and never let a reconcile delete against it (see applyContainerContents).
 // External linkage (EngineInternal.h): the world TU's vendor probe shares it.
 unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
-                          unsigned int maxOut) {
+                          unsigned int maxOut, bool* outTruncated) {
+    if (outTruncated) *outTruncated = false;
     if (!inv || !out || maxOut == 0) return 0;
     unsigned int n = 0;
-    __try {
-        lektor<Item*>& all = inv->_allItems;
-        unsigned int total = all.size();
-        for (unsigned int i = 0; i < total && n < maxOut; ++i) {
-            Item* it = all[i];
-            if (!it) continue;
-            GameData* gd = it->getGameData();
-            if (!gd) continue;
-            memset(&out[n], 0, sizeof(InvItemEntry));
-            const char* sid = gd->stringID.c_str();
-            strncpy(out[n].stringID, sid ? sid : "", sizeof(out[n].stringID) - 1);
-            out[n].itemType = (unsigned int)gd->type;
-            int q = it->quantity; if (q < 1) q = 1;
-            out[n].quantity = (q > 65535) ? (unsigned short)65535 : (unsigned short)q;
-            float ql = it->quality; if (ql < 0.0f) ql = 0.0f;
-            out[n].quality = (unsigned short)(ql * 100.0f);
-            if (it->isEquipped) continue; // worn gear is appended below, from equip sections
-            out[n].equipped = 0;
-            out[n].slot     = (unsigned char)((unsigned int)it->slotType & 0xFFu);
-            out[n].section  = 0; // loose: no equip section
-            // Phase 6b: locked shackle bit (LockedArmour with a live lock). Direct
-            // virtual dispatch (like getGameData above) discriminates the item; the
-            // outer __try covers a fault.
-            { LockedArmour* la = it->isLockedArmour(); out[n].locked = (la && la->lock) ? 1 : 0; }
-            fillItemProvenance(it, out[n]); // weapon manufacturer/material (empty otherwise)
-            if (outItems) outItems[n] = it;
-            ++n;
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return n;
-    }
-    // Append EQUIPPED gear (Phase 4a equipment sync). Worn items - EVERY equippable
-    // slot: weapons, all armour pieces, belt, worn backpack, ... - live in the
-    // inventory's equip SECTIONS, not the loose _allItems list. Walk every section and
-    // capture the ones flagged isAnEquippedItemSection, tagging each item equipped=1
-    // with the section's slot. This covers all slots uniformly (the prior armour/weapon
-    // getters silently missed the weapon holster, so weapon unequips never replicated).
+    bool trunc = false;
+    // Local mirror of the captured Item*s. The nested-container pass needs the parent objects
+    // to reach into their private inventories, and most callers pass outItems = 0; every real
+    // caller reads at most INV_ITEMS_MAX entries, so a fixed mirror covers them all.
+    const unsigned int MIRROR_MAX = 64;
+    Item* mine[64];
+    memset(mine, 0, sizeof(mine));
+    // EQUIPPED gear (Phase 4a equipment sync). Worn items - EVERY equippable slot:
+    // weapons, all armour pieces, belt, worn backpack, ... - live in the inventory's
+    // equip SECTIONS, not the loose _allItems list. Walk every section and capture the
+    // ones flagged isAnEquippedItemSection, tagging each item equipped=1 with the
+    // section's slot. This covers all slots uniformly (the prior armour/weapon getters
+    // silently missed the weapon holster, so weapon unequips never replicated).
     if (g_getSectionsFn) {
         __try {
             lektor<InventorySection*>* secs = g_getSectionsFn(inv);
             unsigned int ns = secs ? secs->size() : 0;
-            for (unsigned int s = 0; s < ns && n < maxOut; ++s) {
+            for (unsigned int s = 0; s < ns; ++s) {
                 InventorySection* sec = (*secs)[s];
                 if (!sec || !sec->isAnEquippedItemSection) continue;
                 const Ogre::vector<InventorySection::SectionItem>::type& its = sec->items;
                 unsigned int ni = (unsigned int)its.size();
-                for (unsigned int i = 0; i < ni && n < maxOut; ++i) {
+                for (unsigned int i = 0; i < ni; ++i) {
                     Item* it = its[i].item;
                     if (!it) continue;
                     GameData* gd = it->getGameData();
                     if (!gd) continue;
+                    if (n >= maxOut) { trunc = true; break; }
                     memset(&out[n], 0, sizeof(InvItemEntry));
                     const char* sid = gd->stringID.c_str();
                     strncpy(out[n].stringID, sid ? sid : "", sizeof(out[n].stringID) - 1);
@@ -125,10 +115,13 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
                     out[n].section  = sectionNameHash(sec->name.c_str());
                     fillItemProvenance(it, out[n]); // weapon manufacturer/material
                     if (outItems) outItems[n] = it;
+                    if (n < MIRROR_MAX) mine[n] = it;
                     ++n;
                 }
+                if (trunc) break;
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
+            if (outTruncated) *outTruncated = true; // partial read: not a full description
             return n;
         }
     }
@@ -143,7 +136,7 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
             Item* wpns[2];
             wpns[0] = g_getPrimaryWeaponFn ? g_getPrimaryWeaponFn(inv) : 0;
             wpns[1] = g_getSecondaryWeaponFn ? g_getSecondaryWeaponFn(inv) : 0;
-            for (int w = 0; w < 2 && n < maxOut; ++w) {
+            for (int w = 0; w < 2; ++w) {
                 Item* it = wpns[w];
                 if (!it) continue;
                 GameData* gd = it->getGameData();
@@ -160,6 +153,7 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
                         strncmp(out[j].stringID, sid ? sid : "",
                                 sizeof(out[j].stringID)) == 0) { dup = true; break; }
                 if (dup) continue;
+                if (n >= maxOut) { trunc = true; break; }
                 memset(&out[n], 0, sizeof(InvItemEntry));
                 strncpy(out[n].stringID, sid ? sid : "", sizeof(out[n].stringID) - 1);
                 out[n].itemType = (unsigned int)gd->type;
@@ -175,12 +169,104 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
                 out[n].section  = 0;
                 fillItemProvenance(it, out[n]); // weapon manufacturer/material (required to recreate)
                 if (outItems) outItems[n] = it;
+                if (n < MIRROR_MAX) mine[n] = it;
                 ++n;
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
+            if (outTruncated) *outTruncated = true;
             return n;
         }
     }
+    // LOOSE items last: whatever cap remains after the irreplaceable worn kit.
+    __try {
+        lektor<Item*>& all = inv->_allItems;
+        unsigned int total = all.size();
+        for (unsigned int i = 0; i < total; ++i) {
+            Item* it = all[i];
+            if (!it) continue;
+            GameData* gd = it->getGameData();
+            if (!gd) continue;
+            if (it->isEquipped) continue; // worn gear was captured above, from equip sections
+            if (n >= maxOut) { trunc = true; break; }
+            memset(&out[n], 0, sizeof(InvItemEntry));
+            const char* sid = gd->stringID.c_str();
+            strncpy(out[n].stringID, sid ? sid : "", sizeof(out[n].stringID) - 1);
+            out[n].itemType = (unsigned int)gd->type;
+            int q = it->quantity; if (q < 1) q = 1;
+            out[n].quantity = (q > 65535) ? (unsigned short)65535 : (unsigned short)q;
+            float ql = it->quality; if (ql < 0.0f) ql = 0.0f;
+            out[n].quality = (unsigned short)(ql * 100.0f);
+            out[n].equipped = 0;
+            out[n].slot     = (unsigned char)((unsigned int)it->slotType & 0xFFu);
+            out[n].section  = 0; // loose: no equip section
+            // Phase 6b: locked shackle bit (LockedArmour with a live lock). Direct
+            // virtual dispatch (like getGameData above) discriminates the item; the
+            // outer __try covers a fault.
+            { LockedArmour* la = it->isLockedArmour(); out[n].locked = (la && la->lock) ? 1 : 0; }
+            fillItemProvenance(it, out[n]); // weapon manufacturer/material (empty otherwise)
+            if (outItems) outItems[n] = it;
+            if (n < MIRROR_MAX) mine[n] = it;
+            ++n;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (outTruncated) *outTruncated = true;
+        return n;
+    }
+    // NESTED CONTAINERS last (protocol 48). A worn backpack owns a PRIVATE Inventory - its
+    // contents are in no section of the wearer's own inventory, so everything above missed
+    // them entirely and a bagged item was described by no snapshot at all. Each nested item is
+    // appended with parentIdx = <its bag's index> + 1 so the peer can put it back INSIDE the
+    // right bag rather than merely somewhere on the character.
+    //
+    // One level only, and deliberately: Kenshi does not nest bags inside bags, and a bounded
+    // walk cannot be talked into recursing forever by a malformed object graph. The parent
+    // items themselves were captured above, so this scans a snapshot of the count taken BEFORE
+    // appending - `nTop` - or it would walk its own output.
+    const unsigned int nTop = (n < MIRROR_MAX) ? n : MIRROR_MAX;
+    if (g_getSectionsFn) {
+        for (unsigned int p = 0; p < nTop && n < maxOut; ++p) {
+            Item* parent = mine[p];
+            if (!parent) continue;
+            __try {
+                Inventory* sub = parent->getInventory();
+                if (!sub || sub == inv) continue; // not a container item
+                lektor<InventorySection*>* subSecs = g_getSectionsFn(sub);
+                unsigned int nss = subSecs ? subSecs->size() : 0;
+                for (unsigned int s = 0; s < nss && n < maxOut; ++s) {
+                    InventorySection* sec = (*subSecs)[s];
+                    if (!sec) continue;
+                    const Ogre::vector<InventorySection::SectionItem>::type& its = sec->items;
+                    unsigned int ni = (unsigned int)its.size();
+                    for (unsigned int i = 0; i < ni; ++i) {
+                        Item* it = its[i].item;
+                        if (!it) continue;
+                        GameData* gd = it->getGameData();
+                        if (!gd) continue;
+                        if (n >= maxOut) { trunc = true; break; }
+                        memset(&out[n], 0, sizeof(InvItemEntry));
+                        const char* sid = gd->stringID.c_str();
+                        strncpy(out[n].stringID, sid ? sid : "", sizeof(out[n].stringID) - 1);
+                        out[n].itemType = (unsigned int)gd->type;
+                        int q = it->quantity; if (q < 1) q = 1;
+                        out[n].quantity = (q > 65535) ? (unsigned short)65535 : (unsigned short)q;
+                        float ql = it->quality; if (ql < 0.0f) ql = 0.0f;
+                        out[n].quality = (unsigned short)(ql * 100.0f);
+                        out[n].equipped  = 0;
+                        out[n].slot      = (unsigned char)((unsigned int)it->slotType & 0xFFu);
+                        out[n].section   = 0;
+                        out[n].parentIdx = (unsigned char)((p + 1) & 0xFFu);
+                        fillItemProvenance(it, out[n]);
+                        if (outItems) outItems[n] = it;
+                        ++n;
+                    }
+                    if (trunc) break;
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                trunc = true; // a bag we could not finish reading is an incomplete description
+            }
+        }
+    }
+    if (outTruncated) *outTruncated = trunc;
     return n;
 }
 
@@ -416,14 +502,15 @@ int correctWeaponSlot(Inventory* inv, const char* sid, unsigned int type,
 
 unsigned int captureContainerContents(GameWorld* gw, const unsigned int cHand[5],
                                       InvItemEntry* out, unsigned int maxOut,
-                                      unsigned int* outHash) {
+                                      unsigned int* outHash, bool* outTruncated) {
     if (outHash) *outHash = 0;
+    if (outTruncated) *outTruncated = false;
     if (!gw || !out || maxOut == 0) return 0;
     RootObject* ro = resolveObjectByHand(cHand);
     if (!ro) return 0;
     Inventory* inv = invOf(ro);
     if (!inv) return 0;
-    unsigned int n = readInvItems(inv, out, 0, maxOut);
+    unsigned int n = readInvItems(inv, out, 0, maxOut, outTruncated);
     if (outHash) {
         unsigned int h = 0;
         for (unsigned int i = 0; i < n; ++i) h += invEntryHash(out[i]);
@@ -432,19 +519,26 @@ unsigned int captureContainerContents(GameWorld* gw, const unsigned int cHand[5]
     return n;
 }
 
-bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
-                            const InvItemEntry* items, unsigned int count) {
-    if (!gw) return false;
-    RootObject* ro = resolveObjectByHand(cHand);
-    if (!ro) return false;
-    Inventory* inv = invOf(ro);
-    if (!inv) return false;
+// The reconcile itself, against ONE inventory. Split out from applyContainerContents so the
+// same logic can be pointed at a nested container's private inventory (a worn backpack's
+// 'backpack_content'), which is the only way a bagged item can be placed back INSIDE the bag
+// rather than merely somewhere on the character. Nothing in here needs the owner's hand.
+static bool applyToInventory(GameWorld* gw, Inventory* inv,
+                             const InvItemEntry* items, unsigned int count,
+                             bool truncated) {
+    if (!gw || !inv) return false;
 
-    // Snapshot current contents (with parallel Item* for removal).
+    // Snapshot current contents (with parallel Item* for removal). If OUR OWN read
+    // overflowed, `cur` undercounts what we hold, so every apparent shortfall might be an
+    // item we simply did not look at - creating against that mints duplicates. Treat a
+    // truncated local read as "cannot create" the same way a truncated desired list means
+    // "cannot delete": for a container neither side can fully describe, the reconcile
+    // degrades to moves only rather than guessing in either direction.
     const unsigned int MAXC = 64;
     InvItemEntry cur[64];
     Item* curItems[64];
-    unsigned int ncur = readInvItems(inv, cur, curItems, MAXC);
+    bool curTruncated = false;
+    unsigned int ncur = readInvItems(inv, cur, curItems, MAXC, &curTruncated);
 
     // Group desired + current by TEMPLATE (stringID,itemType), tracking the EQUIPPED vs
     // LOOSE split separately. A change in the split while the template's TOTAL count is
@@ -557,6 +651,25 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
         int createLoose = 0;
         if (g[k].desiredLoose > g[k].curLoose) createLoose += g[k].desiredLoose - g[k].curLoose;
         if (g[k].desiredEq    > g[k].curEq)    createLoose += g[k].desiredEq    - g[k].curEq;
+        if (createLoose > 0 && curTruncated) {
+            if (dbg) { char b[160]; _snprintf(b, sizeof(b) - 1,
+                "[recon]   CREATE-SKIP (local truncated) sid='%s' shortfall=%d",
+                g[k].sid, createLoose); b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+            createLoose = 0;
+        }
+        //    NEVER fabricate a CONTAINER (a backpack). createItemAndAdd would mint an EMPTY
+        //    one, and the wire snapshot describes the bag itself, not what is nested inside
+        //    it - so the "restored" backpack silently swallows its own contents. Containers
+        //    move only through the W2 conservation channel, which relocates the real object
+        //    with its nesting intact; leaving the shortfall unfilled keeps the two sides
+        //    diverged until that channel lands the real bag.
+        if (createLoose > 0 && isContainerItemType(g[k].type)) {
+            char b[180]; _snprintf(b, sizeof(b) - 1,
+                "[recon]   CREATE-SKIP-CONTAINER sid='%s' type=%u shortfall=%d (a fabricated "
+                "backpack would be empty)", g[k].sid, g[k].type, createLoose);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            createLoose = 0;
+        }
         if (createLoose > 0) {
             int qb = (g[k].desiredEq > g[k].curEq) ? g[k].qualEq : g[k].qualLoose;
             bool ok = createItemAndAdd(gw, inv, g[k].sid, g[k].type, createLoose, qb, false,
@@ -566,6 +679,18 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
         }
         // 4) RESIDUAL REMOVE (genuine removals; destroy surplus). Moved items were nulled
         //    in curItems above, so removeByKey won't touch them.
+        //    SKIPPED ENTIRELY when the desired list is TRUNCATED: an incomplete snapshot
+        //    cannot distinguish "the author no longer has this" from "it didn't fit on the
+        //    wire", and guessing wrong destroys the peer's items for good. Additive-only
+        //    leaves the two containers diverged (recoverable) instead of losing gear.
+        if (truncated || curTruncated) {
+            if (dbg) { char b[180]; _snprintf(b, sizeof(b) - 1,
+                "[recon]   REMOVE-SKIP (truncated desired=%d local=%d) sid='%s' surplusLoose=%d surplusEq=%d",
+                truncated ? 1 : 0, curTruncated ? 1 : 0,
+                g[k].sid, g[k].curLoose - g[k].desiredLoose, g[k].curEq - g[k].desiredEq);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+            continue;
+        }
         if (g[k].curLoose > g[k].desiredLoose) {
             int r = removeByKey(inv, curItems, cur, ncur, g[k].sid, g[k].type,
                             g[k].curLoose - g[k].desiredLoose, 0);
@@ -592,6 +717,144 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
                 "[recon]   SLOT-MOVE sid='%s' -> section=%u", items[i].stringID, items[i].section);
                 b[sizeof(b)-1]='\0'; coop::logLine(b); }
         }
+    }
+    return changed;
+}
+
+namespace {
+// The private Inventory of the first CONTAINER item held at cHand (a worn backpack), or 0.
+// Caller holds SEH via the public wrappers below.
+Inventory* nestedInventoryOf(GameWorld* gw, const unsigned int cHand[5]) {
+    if (!gw) return 0;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return 0;
+    Inventory* inv = invOf(ro);
+    if (!inv) return 0;
+    InvItemEntry cur[INV_ITEMS_MAX];
+    Item* curItems[INV_ITEMS_MAX];
+    unsigned int n = readInvItems(inv, cur, curItems, INV_ITEMS_MAX, 0);
+    for (unsigned int i = 0; i < n; ++i) {
+        if (!curItems[i] || cur[i].parentIdx != 0) continue;
+        Inventory* sub = 0;
+        __try { sub = curItems[i]->getInventory(); } __except (EXCEPTION_EXECUTE_HANDLER) { sub = 0; }
+        if (sub && sub != inv) return sub;
+    }
+    return 0;
+}
+} // namespace
+
+// SEH-guarded: put `qty` of (sid,type) INSIDE the container the character at cHand carries
+// (its worn backpack's private inventory), not merely into the character's own grid. The
+// nested-contents gate needs to create exactly the state a player creates by dragging
+// something into their bag, and no other primitive can reach that inventory.
+int addItemToNestedContainer(GameWorld* gw, const unsigned int cHand[5], const char* sid,
+                             unsigned int typeCat, int qty) {
+    if (!gw || !sid || !sid[0] || qty <= 0) return 0;
+    int added = 0;
+    __try {
+        Inventory* sub = nestedInventoryOf(gw, cHand);
+        if (!sub) return 0;
+        if (createItemAndAdd(gw, sub, sid, typeCat, qty, 0, /*equip=*/false)) added = qty;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { added = 0; }
+    return added;
+}
+
+// SEH-guarded: how many of (sid,type) sit INSIDE the carried container (summed quantities).
+// -1 when the character holds no container at all, so a gate can tell "the bag is not here"
+// apart from "the bag is here and empty" - the difference between an unfinished relocation and
+// lost contents.
+int countInNestedContainer(GameWorld* gw, const unsigned int cHand[5], const char* sid,
+                           unsigned int typeCat) {
+    if (!gw || !sid || !sid[0]) return -1;
+    int total = -1;
+    __try {
+        Inventory* sub = nestedInventoryOf(gw, cHand);
+        if (!sub) return -1;
+        InvItemEntry ent[INV_ITEMS_MAX];
+        unsigned int n = readInvItems(sub, ent, 0, INV_ITEMS_MAX, 0);
+        total = 0;
+        for (unsigned int i = 0; i < n; ++i) {
+            if (typeCat != 0 && ent[i].itemType != typeCat) continue;
+            if (strcmp(ent[i].stringID, sid) != 0) continue;
+            int q = ent[i].quantity; if (q < 1) q = 1;
+            total += q;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { total = -1; }
+    return total;
+}
+
+bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
+                            const InvItemEntry* items, unsigned int count,
+                            bool truncated) {
+    if (!gw) return false;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return false;
+    Inventory* inv = invOf(ro);
+    if (!inv) return false;
+
+    // Split the snapshot by its parent reference (protocol 48). The TOP level describes this
+    // container; entries with parentIdx > 0 describe what is inside one of those items. They
+    // must be reconciled separately or the two would fight: a bagged item counted at the top
+    // level looks like a loose item the peer is missing, so the reconcile mints a second copy
+    // out on the character and the bag stays empty.
+    InvItemEntry top[INV_ITEMS_MAX];
+    unsigned char topSrcIdx[INV_ITEMS_MAX]; // original index, so children can find their parent
+    unsigned int nTop = 0;
+    bool anyNested = false;
+    for (unsigned int i = 0; i < count && nTop < INV_ITEMS_MAX; ++i) {
+        if (items[i].parentIdx != 0) { anyNested = true; continue; }
+        topSrcIdx[nTop] = (unsigned char)i;
+        top[nTop++] = items[i];
+    }
+    bool changed = applyToInventory(gw, inv, nTop ? top : 0, nTop, truncated);
+    if (!anyNested) return changed;
+
+    // Re-read AFTER the top-level pass: it may have created or moved the very bag we are about
+    // to fill, and a bag identified from the stale read would be the wrong object (or gone).
+    InvItemEntry cur[INV_ITEMS_MAX];
+    Item* curItems[INV_ITEMS_MAX];
+    unsigned int ncur = readInvItems(inv, cur, curItems, INV_ITEMS_MAX, 0);
+
+    static int dbg = -1;
+    if (dbg < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dbg = (e && e[0] == '1') ? 1 : 0; }
+
+    for (unsigned int t = 0; t < nTop; ++t) {
+        // Gather this parent's children. The wire names the parent by its index in the
+        // ORIGINAL entry array, which survives the split via topSrcIdx.
+        InvItemEntry kids[INV_ITEMS_MAX];
+        unsigned int nk = 0;
+        for (unsigned int i = 0; i < count && nk < INV_ITEMS_MAX; ++i)
+            if (items[i].parentIdx == (unsigned char)(topSrcIdx[t] + 1)) kids[nk++] = items[i];
+        if (nk == 0) continue;
+
+        // Find OUR copy of the bag. Only entries the local read reports as this same template
+        // qualify, and only one that actually owns an inventory - matching on template alone
+        // could hand us a same-sid item that is not the container.
+        Inventory* sub = 0;
+        for (unsigned int c = 0; c < ncur && !sub; ++c) {
+            if (cur[c].itemType != top[t].itemType) continue;
+            if (strcmp(cur[c].stringID, top[t].stringID) != 0) continue;
+            if (!curItems[c]) continue;
+            __try {
+                Inventory* s = curItems[c]->getInventory();
+                if (s && s != inv) sub = s;
+            } __except (EXCEPTION_EXECUTE_HANDLER) { sub = 0; }
+        }
+        if (!sub) {
+            // The bag is not here (still relocating over the conservation channel, or this
+            // client genuinely lacks it). Its contents are NOT reconciled anywhere else, so
+            // say so: silently skipping is how bagged items went missing in the first place.
+            char b[220]; _snprintf(b, sizeof(b) - 1,
+                "[recon] NESTED-SKIP sid='%s' type=%u kids=%u (no local copy of the container "
+                "yet; its contents stay unreconciled until it arrives)",
+                top[t].stringID, top[t].itemType, nk);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            continue;
+        }
+        if (dbg) { char b[200]; _snprintf(b, sizeof(b) - 1,
+            "[recon] NESTED sid='%s' type=%u kids=%u", top[t].stringID, top[t].itemType, nk);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+        if (applyToInventory(gw, sub, kids, nk, truncated)) changed = true;
     }
     return changed;
 }
@@ -887,6 +1150,35 @@ void dumpInventory(GameWorld* gw, const unsigned int cHand[5]) {
                 _snprintf(c, sizeof(c) - 1, "DUMP     type=%u eq=%d sid='%s'",
                           (unsigned int)gd->type, it->isEquipped ? 1 : 0, gd->stringID.c_str());
                 c[sizeof(c) - 1] = '\0'; coop::logLine(c);
+                // A worn CONTAINER carries its own Inventory, and nothing in the character's
+                // own sections describes what is inside it. Recurse one level so the log says
+                // plainly where a bagged item lives - the snapshot channel walks only the
+                // character's inventory, which is why such an item replicates nowhere.
+                Inventory* sub = it->getInventory();
+                if (!sub || sub == inv) continue;
+                lektor<InventorySection*>* subSecs = g_getSectionsFn(sub);
+                unsigned int nss = subSecs ? subSecs->size() : 0;
+                char sh[160]; _snprintf(sh, sizeof(sh) - 1,
+                    "DUMP     NESTED inventory of '%s': sections=%u",
+                    gd->stringID.c_str(), nss);
+                sh[sizeof(sh) - 1] = '\0'; coop::logLine(sh);
+                for (unsigned int ss = 0; ss < nss; ++ss) {
+                    InventorySection* s2 = (*subSecs)[ss]; if (!s2) continue;
+                    const Ogre::vector<InventorySection::SectionItem>::type& i2 = s2->items;
+                    char sb[220]; _snprintf(sb, sizeof(sb) - 1,
+                        "DUMP       nsec='%s' equip=%d ctnr=%d items=%u", s2->name.c_str(),
+                        s2->isAnEquippedItemSection ? 1 : 0, s2->containerSlot ? 1 : 0,
+                        (unsigned int)i2.size());
+                    sb[sizeof(sb) - 1] = '\0'; coop::logLine(sb);
+                    for (unsigned int k = 0; k < (unsigned int)i2.size(); ++k) {
+                        Item* n2 = i2[k].item; if (!n2) continue;
+                        GameData* g2 = n2->getGameData(); if (!g2) continue;
+                        char nb[200]; _snprintf(nb, sizeof(nb) - 1,
+                            "DUMP         type=%u qty=%d sid='%s'", (unsigned int)g2->type,
+                            n2->quantity, g2->stringID.c_str());
+                        nb[sizeof(nb) - 1] = '\0'; coop::logLine(nb);
+                    }
+                }
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
@@ -903,7 +1195,7 @@ void dumpInventory(GameWorld* gw, const unsigned int cHand[5]) {
 // removes it from the bag and places it as a world object. Returns the number dropped.
 int dropItemFromInventory(GameWorld* gw, const unsigned int cHand[5],
                           const char* sid, unsigned int typeCat, int qty,
-                          void** outLastDropped) {
+                          void** outLastDropped, bool allowEquipped) {
     if (outLastDropped) *outLastDropped = 0;
     if (!gw || !sid || !sid[0] || qty <= 0) return 0;
     RootObject* ro = resolveObjectByHand(cHand);
@@ -920,11 +1212,15 @@ int dropItemFromInventory(GameWorld* gw, const unsigned int cHand[5],
             Item* curItems[64];
             unsigned int ncur = readInvItems(inv, cur, curItems, MAXC);
             Item* victim = 0;
-            for (unsigned int i = 0; i < ncur; ++i) {
-                if (cur[i].equipped) continue;                 // loose only
-                if (cur[i].itemType != typeCat) continue;
-                if (strcmp(cur[i].stringID, sid) != 0) continue;
-                victim = curItems[i]; break;
+            // Two passes so a LOOSE copy is always preferred over a worn one: dropping the
+            // worn piece when a spare lies in the bag would strip the character needlessly.
+            for (unsigned int pass = 0; pass < (allowEquipped ? 2u : 1u) && !victim; ++pass) {
+                for (unsigned int i = 0; i < ncur; ++i) {
+                    if (pass == 0 && cur[i].equipped) continue;
+                    if (cur[i].itemType != typeCat) continue;
+                    if (strcmp(cur[i].stringID, sid) != 0) continue;
+                    victim = curItems[i]; break;
+                }
             }
             if (!victim) break;
             inv->dropItem(victim);                             // virtual: bag -> ground
@@ -1335,18 +1631,30 @@ int objectWorldPos(const unsigned int hand[5], float out[3]) {
 // the current world position) if the item still exists and is NOT inside an inventory;
 // returns 0 if it was destroyed (hand no longer resolves) or picked up (isInInventory).
 // This replaces the "vanished from the spatial scan" cull, which false-culled town drops.
-int groundItemLiveness(const unsigned int itemHand[5], float out[3]) {
-    RootObject* ro = resolveObjectByHand(itemHand);
-    if (!ro) return 0; // destroyed / no longer resolvable
+int groundObjectLiveness(RootObject* ro, float out[3], bool* outPickedUp) {
+    if (outPickedUp) *outPickedUp = false;
+    if (!ro) return 0;
     int live = 0;
     __try {
         Item* it = reinterpret_cast<Item*>(ro);
-        if (it->isInInventory) return 0; // picked up into some inventory
+        if (it->isInInventory) {
+            // Distinguishable from "destroyed": the object still reads, it has just
+            // entered a bag. Only THIS case licenses a W1 claim - claiming on a
+            // destroyed proxy would delete the author's item for no reason.
+            if (outPickedUp) *outPickedUp = true;
+            return 0;
+        }
         Ogre::Vector3 p = ro->getPosition();
         if (out) { out[0] = p.x; out[1] = p.y; out[2] = p.z; }
         live = 1;
     } __except (EXCEPTION_EXECUTE_HANDLER) { live = 0; }
     return live;
+}
+
+int groundItemLiveness(const unsigned int itemHand[5], float out[3]) {
+    RootObject* ro = resolveObjectByHand(itemHand);
+    if (!ro) return 0; // destroyed / no longer resolvable
+    return groundObjectLiveness(ro, out, 0);
 }
 
 // SEH-guarded (Phase W3): world position of a tracked Item* (as void*). The drop detector
@@ -1384,6 +1692,14 @@ int relocateWeaponToGround(GameWorld* gw, const unsigned int ownerHand[5],
     if (dropped == 0) {
         int un = unequipItemToLoose(gw, ownerHand, sid, typeCat, 1);
         if (un > 0) dropped = dropItemFromInventory(gw, ownerHand, sid, typeCat, 1, &droppedItem);
+        // Last resort: drop it straight out of its equip slot. A worn CONTAINER can be
+        // staged NO other way - no loose section has room for the bag, so the unequip's
+        // fallback add silently re-equips it and the loose-only drop then finds nothing.
+        // Without this the peer's own copy is unreachable, the caller gives up, and (since
+        // a container must never be fabricated) the backpack is simply lost.
+        if (dropped == 0)
+            dropped = dropItemFromInventory(gw, ownerHand, sid, typeCat, 1, &droppedItem,
+                                            /*allowEquipped*/ true);
     }
     if (dropped == 0) return 0;
     if (outDropped) *outDropped = droppedItem;
@@ -1398,6 +1714,41 @@ int relocateWeaponToGround(GameWorld* gw, const unsigned int ownerHand[5],
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
     return dropped;
+}
+
+// SEH-guarded CONSERVATION BACKSTOP (Phase W2): the drop intent could not be satisfied by
+// relocating a real copy, because this client no longer HAS one - the classic cause is a
+// bag snapshot that reached us before the intent and whose reconcile destroyed it. The
+// intent is self-sufficient (WorldDropPacket carries quality + manufacturer + material), so
+// rebuild the item from the packet's own provenance directly into the owner's bag and then
+// relocate that to the ground, reproducing the drop.
+//
+// This is a HEAL, not the primary path: publishInventories holds a container's snapshot
+// while a drop is being adjudicated (Replicator::wdPendingDrop) so the race should not
+// happen at all. It exists because losing a weapon is unrecoverable for the player while a
+// rare duplicate is not, and because a peer that never had the item (mod/save skew) is
+// better served with a copy than with silence. Callers MUST first confirm the owner
+// resolves locally - fabricating for an unresolved/not-yet-loaded container would mint
+// items for a bag we simply cannot see yet.
+// Weapon fabrication remains subject to KENSHICOOP_WEAPON_FAB (checked inside
+// createItemAndAdd), so the escape hatch back to conservation-only gear sync still works.
+// Returns the number relocated (0 if the fabricate or the drop failed).
+int fabricateWeaponToGround(GameWorld* gw, const unsigned int ownerHand[5],
+                            const char* sid, unsigned int typeCat, int qualityBucket,
+                            const char* manufacturer, const char* material,
+                            float x, float y, float z, void** outDropped) {
+    if (outDropped) *outDropped = 0;
+    if (!gw || !sid || !sid[0]) return 0;
+    RootObject* ro = resolveObjectByHand(ownerHand);
+    if (!ro) return 0;
+    Inventory* inv = invOf(ro);
+    if (!inv) return 0;
+    // Create LOOSE (equip state is irrelevant - it is about to be dropped anyway).
+    if (!createItemAndAdd(gw, inv, sid, typeCat, 1, qualityBucket, false,
+                          manufacturer, material))
+        return 0;
+    // Now the normal conservation path has a real copy to move.
+    return relocateWeaponToGround(gw, ownerHand, sid, typeCat, x, y, z, outDropped);
 }
 
 // SEH-guarded (Phase W3): capture the WEAPON items the object at cHand currently holds, with
@@ -1418,9 +1769,9 @@ unsigned int captureWeaponPtrs(GameWorld* gw, const unsigned int cHand[5],
     unsigned int ncur = readInvItems(inv, ent, its, MAXC);
     unsigned int n = 0;
     for (unsigned int i = 0; i < ncur && n < maxOut; ++i) {
-        // Gear only (itemType 2 = WEAPON, 3 = ARMOUR/clothing): the conservation channel tracks
-        // these by real Item* handle. Stackable items stay on the W1 proxy stream.
-        if (ent[i].itemType != 2u && ent[i].itemType != 3u) continue;
+        // Conserved gear only: the conservation channel tracks these by real Item*
+        // handle. Stackable items stay on the W1 proxy stream.
+        if (!isConservedItemType(ent[i].itemType)) continue;
         strncpy(sids[n], ent[i].stringID, 47); sids[n][47] = '\0';
         items[n] = its[i];
         ++n;

@@ -567,9 +567,10 @@ Character* findWorkerNear(GameWorld* gw, RootObject* fixture);
 
 // EngineInventory.cpp:
 
-// Container contents (loose + equipped) into out[] (see definition).
+// Container contents (equipped gear first, then loose) into out[] (see definition).
+// *outTruncated (optional) is set when a qualifying item did not fit in maxOut.
 unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
-                          unsigned int maxOut);
+                          unsigned int maxOut, bool* outTruncated = 0);
 // Item template by stringID within its itemType category.
 GameData* findItemTemplateImpl(GameWorld* gw, const char* sid, unsigned int typeCat);
 // Spawn a character from a random template into the given faction.

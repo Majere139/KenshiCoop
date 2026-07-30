@@ -52,6 +52,12 @@ inline unsigned int invEntryHash(const InvItemEntry& e) {
     // hashing the section a Weapon I<->II move produces an UNCHANGED fingerprint and is
     // never published, so the peer never learns the slot changed.
     h ^= (unsigned int)e.section * 2475825337u;
+    // WHERE an item sits is content too (protocol 48). Moving a stack from the character's
+    // main grid INTO a worn backpack changes nothing else about it - same template, quantity,
+    // quality, loose either way - so without the parent reference in the fingerprint the move
+    // is invisible, no snapshot is published, and the peer's bag stays empty. XOR keeps the
+    // canonical hash of a top-level entry (parentIdx = 0) exactly as it was.
+    h ^= (unsigned int)e.parentIdx * 2129725511u;
     // Manufacturer + material are part of a WEAPON's identity (mesh/company + grade): two
     // otherwise-identical base weapons with different manufacturers are visually distinct,
     // so they must hash differently (a swap registers as a content change + resend).

@@ -58,6 +58,12 @@ public:
                 if (dr == 0) {
                     int un = engine::unequipItemToLoose(ctx.gw, hand_, baseSid_, baseType_, 1);
                     if (un > 0) dr = engine::dropItemFromInventory(ctx.gw, hand_, baseSid_, baseType_, 1);
+                    // A worn CONTAINER can be staged neither way: no loose section has room
+                    // for the bag, so the unequip's fallback add just re-equips it. Drop it
+                    // straight out of its slot, which is what dragging it to the ground does.
+                    if (dr == 0)
+                        dr = engine::dropItemFromInventory(ctx.gw, hand_, baseSid_, baseType_, 1,
+                                                          0, /*allowEquipped*/ true);
                 }
                 invAfter_  = invCount(ctx.gw);
                 grndAfter_ = engine::countFreeGroundItemsNear(ctx.gw, hand_, baseSid_, baseType_, radius());
@@ -550,6 +556,129 @@ private:
     char          sid_[48];
 };
 
+// world_pickup_mirror (protocol 47 CLAIM oracle): the W1 pickup mirror. W1 mirrors a NON-gear
+// drop by minting a template proxy on the peer, but nothing used to tell the AUTHOR when that
+// proxy was consumed - its own cull tests the liveness of its OWN real item, which is still
+// lying on its ground, so it never fired. The item ended up in the peer's bag AND on the
+// author's ground: a duplicate, and the reported "join picked it up but the host still sees
+// it there". The HOST seeds + drops a common non-gear item; the JOIN finds the resulting free
+// ground item (reading its sid/type off the scan, so no cross-client sid agreement is needed)
+// and picks it up by relocation; the CLAIM must then make the HOST's own ground copy vanish.
+// The host's leg is the whole point: grndPeak>=1 proves the drop landed, grndFinal==0 proves
+// the claim retired it. WPMIRROR log contract; judged by Test-WorldPickupMirror.
+class WorldPickupMirrorScenario : public TimedScenario {
+public:
+    WorldPickupMirrorScenario()
+        : TimedScenario("world_pickup_mirror", 0), have_(false), lastLogMs_(0), step_(0),
+          seeded_(0), dropped_(0), pickedUp_(0), dropType_(0),
+          grndPeak_(0), grndFinal_(-1) {
+        for (int i = 0; i < 5; ++i) hand_[i] = 0;
+        sid_[0] = '\0';
+    }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        have_ = engine::pickInventoryContainer(ctx.gw, hand_);
+        char b[180];
+        _snprintf(b, sizeof(b) - 1,
+            "WPMIRROR start role=%s have=%d hand=%u,%u,%u,%u,%u",
+            ctx.isHost ? "host" : "join", have_ ? 1 : 0,
+            hand_[0], hand_[1], hand_[2], hand_[3], hand_[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!have_) { if (ctx.elapsedMs >= 6000) { passed_ = false; return true; } return false; }
+
+        // HOST authors the drop through the hooked inventory path, so the edge is
+        // captured query-free and W1 streams a proxy to the join.
+        if (ctx.isHost && step_ == 0 && ctx.elapsedMs >= DROP_MS) {
+            step_ = 1;
+            seeded_ = engine::addTestItemsToContainer(ctx.gw, hand_, 1, sid_, sizeof(sid_));
+            InvItemEntry items[INV_ITEMS_MAX];
+            unsigned int n = engine::captureContainerContents(ctx.gw, hand_, items, INV_ITEMS_MAX, 0);
+            for (unsigned int i = 0; i < n; ++i)
+                if (!items[i].equipped && strcmp(items[i].stringID, sid_) == 0) {
+                    dropType_ = items[i].itemType; break;
+                }
+            dropped_ = engine::dropItemFromInventory(ctx.gw, hand_, sid_, dropType_, 1);
+            char b[200]; _snprintf(b, sizeof(b) - 1,
+                "WPMIRROR drop seeded=%d dropped=%d sid='%s' type=%u",
+                seeded_, dropped_, sid_[0] ? sid_ : "(none)", dropType_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        // JOIN consumes the proxy. Its sid/type come off the scan row, so the join never
+        // has to agree with the host about WHICH template was seeded. Relocation (not
+        // fabrication) is what a real UI pickup does to the proxy object.
+        if (!ctx.isHost && step_ == 0 && ctx.elapsedMs >= PICKUP_MS) {
+            engine::WorldItemRaw raw[16];
+            unsigned int n = engine::captureWorldItems(ctx.gw, raw, 16, radius());
+            if (n > 0) {
+                step_ = 1;
+                strncpy(sid_, raw[0].stringID, sizeof(sid_) - 1); sid_[sizeof(sid_) - 1] = '\0';
+                dropType_ = raw[0].itemType;
+                pickedUp_ = engine::pickupWorldItemIntoInventory(ctx.gw, hand_, sid_,
+                                                                 dropType_, radius());
+                char b[200]; _snprintf(b, sizeof(b) - 1,
+                    "WPMIRROR pickup n=%u got=%d sid='%s' type=%u",
+                    n, pickedUp_, sid_, dropType_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+
+        // HOST samples its OWN free-ground count for the dropped template: it must rise to
+        // 1 on the drop and fall back to 0 once the join's claim lands.
+        if (ctx.isHost && sid_[0] && (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0)) {
+            lastLogMs_ = ctx.elapsedMs;
+            int grnd = engine::countFreeGroundItemsNear(ctx.gw, hand_, sid_, dropType_, radius());
+            if (grnd > (int)grndPeak_) grndPeak_ = (unsigned int)grnd;
+            char b[180]; _snprintf(b, sizeof(b) - 1,
+                "WPMIRROR host t=%lu ground=%d peak=%u",
+                (unsigned long)ctx.elapsedMs, grnd, grndPeak_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            if (ctx.isHost) {
+                grndFinal_ = engine::countFreeGroundItemsNear(ctx.gw, hand_, sid_,
+                                                              dropType_, radius());
+                passed_ = (dropped_ > 0) && (grndPeak_ >= 1) && (grndFinal_ == 0);
+                char b[220]; _snprintf(b, sizeof(b) - 1,
+                    "WPMIRROR verdict role=host pass=%d sid='%s' dropped=%d grndPeak=%u grndFinal=%d",
+                    passed_ ? 1 : 0, sid_[0] ? sid_ : "(none)", dropped_, grndPeak_, grndFinal_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            } else {
+                passed_ = (pickedUp_ > 0);
+                char b[200]; _snprintf(b, sizeof(b) - 1,
+                    "WPMIRROR verdict role=join pass=%d sid='%s' pickedUp=%d",
+                    passed_ ? 1 : 0, sid_[0] ? sid_ : "(none)", pickedUp_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            return true;
+        }
+        return false;
+    }
+
+private:
+    static const unsigned long DROP_MS          = 6000;  // host drops
+    static const unsigned long PICKUP_MS        = 14000; // join consumes the proxy
+    static const unsigned long JOIN_DURATION_MS = 22000;
+    static const unsigned long HOST_DURATION_MS = 26000; // outlive the join + claim slack
+    static float radius() { return 60.0f; }
+    bool          have_;
+    unsigned long lastLogMs_;
+    int           step_;
+    int           seeded_;
+    int           dropped_;
+    int           pickedUp_;
+    unsigned int  dropType_;
+    unsigned int  grndPeak_;
+    int           grndFinal_;
+    unsigned int  hand_[5];
+    char          sid_[48];
+};
+
 // rejoin_items (Phase 3 item-dup fix): a reload must NOT duplicate save-native
 // ground items. The HOST drops K test items (both clients reach n0+K), issues a
 // coordinated saveGameAs (the saveSync half streams the join a byte-identical
@@ -777,13 +906,241 @@ const char* const RejoinItemsScenario::SAVE_NAME = "coopresume";
 
 } // namespace
 
+// inv_nested_bag (protocol 48): an item placed INSIDE a worn backpack must appear inside the
+// PEER's copy of that backpack. A worn bag owns a private Inventory that no section of the
+// wearer's own inventory mentions, so a bagged item used to be described by no snapshot at all:
+// it existed for the author and nowhere else, and dropping the bag handed the peer a bag
+// missing its contents. The gate is deliberately about the item's PLACE, not its presence -
+// the join must find it in the bag (countInNestedContainer), because landing it loose on the
+// character would still leave the bag empty when it travels.
+class InvNestedBagScenario : public Scenario {
+public:
+    InvNestedBagScenario()
+        : passed_(false), have_(false), isHost_(false), type_(0), step_(0), added_(0),
+          nestedBase_(-1), nestedPeak_(-1), nestedFinal_(-1), lastLogMs_(0) {
+        for (int i = 0; i < 5; ++i) hand_[i] = 0;
+        sid_[0] = '\0';
+    }
+
+    virtual const char* name() const { return "inv_nested_bag"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        isHost_ = ctx.isHost;
+        // The bag carrier: whichever squad member actually has a container. Both clients load
+        // the same save, so they resolve the SAME character and the same bag.
+        have_ = findBagCarrier(ctx.gw, hand_);
+        engine::commonTestItemSid(ctx.gw, sid_, sizeof(sid_), &type_);
+        // The probe template is a COMMON item, so the bag may already hold some. Everything is
+        // measured as a delta against this baseline: an absolute "peer has some in the bag"
+        // check would pass on the save's own contents without the new item ever crossing.
+        if (have_ && sid_[0]) nestedBase_ = engine::countInNestedContainer(ctx.gw, hand_, sid_, type_);
+        char b[240];
+        _snprintf(b, sizeof(b) - 1,
+            "SCENARIO NEST anchor host=%d have=%d hand=%u,%u,%u,%u,%u sid='%s' type=%u base=%d",
+            isHost_ ? 1 : 0, have_ ? 1 : 0, hand_[0], hand_[1], hand_[2], hand_[3], hand_[4],
+            sid_[0] ? sid_ : "(none)", type_, nestedBase_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        // HOST @8s: put the probe item INSIDE the bag. Late enough that both sides have
+        // seeded their inventory publishers, so this is a real edge rather than part of the
+        // initial convergence.
+        if (isHost_ && have_ && sid_[0] && step_ == 0 && ctx.elapsedMs >= 8000) {
+            step_ = 1;
+            added_ = engine::addItemToNestedContainer(ctx.gw, hand_, sid_, type_, PROBE_QTY);
+            char b[200];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO NEST ADD sid='%s' type=%u qty=%d added=%d",
+                      sid_, type_, PROBE_QTY, added_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        if (have_ && sid_[0] && (ctx.elapsedMs - lastLogMs_ >= 500 || lastLogMs_ == 0)) {
+            lastLogMs_ = ctx.elapsedMs;
+            int inBag = engine::countInNestedContainer(ctx.gw, hand_, sid_, type_);
+            nestedFinal_ = inBag;
+            if (inBag > nestedPeak_) nestedPeak_ = inBag;
+            char b[220];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO NEST %s t=%lu inBag=%d base=%d peak=%d",
+                      isHost_ ? "HOST" : "JOIN", (unsigned long)ctx.elapsedMs, inBag,
+                      nestedBase_, nestedPeak_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        unsigned long dur = isHost_ ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            // Both sides assert the same delta: exactly the probe quantity MORE in the bag than
+            // the save started with. Host also has to prove it really performed the placement,
+            // otherwise a failed setup would leave both sides equal and read as convergence.
+            int delta = (nestedFinal_ >= 0 && nestedBase_ >= 0) ? (nestedFinal_ - nestedBase_) : -1;
+            bool converged = have_ && (nestedBase_ >= 0) && (delta == PROBE_QTY);
+            passed_ = isHost_ ? (converged && added_ == PROBE_QTY) : converged;
+            char b[280];
+            _snprintf(b, sizeof(b) - 1,
+                "SCENARIO NEST verdict role=%s pass=%d sid='%s' want=%d added=%d base=%d "
+                "inBag=%d delta=%d peak=%d",
+                isHost_ ? "host" : "join", passed_ ? 1 : 0, sid_[0] ? sid_ : "(none)",
+                PROBE_QTY, added_, nestedBase_, nestedFinal_, delta, nestedPeak_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const int           PROBE_QTY        = 2;
+    static const unsigned long HOST_DURATION_MS = 30000;
+    static const unsigned long JOIN_DURATION_MS = 28000;
+
+    // First player character that carries a CONTAINER (a worn backpack). Both clients walk the
+    // squad in the same order from the same save, so they settle on the same carrier.
+    static bool findBagCarrier(GameWorld* gw, unsigned int out[5]) {
+        EntityState sq[32];
+        unsigned int n = engine::captureSquad(gw, /*leaderOnly*/ false, sq, 32);
+        for (unsigned int i = 0; i < n; ++i) {
+            unsigned int h[5] = { sq[i].hType, sq[i].hContainer, sq[i].hContainerSerial,
+                                  sq[i].hIndex, sq[i].hSerial };
+            InvItemEntry ent[INV_ITEMS_MAX];
+            unsigned int ni = engine::captureContainerContents(gw, h, ent, INV_ITEMS_MAX, 0);
+            for (unsigned int k = 0; k < ni; ++k) {
+                if (!engine::isContainerItemType(ent[k].itemType)) continue;
+                for (int j = 0; j < 5; ++j) out[j] = h[j];
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool          passed_, have_, isHost_;
+    unsigned int  type_;
+    int           step_;
+    int           added_;
+    int           nestedBase_, nestedPeak_, nestedFinal_;
+    unsigned long lastLogMs_;
+    unsigned int  hand_[5];
+    char          sid_[48];
+};
+
+// world_item_burst (W1 batch overflow): drop SEVERAL non-gear items in ONE tick, more than the
+// per-tick send batch holds (shrunk by KENSHICOOP_WI_BATCH_MAX so a test can reach it at all).
+// The overflow used to be marked as sent without being sent, so the tail of a burst stayed
+// invisible on the peer until the 5 s safety resend happened to carry it - "I dropped it and it
+// never showed up over there". The verdict deliberately measures the SPREAD between the peer
+// seeing its first item of the burst and seeing them all, which needs no cross-client clock:
+// deferred-but-unsent shows up as a multi-second gap, a correctly retried batch as a few ticks.
+class WorldItemBurstScenario : public Scenario {
+public:
+    WorldItemBurstScenario()
+        : passed_(false), have_(false), step_(0), lastSampleMs_(0), seeded_(0), dropped_(0),
+          type_(0), peak_(0), firstSeenMs_(0), allSeenMs_(0) {
+        for (int i = 0; i < 5; ++i) hand_[i] = 0;
+        sid_[0] = '\0';
+    }
+
+    virtual const char* name() const { return "world_item_burst"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        have_ = engine::pickInventoryContainer(ctx.gw, hand_);
+        // Both sides resolve the SAME template independently (same gamedata), so the observer
+        // can count the burst without being told what to look for.
+        engine::commonTestItemSid(ctx.gw, sid_, sizeof(sid_), &type_);
+        char b[200];
+        _snprintf(b, sizeof(b) - 1,
+            "SCENARIO WIB anchor host=%d have=%d sid='%s' type=%u n=%d",
+            ctx.isHost ? 1 : 0, have_ ? 1 : 0, sid_[0] ? sid_ : "(none)", type_, BURST_N);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (ctx.isHost && have_ && step_ == 0 && ctx.elapsedMs >= 6000) {
+            step_ = 1;
+            // One Item of quantity N, then N single drops in this SAME tick: the point is for
+            // every one of them to become a distinct ground object within one publish pass.
+            seeded_ = engine::addTestItemsToContainer(ctx.gw, hand_, BURST_N, sid_, sizeof(sid_));
+            InvItemEntry items[INV_ITEMS_MAX];
+            unsigned int n = engine::captureContainerContents(ctx.gw, hand_, items, INV_ITEMS_MAX, 0);
+            for (unsigned int i = 0; i < n; ++i)
+                if (!items[i].equipped && strcmp(items[i].stringID, sid_) == 0) {
+                    type_ = items[i].itemType; break;
+                }
+            for (int k = 0; k < BURST_N; ++k)
+                dropped_ += engine::dropItemFromInventory(ctx.gw, hand_, sid_, type_, 1);
+            char b[200];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO WIB DROP seeded=%d dropped=%d sid='%s' type=%u",
+                      seeded_, dropped_, sid_[0] ? sid_ : "(none)", type_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        // Sample the ground on BOTH sides. The join's samples are the evidence; the host's
+        // confirm the burst really landed on the author's ground in the first place.
+        if (sid_[0] && (ctx.elapsedMs - lastSampleMs_ >= 250 || lastSampleMs_ == 0)) {
+            lastSampleMs_ = ctx.elapsedMs;
+            int n = engine::countFreeGroundItemsNear(ctx.gw, hand_, sid_, type_, RADIUS);
+            if (n > peak_) peak_ = n;
+            if (n >= 1 && firstSeenMs_ == 0) firstSeenMs_ = ctx.elapsedMs;
+            if (n >= BURST_N && allSeenMs_ == 0) allSeenMs_ = ctx.elapsedMs;
+            char b[200];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO WIB %s t=%lu ground=%d peak=%d",
+                      ctx.isHost ? "HOST" : "JOIN", (unsigned long)ctx.elapsedMs, n, peak_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            long spread = (allSeenMs_ != 0 && firstSeenMs_ != 0)
+                              ? (long)(allSeenMs_ - firstSeenMs_) : -1;
+            if (ctx.isHost) passed_ = have_ && (dropped_ == BURST_N) && (peak_ >= BURST_N);
+            else            passed_ = (peak_ >= BURST_N) && (spread >= 0) && (spread <= SPREAD_MAX_MS);
+            char b[240];
+            _snprintf(b, sizeof(b) - 1,
+                "SCENARIO WIB verdict role=%s pass=%d n=%d dropped=%d peak=%d firstMs=%lu "
+                "allMs=%lu spreadMs=%ld limitMs=%d",
+                ctx.isHost ? "host" : "join", passed_ ? 1 : 0, BURST_N, dropped_, peak_,
+                (unsigned long)firstSeenMs_, (unsigned long)allSeenMs_, spread, SPREAD_MAX_MS);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const int           BURST_N        = 5;
+    static const int           SPREAD_MAX_MS  = 2500; // well under the 5 s safety resend
+    static const unsigned long HOST_DURATION_MS = 26000;
+    static const unsigned long JOIN_DURATION_MS = 24000;
+    static const float         RADIUS;
+    bool          passed_, have_;
+    int           step_;
+    unsigned long lastSampleMs_;
+    int           seeded_, dropped_;
+    unsigned int  type_;
+    int           peak_;
+    unsigned long firstSeenMs_, allSeenMs_;
+    unsigned int  hand_[5];
+    char          sid_[48];
+};
+const float WorldItemBurstScenario::RADIUS = 60.0f;
+
 Scenario* makeWorldItemScenario(const std::string& name) {
     if (name == "drop_probe")   return new DropProbeScenario();
+    if (name == "world_item_burst") return new WorldItemBurstScenario();
+    if (name == "inv_nested_bag")   return new InvNestedBagScenario();
     if (name == "world_item_sync") return new WorldItemSyncScenario();
     if (name == "world_item_drop") return new WorldItemDropScenario();
     if (name == "world_item_join") return new WorldItemSyncScenario(/*joinAuthor*/ true);
     if (name == "world_weapon_drop") return new WorldGearDropScenario("world_weapon_drop", 2);
     if (name == "world_armor_drop")  return new WorldGearDropScenario("world_armor_drop", 3);
+    // Protocol 47: the worn CONTAINER (itemType 46) joined the conservation channel, so it
+    // gates on exactly the same contract as weapons/armour - the peer must RELOCATE its
+    // backpack to the ground, not destroy it. Before the fix the join's bag lost the
+    // backpack and the ground gained nothing (the snapshot REMOVE ran with no drop intent
+    // to explain it), which is precisely the grndMax==0 failure this asserts against.
+    if (name == "inv_backpack_drop") return new WorldGearDropScenario("inv_backpack_drop", 46);
+    if (name == "world_pickup_mirror") return new WorldPickupMirrorScenario();
     if (name == "weapon_loot")  return new WeaponLootScenario();
     if (name == "rejoin_items") return new RejoinItemsScenario();
     return 0;

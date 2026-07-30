@@ -149,12 +149,15 @@ void NetLink::setOwnedEntities(u32 ownerId, const EntityState* arr, unsigned int
 void NetLink::queueEvent(const EventPacket& ev) { pushLocked(outCs_, outEvents_, ev); }
 
 void NetLink::queueInvSnapshot(u32 ownerId, u8 keyKind, const u32 cKey[5],
-                               const InvItemEntry* items, unsigned int count) {
+                               const InvItemEntry* items, unsigned int count, u8 flags) {
     OutInv oi;
     oi.ownerId = ownerId;
     oi.keyKind = keyKind;
+    oi.flags   = flags;
     for (int k = 0; k < 5; ++k) oi.cKey[k] = cKey[k];
-    if (count > INV_ITEMS_MAX) count = INV_ITEMS_MAX;
+    // Clamping here is itself a truncation: mark it so the receiver stays additive-only
+    // (the caller normally sets the flag, but never let a silent clamp delete items).
+    if (count > INV_ITEMS_MAX) { count = INV_ITEMS_MAX; oi.flags |= INV_FLAG_TRUNCATED; }
     if (items && count > 0) oi.items.assign(items, items + count);
     pushLocked(outCs_, outInv_, oi);
 }
@@ -173,6 +176,15 @@ void NetLink::queueWorldRemove(u32 ownerId, const u32* netIds, unsigned int coun
     if (count > 255) count = 255; // u8 count on the wire
     if (netIds && count > 0) ow.netIds.assign(netIds, netIds + count);
     pushLocked(outCs_, outWorldRemove_, ow);
+}
+
+void NetLink::queueWorldClaim(u32 ownerId, u32 authorId, const u32* netIds,
+                              unsigned int count) {
+    OutWorldClaim ow;
+    ow.ownerId = ownerId; ow.authorId = authorId;
+    if (count > 255) count = 255; // u8 count on the wire
+    if (netIds && count > 0) ow.netIds.assign(netIds, netIds + count);
+    pushLocked(outCs_, outWorldClaim_, ow);
 }
 
 void NetLink::queueNpcCensus(u32 ownerId, const u32* hands, const float* pos,
@@ -549,7 +561,7 @@ void NetLink::threadLoop() {
                                 const InvItemEntry* items =
                                     (hdr.count > 0) ? reinterpret_cast<const InvItemEntry*>(p) : 0;
                                 inbound_->pushInv(hdr.ownerId, hdr.keyKind, cKey,
-                                                  items, hdr.count);
+                                                  items, hdr.count, hdr.flags);
                             }
                         }
                     } else if (type == PKT_WORLD_ITEM) {
@@ -582,6 +594,24 @@ void NetLink::threadLoop() {
                                 const u32* netIds =
                                     (hdr.count > 0) ? reinterpret_cast<const u32*>(p) : 0;
                                 inbound_->pushWorldRemove(hdr.ownerId, netIds, hdr.count);
+                            }
+                        }
+                    } else if (type == PKT_WORLD_ITEM_CLAIM) {
+                        // A peer consumed the proxies it held for these netIds
+                        // (protocol 47), so the AUTHOR must destroy its real
+                        // ground objects - the pickup mirror W1 lacked.
+                        const unsigned len = (unsigned)ev.packet->dataLength;
+                        if (len >= sizeof(WorldItemClaimHeader) && inbound_) {
+                            WorldItemClaimHeader hdr;
+                            std::memcpy(&hdr, ev.packet->data, sizeof(hdr));
+                            unsigned need = sizeof(WorldItemClaimHeader)
+                                          + (unsigned)hdr.count * sizeof(u32);
+                            if (len >= need) {
+                                const enet_uint8* p = ev.packet->data + sizeof(WorldItemClaimHeader);
+                                const u32* netIds =
+                                    (hdr.count > 0) ? reinterpret_cast<const u32*>(p) : 0;
+                                inbound_->pushWorldClaim(hdr.ownerId, hdr.authorId,
+                                                         netIds, hdr.count);
                             }
                         }
                     } else if (type == PKT_NPC_CENSUS) {
@@ -960,6 +990,48 @@ void NetLink::threadLoop() {
             }
         }
 
+        // Drain + send any queued conservation DROP intents on CH_RELIABLE (Phase W2). A
+        // fixed-size POD per drop, like an event; reliable so a drop is never lost.
+        //
+        // Ordered BEFORE the inventory snapshots below: both ride CH_RELIABLE, which ENet
+        // delivers in SEND order, so draining drops first means a drop intent can never be
+        // overtaken on the wire by the bag snapshot that reflects it. The peer's apply phase
+        // already runs drops before the reconcile within a tick, so this is belt-and-braces
+        // - but it removes an inversion that made the same-tick case confusing to reason
+        // about (and to read in a packet capture).
+        std::vector<WorldDropPacket> drops;
+        EnterCriticalSection(&outCs_);
+        drops.swap(outWorldDrops_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < drops.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&drops[i], sizeof(WorldDropPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send any queued conservation PICKUP intents on CH_RELIABLE (Phase W3).
+        std::vector<WorldPickupPacket> pickups;
+        EnterCriticalSection(&outCs_);
+        pickups.swap(outWorldPickups_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < pickups.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&pickups[i], sizeof(WorldPickupPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
         // Drain + send any queued container-contents snapshots on CH_RELIABLE. Each
         // is [InvSnapshotHeader][InvItemEntry*count]; only enqueued on content-change,
         // so this channel stays quiet. Reliable so the change survives WAN loss.
@@ -969,13 +1041,15 @@ void NetLink::threadLoop() {
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < invs.size(); ++i) {
             unsigned count = (unsigned)invs[i].items.size();
-            if (count > INV_ITEMS_MAX) count = INV_ITEMS_MAX;
+            u8 iflags = invs[i].flags;
+            if (count > INV_ITEMS_MAX) { count = INV_ITEMS_MAX; iflags |= INV_FLAG_TRUNCATED; }
             unsigned bytes = sizeof(InvSnapshotHeader) + count * sizeof(InvItemEntry);
             ENetPacket* out = enet_packet_create(0, bytes, ENET_PACKET_FLAG_RELIABLE);
             InvSnapshotHeader hdr;
             hdr.type             = (u8)PKT_INV_SNAPSHOT;
             hdr.ownerId          = invs[i].ownerId;
             hdr.keyKind          = invs[i].keyKind;
+            hdr.flags            = iflags;
             hdr.cType            = invs[i].cKey[0];
             hdr.cContainer       = invs[i].cKey[1];
             hdr.cContainerSerial = invs[i].cKey[2];
@@ -1000,9 +1074,11 @@ void NetLink::threadLoop() {
         // changed ground items, so a settled world produces no traffic. Host-authored.
         std::vector<OutWorldItems> wis;
         std::vector<OutWorldRemove> wrs;
+        std::vector<OutWorldClaim> wcs;
         EnterCriticalSection(&outCs_);
         wis.swap(outWorldItems_);
         wrs.swap(outWorldRemove_);
+        wcs.swap(outWorldClaim_);
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < wis.size(); ++i) {
             unsigned count = (unsigned)wis[i].items.size();
@@ -1046,6 +1122,30 @@ void NetLink::threadLoop() {
                 enet_packet_destroy(out);
             }
         }
+        // Drain + send any queued world-item CLAIMS on CH_RELIABLE (protocol 47). A claim
+        // travels the opposite way to a cull: the peer that consumed a proxy tells the
+        // AUTHOR to destroy its real ground copy.
+        for (size_t i = 0; i < wcs.size(); ++i) {
+            unsigned count = (unsigned)wcs[i].netIds.size();
+            if (count > 255) count = 255;
+            unsigned bytes = sizeof(WorldItemClaimHeader) + count * sizeof(u32);
+            ENetPacket* out = enet_packet_create(0, bytes, ENET_PACKET_FLAG_RELIABLE);
+            WorldItemClaimHeader hdr;
+            hdr.type     = (u8)PKT_WORLD_ITEM_CLAIM;
+            hdr.ownerId  = wcs[i].ownerId;
+            hdr.authorId = wcs[i].authorId;
+            hdr.count    = (u8)count;
+            std::memcpy(out->data, &hdr, sizeof(hdr));
+            if (count > 0)
+                std::memcpy(out->data + sizeof(hdr), &wcs[i].netIds[0], count * sizeof(u32));
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
 
         // Drain + send any queued NPC existence censuses on CH_RELIABLE
         // (protocol 36, host -> join, 1 Hz). ENet fragments the large list.
@@ -1075,41 +1175,6 @@ void NetLink::threadLoop() {
                 if (censuses[i].pos.size() >= count * 3)
                     std::memcpy(pp, &censuses[i].pos[0], count * 3 * sizeof(float));
             }
-            if (isHost_) {
-                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
-            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
-                enet_peer_send(serverPeer_, CH_RELIABLE, out);
-            } else {
-                enet_packet_destroy(out);
-            }
-        }
-
-        // Drain + send any queued conservation DROP intents on CH_RELIABLE (Phase W2). A
-        // fixed-size POD per drop, like an event; reliable so a drop is never lost.
-        std::vector<WorldDropPacket> drops;
-        EnterCriticalSection(&outCs_);
-        drops.swap(outWorldDrops_);
-        LeaveCriticalSection(&outCs_);
-        for (size_t i = 0; i < drops.size(); ++i) {
-            ENetPacket* out = enet_packet_create(&drops[i], sizeof(WorldDropPacket),
-                                                 ENET_PACKET_FLAG_RELIABLE);
-            if (isHost_) {
-                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
-            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
-                enet_peer_send(serverPeer_, CH_RELIABLE, out);
-            } else {
-                enet_packet_destroy(out);
-            }
-        }
-
-        // Drain + send any queued conservation PICKUP intents on CH_RELIABLE (Phase W3).
-        std::vector<WorldPickupPacket> pickups;
-        EnterCriticalSection(&outCs_);
-        pickups.swap(outWorldPickups_);
-        LeaveCriticalSection(&outCs_);
-        for (size_t i = 0; i < pickups.size(); ++i) {
-            ENetPacket* out = enet_packet_create(&pickups[i], sizeof(WorldPickupPacket),
-                                                 ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);
             } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {

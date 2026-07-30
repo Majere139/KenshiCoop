@@ -1,7 +1,8 @@
 # oracles/Inventory.ps1 - inventory + world-item oracles (monolith split of
 # CoopOracles.psm1, 2026-07-12): Test-InventorySync/Bidir/Equip/Reequip,
 # Test-AddEquip, Test-TradeProbe, Test-TradePeer, Test-DropProbe,
-# Test-WorldItemSync, Test-WpnRelocate, Test-WeaponDrop, Test-WeaponLoot.
+# Test-WorldItemSync, Test-WpnRelocate, Test-WeaponDrop, Test-WeaponLoot,
+# Test-InventoryOverflow, Test-InventoryDropFull (protocol 46 item-loss gates).
 # Dot-sourced by CoopOracles.psm1 (module scope).
 # Must NOT: change gate names or the INV/TINV/DROP/GEAR marker regexes -
 # they are the C++ log contract (resources/CODE_MAP.md).
@@ -782,6 +783,430 @@ function Test-WeaponDrop {
     Write-Host ("  $tag " + $(if ($ok) { "PASS" } else { "FAIL" }))
     return (Add-GateResult -Name $GateName -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
                 -Metrics @{ hostOk = $hostOk; joinOk = $joinOk; authored = $authored; applied = $applied })
+}
+
+# world_pickup_mirror (protocol 47): the W1 CLAIM half. The host drops a non-gear item and
+# the join consumes the resulting proxy; the host's OWN ground copy must then be destroyed.
+# grndPeak>=1 proves the drop landed at all (so grndFinal==0 cannot pass vacuously), and
+# grndFinal==0 is the fix: before the claim existed the author kept its copy forever and the
+# item was duplicated - the "join picked it up but the host still sees it there" report.
+function Test-WorldPickupMirror {
+    param([string]$HostFile, [string]$JoinFile)
+    $rxHost = 'WPMIRROR verdict role=host pass=(\d+) sid=''([^'']*)'' dropped=(-?\d+) grndPeak=(\d+) grndFinal=(-?\d+)'
+    $rxJoin = 'WPMIRROR verdict role=join pass=(\d+) sid=''([^'']*)'' pickedUp=(-?\d+)'
+    $hostOk = $false; $peak = 0; $final = -1; $dropped = 0
+    if (Test-Path $HostFile) {
+        $hl = Select-String -Path $HostFile -Pattern $rxHost -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -ne $hl) {
+            $g = $hl.Matches[0].Groups
+            $dropped = [int]$g[3].Value; $peak = [int]$g[4].Value; $final = [int]$g[5].Value
+            $hostOk = ($dropped -ge 1) -and ($peak -ge 1) -and ($final -eq 0)
+            Write-Host ("  WPICKUP-MIRROR [host] " + $(if ($hostOk) { "PASS" } else { "FAIL" }) +
+                        " - ground copy retired (dropped=$dropped peak=$peak final=$final)")
+            if (-not $hostOk -and $peak -ge 1 -and $final -gt 0) {
+                Write-Host "    NOTE: the item stayed on the author's ground after the peer took it => the CLAIM never landed (duplicate)"
+            }
+        } else { Write-Host "  WPICKUP-MIRROR [host] FAIL - no host WPMIRROR verdict" }
+    } else { Write-Host "  WPICKUP-MIRROR [host] FAIL - no log" }
+    $joinOk = $false; $got = 0
+    if (Test-Path $JoinFile) {
+        $jl = Select-String -Path $JoinFile -Pattern $rxJoin -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -ne $jl) {
+            $g = $jl.Matches[0].Groups
+            $got = [int]$g[3].Value
+            $joinOk = ($got -ge 1)
+            Write-Host ("  WPICKUP-MIRROR [join] " + $(if ($joinOk) { "PASS" } else { "FAIL" }) +
+                        " - consumed the proxy (pickedUp=$got)")
+        } else { Write-Host "  WPICKUP-MIRROR [join] FAIL - no join WPMIRROR verdict" }
+    } else { Write-Host "  WPICKUP-MIRROR [join] FAIL - no log" }
+    $claimed = (Test-Path $JoinFile) -and (Select-String -Path $JoinFile -Pattern '\[wi\] CLAIM author=' -Quiet)
+    $applied = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[wi\] CLAIM-APPLY netId=\d+ .* destroyed=1' -Quiet)
+    Write-Host ("  WPICKUP-MIRROR trace: join authored CLAIM=$claimed, host CLAIM-APPLY destroyed=1=$applied")
+    $ok = $hostOk -and $joinOk
+    Write-Host ("  WPICKUP-MIRROR " + $(if ($ok) { "PASS" } else { "FAIL" }))
+    return (Add-GateResult -Name "pickup_mirror" -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
+                -Metrics @{ hostOk = $hostOk; joinOk = $joinOk; dropped = $dropped;
+                            grndPeak = $peak; grndFinal = $final; pickedUp = $got;
+                            claimed = $claimed; applied = $applied })
+}
+
+# inv_regear (protocol 47): the ONE-INSTANCE invariant across a full W2 round trip. Both
+# halves must hold, because either alone is satisfied by a broken outcome:
+#   host grndFinal=0  - our ground copy was retired ... but on its own, losing the item does that
+#   host bagR1>=1     - our copy of the peer's bag holds it ... but on its own, so does a duplicate
+# grndPeak>=1 keeps the whole thing honest by proving the item was ever on the ground.
+# The trace also reports REHOME-DUPE-RISK, which is the author declining to destroy a ground
+# copy it could not verify - safe (never loses the item) but still a visible duplicate, so it
+# is surfaced rather than swallowed.
+function Test-GearRepickup {
+    param([string]$HostFile, [string]$JoinFile,
+          [string]$GateName = "gear_repickup",
+          # inv_regear_refuse only: the run injected a refusal, so converging is not enough -
+          # the retry/verify path must be visible in the log, or the gate would also pass on a
+          # build that went back to re-homing once and giving up.
+          [switch]$RequireRetry,
+          # inv_regear_refuse_all only: every attempt was refused, so convergence must have
+          # come from the verify-then-destroy branch specifically (REHOME-DEDUPE).
+          [switch]$RequireDedupe,
+          # inv_regear_forget only: the author threw its ground track away, so the pickup
+          # arrived named but unmatchable. Converging can then ONLY have come from the
+          # site-anchored recovery, and the gate says so - otherwise it would also pass on the
+          # build that answered "untracked" and left the item lying on the ground.
+          [switch]$RequireSiteRecovery)
+    $rxHost = 'WGRP verdict role=host pass=(\d+) sid=''([^'']*)'' dropped=(-?\d+) grndPeak=(-?\d+) grndFinal=(-?\d+) bagR1=(-?\d+) bagBase=(-?\d+)'
+    $rxJoin = 'WGRP verdict role=join pass=(\d+) sid=''([^'']*)'' pickedUp=(-?\d+) tries=(\d+) bagR1=(-?\d+) bagBase=(-?\d+)'
+    $hostOk = $false; $dropped = 0; $peak = 0; $final = -1; $bag = -1; $base = 0
+    if (Test-Path $HostFile) {
+        $hl = Select-String -Path $HostFile -Pattern $rxHost -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -ne $hl) {
+            $g = $hl.Matches[0].Groups
+            $dropped = [int]$g[3].Value; $peak = [int]$g[4].Value
+            $final = [int]$g[5].Value; $bag = [int]$g[6].Value; $base = [int]$g[7].Value
+            $hostOk = ($dropped -ge 1) -and ($peak -ge 1) -and ($final -eq 0) -and ($bag -eq $base + 1)
+            Write-Host ("  GEAR-REPICKUP [host] " + $(if ($hostOk) { "PASS" } else { "FAIL" }) +
+                        " - one instance after the peer's pickup (dropped=$dropped peak=$peak ground=$final bagR1=$bag base=$base)")
+            if ($final -gt 0 -and $bag -gt $base) {
+                Write-Host "    NOTE: DUPLICATE - the item is in the peer's bag AND still on our ground (the manual-session symptom)"
+            } elseif ($final -eq 0 -and $bag -le $base -and $peak -ge 1) {
+                Write-Host "    NOTE: LOST - our ground copy is gone and the bag did not gain it either"
+            } elseif ($bag -gt $base + 1) {
+                Write-Host "    NOTE: DUPLICATE inside the bag - it gained $($bag - $base) copies for one pickup"
+            }
+        } else { Write-Host "  GEAR-REPICKUP [host] FAIL - no host WGRP verdict" }
+    } else { Write-Host "  GEAR-REPICKUP [host] FAIL - no log" }
+    $joinOk = $false; $got = 0; $tries = 0; $jbag = -1; $jbase = 0
+    if (Test-Path $JoinFile) {
+        $jl = Select-String -Path $JoinFile -Pattern $rxJoin -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -ne $jl) {
+            $g = $jl.Matches[0].Groups
+            $got = [int]$g[3].Value; $tries = [int]$g[4].Value
+            $jbag = [int]$g[5].Value; $jbase = [int]$g[6].Value
+            $joinOk = ($got -ge 1) -and ($jbag -eq $jbase + 1)
+            Write-Host ("  GEAR-REPICKUP [join] " + $(if ($joinOk) { "PASS" } else { "FAIL" }) +
+                        " - picked the relocated gear up (got=$got tries=$tries bagR1=$jbag base=$jbase)")
+        } else { Write-Host "  GEAR-REPICKUP [join] FAIL - no join WGRP verdict" }
+    } else { Write-Host "  GEAR-REPICKUP [join] FAIL - no log" }
+    $rehomed  = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[wd\] PICKUP-APPLY .* moved=1' -Quiet)
+    $retried  = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[wd\] REHOME-(RETRY-OK|DEDUPE)' -Quiet)
+    $risk     = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[wd\] REHOME-DUPE-RISK' -Quiet)
+    $injected = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[wd\] REHOME-REFUSE-INJECTED' -Quiet)
+    Write-Host ("  GEAR-REPICKUP trace: host re-homed on first try=$rehomed, needed retry/dedupe=$retried, unresolved duplicate=$risk, refusal injected=$injected")
+    $deduped = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[wd\] REHOME-DEDUPE .* destroyed=1' -Quiet)
+    $ok = $hostOk -and $joinOk
+    if ($RequireRetry -or $RequireDedupe) {
+        if (-not $injected) {
+            Write-Host "  GEAR-REPICKUP FAIL - the refusal lever never fired, so the recovery path was never under test"
+            $ok = $false
+        } elseif (-not $retried) {
+            Write-Host "  GEAR-REPICKUP FAIL - a re-home was refused but nothing retried or deduped it (single-shot re-home = permanent duplicate)"
+            $ok = $false
+        }
+    }
+    if ($RequireSiteRecovery) {
+        $forgot    = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[wd\] TRACK-FORGET-INJECTED' -Quiet)
+        $recovered = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[wd\] PICKUP-APPLY .* moved=1 why=recovered-by-site' -Quiet)
+        $untracked = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[wd\] PICKUP-APPLY .* moved=0 why=untracked' -Quiet)
+        Write-Host "  GEAR-REPICKUP site recovery: track forgotten=$forgot, recovered-by-site=$recovered, gave up as untracked=$untracked"
+        if (-not $forgot) {
+            Write-Host "  GEAR-REPICKUP FAIL - the forget lever never fired, so the recovery was never under test"
+            $ok = $false
+        } elseif (-not $recovered) {
+            Write-Host "  GEAR-REPICKUP FAIL - a named pickup could not be matched and nothing recovered it (this is the duplicate the player reported)"
+            $ok = $false
+        }
+    }
+    if ($RequireDedupe) {
+        Write-Host "  GEAR-REPICKUP dedupe branch: REHOME-DEDUPE destroyed=1 = $deduped"
+        if (-not $deduped) {
+            Write-Host "  GEAR-REPICKUP FAIL - with every re-home refused, the ground copy can only be retired by verify-then-destroy, and that branch never ran"
+            $ok = $false
+        }
+    }
+    Write-Host ("  GEAR-REPICKUP " + $(if ($ok) { "PASS" } else { "FAIL" }))
+    return (Add-GateResult -Name $GateName -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
+                -Metrics @{ hostOk = $hostOk; joinOk = $joinOk; dropped = $dropped;
+                            grndPeak = $peak; grndFinal = $final; hostBagR1 = $bag;
+                            hostBagBase = $base; pickedUp = $got; tries = $tries;
+                            joinBagR1 = $jbag; joinBagBase = $jbase;
+                            rehomedFirstTry = $rehomed; retried = $retried; dupeRisk = $risk;
+                            refusalInjected = $injected; deduped = $deduped })
+}
+
+# world_item_burst: a burst of non-gear drops landing in ONE publish pass must ALL reach the
+# peer promptly. The per-tick send batch is finite, and the entries that did not fit used to be
+# stamped as sent anyway, so they went out only when the 5 s safety resend happened to pick them
+# up. The gate reads the SPREAD between the peer seeing the first item of the burst and seeing
+# them all, which needs no shared clock: a few ticks means the batch was retried, seconds means
+# the tail was booked as sent and quietly withheld. The author's own side must show the whole
+# burst on its ground too, or a "converged" spread would just mean nothing was ever dropped.
+# inv_nested_bag (protocol 48): an item the host places INSIDE a worn backpack must show up
+# inside the JOIN's copy of that bag. A worn container owns its own private Inventory, and no
+# section of the wearer's inventory refers to it, so a bagged item used to appear in no snapshot
+# whatsoever - it existed for its author alone, and the bag travelled to the peer empty. The
+# gate is about PLACE, not presence: landing the item loose on the character would pass a naive
+# "does the peer have it" check while leaving the bag empty for the next relocation, so the
+# scenario counts strictly INSIDE the container. It is also a DELTA (inBag - base), because the
+# probe is a common template the save's bag may already hold - an absolute count would pass on
+# the fixture's own contents with nothing having crossed the wire.
+function Test-NestedBag {
+    param([string]$HostFile, [string]$JoinFile)
+    $rx = "NEST verdict role=(host|join) pass=(\d+) sid='([^']*)' want=(-?\d+) added=(-?\d+) base=(-?\d+) inBag=(-?\d+) delta=(-?\d+) peak=(-?\d+)"
+    $read = {
+        param($file, $role)
+        $r = [pscustomobject]@{ found = $false; pass = $false; sid = ''; want = 0
+                                added = -1; base = -1; inBag = -1; delta = -1 }
+        if (-not (Test-Path $file)) { return $r }
+        $m = Select-String -Path $file -Pattern $rx -ErrorAction SilentlyContinue |
+             Where-Object { $_.Matches[0].Groups[1].Value -eq $role } | Select-Object -Last 1
+        if ($null -eq $m) { return $r }
+        $g = $m.Matches[0].Groups
+        $r.found = $true; $r.pass = ([int]$g[2].Value -eq 1); $r.sid = $g[3].Value
+        $r.want = [int]$g[4].Value; $r.added = [int]$g[5].Value; $r.base = [int]$g[6].Value
+        $r.inBag = [int]$g[7].Value; $r.delta = [int]$g[8].Value
+        return $r
+    }
+    $h = & $read $HostFile 'host'
+    $j = & $read $JoinFile 'join'
+    if (-not $h.found) { Write-Host "  NESTED-BAG [host] FAIL - no NEST verdict" }
+    else {
+        Write-Host ("  NESTED-BAG [host] " + $(if ($h.pass) { "PASS" } else { "FAIL" }) +
+                    " - author put $($h.want)x '$($h.sid)' in the bag (added=$($h.added) base=$($h.base) inBag=$($h.inBag) delta=$($h.delta))")
+        if ($h.added -lt $h.want) {
+            Write-Host "    NOTE: the author never got the item into the bag, so the join had nothing to converge to - this is a setup failure, not a sync result"
+        }
+    }
+    if (-not $j.found) { Write-Host "  NESTED-BAG [join] FAIL - no NEST verdict" }
+    else {
+        Write-Host ("  NESTED-BAG [join] " + $(if ($j.pass) { "PASS" } else { "FAIL" }) +
+                    " - peer's bag gained $($j.delta) (want=$($j.want) base=$($j.base) inBag=$($j.inBag))")
+        if ($j.base -lt 0) {
+            Write-Host "    NOTE: the join found no container at all on that character, so nothing could be nested"
+        } elseif ($j.delta -eq 0) {
+            Write-Host "    NOTE: the bagged item never reached the peer's bag - a worn container's contents are described by the snapshot only if readInvItems walks into it"
+        } elseif ($j.delta -gt $j.want) {
+            Write-Host "    NOTE: the peer's bag gained MORE than was placed - the nested entries were applied twice (once nested, once at top level)"
+        }
+    }
+    $skip = (Test-Path $JoinFile) -and (Select-String -Path $JoinFile -Pattern '\[recon\] NESTED-SKIP' -Quiet)
+    Write-Host "  NESTED-BAG trace: join skipped a nested apply for a missing container=$skip"
+    $ok = $h.found -and $j.found -and $h.pass -and $j.pass
+    Write-Host ("  NESTED-BAG " + $(if ($ok) { "PASS" } else { "FAIL" }))
+    return (Add-GateResult -Name "nested_bag" -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
+                -Metrics @{ hostOk = $h.pass; joinOk = $j.pass; want = $j.want
+                            hostAdded = $h.added; hostBase = $h.base; hostInBag = $h.inBag
+                            joinBase = $j.base; joinInBag = $j.inBag; joinDelta = $j.delta
+                            nestedSkip = $skip })
+}
+
+function Test-WorldItemBurst {
+    param([string]$HostFile, [string]$JoinFile)
+    $rx = 'WIB verdict role=(host|join) pass=(\d+) n=(\d+) dropped=(-?\d+) peak=(-?\d+) firstMs=(\d+) allMs=(\d+) spreadMs=(-?\d+) limitMs=(\d+)'
+    $read = {
+        param($file, $role)
+        $r = [pscustomobject]@{ found = $false; pass = $false; n = 0; dropped = -1; peak = -1
+                                spread = -1; limit = 0 }
+        if (-not (Test-Path $file)) { return $r }
+        $m = Select-String -Path $file -Pattern $rx -ErrorAction SilentlyContinue |
+             Where-Object { $_.Matches[0].Groups[1].Value -eq $role } | Select-Object -Last 1
+        if ($null -eq $m) { return $r }
+        $g = $m.Matches[0].Groups
+        $r.found = $true; $r.pass = ([int]$g[2].Value -eq 1); $r.n = [int]$g[3].Value
+        $r.dropped = [int]$g[4].Value; $r.peak = [int]$g[5].Value
+        $r.spread = [int]$g[8].Value; $r.limit = [int]$g[9].Value
+        return $r
+    }
+    $h = & $read $HostFile 'host'
+    $j = & $read $JoinFile 'join'
+    if (-not $h.found) { Write-Host "  WORLD-ITEM-BURST [host] FAIL - no WIB verdict" }
+    else {
+        Write-Host ("  WORLD-ITEM-BURST [host] " + $(if ($h.pass) { "PASS" } else { "FAIL" }) +
+                    " - author dropped the whole burst (n=$($h.n) dropped=$($h.dropped) groundPeak=$($h.peak))")
+    }
+    if (-not $j.found) { Write-Host "  WORLD-ITEM-BURST [join] FAIL - no WIB verdict" }
+    else {
+        Write-Host ("  WORLD-ITEM-BURST [join] " + $(if ($j.pass) { "PASS" } else { "FAIL" }) +
+                    " - peer saw all $($j.n) (groundPeak=$($j.peak) spread=$($j.spread)ms limit=$($j.limit)ms)")
+        if ($j.peak -lt $j.n) {
+            Write-Host "    NOTE: the peer never saw the whole burst - part of it was never streamed at all"
+        } elseif ($j.spread -gt $j.limit) {
+            Write-Host "    NOTE: the tail of the burst arrived $($j.spread)ms late - the overflow was booked as sent and waited for the safety resend"
+        }
+    }
+    $defer = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[wi\] SEND-DEFER' -Quiet)
+    Write-Host "  WORLD-ITEM-BURST trace: batch overflowed (SEND-DEFER)=$defer"
+    $ok = $h.found -and $j.found -and $h.pass -and $j.pass
+    if (-not $defer) {
+        Write-Host "  WORLD-ITEM-BURST FAIL - the batch never overflowed, so the deferral path was never under test"
+        $ok = $false
+    }
+    Write-Host ("  WORLD-ITEM-BURST " + $(if ($ok) { "PASS" } else { "FAIL" }))
+    return (Add-GateResult -Name "world_item_burst" -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
+                -Metrics @{ hostOk = $h.pass; joinOk = $j.pass; burstN = $j.n
+                            hostDropped = $h.dropped; hostPeak = $h.peak; joinPeak = $j.peak
+                            joinSpreadMs = $j.spread; limitMs = $j.limit; overflowed = $defer })
+}
+
+# no_phantom_pickups (protocol 47): every W2 PICKUP intent must NAME the instance it is about
+# (ref=<dropOwner>/<dropId>, the identity both clients took from the DROP). ref=0/0 is the
+# phantom signature, and it was mass-produced two ways: the gear census read an increase it
+# had no evidence for (a container's worn items missing from one read and back in the next -
+# or, worse, an uninitialised `seeded` flag making it skip its baseline entirely and read the
+# whole worn kit as arrivals), and the receiver answered such an intent by re-homing an
+# arbitrary same-sid ground item. Both ends now refuse to guess, so the count must be zero.
+# Checked on authored intents AND on applies, since either end alone could reintroduce it.
+function Test-NoPhantomPickups {
+    param([string]$HostFile, [string]$JoinFile)
+    $side = {
+        param($file, $role)
+        $r = [pscustomobject]@{ ok = $true; authored = 0; phantomAuthored = 0
+                                applied = 0; phantomApplied = 0; seeded = 0; suppressed = 0 }
+        if (-not (Test-Path $file)) {
+            Write-Host "  NO-PHANTOM-PICKUPS [$role] FAIL - no log"
+            $r.ok = $false; return $r
+        }
+        foreach ($ln in (Get-Content -Path $file -ErrorAction SilentlyContinue)) {
+            if ($ln -match '\[wd\] PICKUP id=') {
+                $r.authored++
+                if ($ln -match 'ref=0/0') { $r.phantomAuthored++ }
+            } elseif ($ln -match '\[wd\] PICKUP-APPLY ') {
+                $r.applied++
+                if ($ln -match 'ref=0/0') { $r.phantomApplied++ }
+            }
+            if ($ln -match '\[wd\] census-seed') { $r.seeded++ }
+            if ($ln -match '\[wd\] increase-(unexplained|untracked)') { $r.suppressed++ }
+        }
+        $r.ok = ($r.phantomAuthored -eq 0) -and ($r.phantomApplied -eq 0)
+        Write-Host ("  NO-PHANTOM-PICKUPS [$role] " + $(if ($r.ok) { "PASS" } else { "FAIL" }) +
+                    " - identity-less authored=$($r.phantomAuthored)/$($r.authored) applied=$($r.phantomApplied)/$($r.applied)" +
+                    " (containers seeded=$($r.seeded), unprovable increases suppressed=$($r.suppressed))")
+        if ($r.phantomAuthored -gt 0) {
+            Write-Host "    NOTE: the census authored $($r.phantomAuthored) PICKUP intent(s) naming no instance - it read an increase it had no arriving object for"
+        }
+        if ($r.phantomApplied -gt 0) {
+            Write-Host "    NOTE: $($r.phantomApplied) PICKUP-APPLY had no drop identity - such an intent can only be answered by guessing which ground item to re-home"
+        }
+        return $r
+    }
+    $h = & $side $HostFile 'host'
+    $j = & $side $JoinFile 'join'
+    $ok = $h.ok -and $j.ok
+    Write-Host ("  NO-PHANTOM-PICKUPS " + $(if ($ok) { "PASS" } else { "FAIL" }))
+    return (Add-GateResult -Name "no_phantom_pickups" -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
+                -Metrics @{ hostAuthored = $h.authored; joinAuthored = $j.authored;
+                            hostPhantomAuthored = $h.phantomAuthored; joinPhantomAuthored = $j.phantomAuthored;
+                            hostApplied = $h.applied; joinApplied = $j.applied;
+                            hostPhantomApplied = $h.phantomApplied; joinPhantomApplied = $j.phantomApplied;
+                            hostSeeded = $h.seeded; joinSeeded = $j.seeded;
+                            hostSuppressed = $h.suppressed; joinSuppressed = $j.suppressed })
+}
+
+# inv_overflow (protocol 46): the container-overflow item-loss class. Both clients run the
+# same local checks against a container they OWN, so BOTH verdicts must pass. Gates:
+#   gearOk     - a capture that cannot fit everything spends its budget on EQUIPPED entries
+#                first (worn kit is never what gets cut)
+#   truncOk    - the overflow is reported on the wire (INV_FLAG_TRUNCATED)
+#   additiveOk - reconciling against a truncated list destroys NOTHING
+# Also asserts no APPLY-TRUNCATED reconcile ever reported a shrinking container.
+function Test-InventoryOverflow {
+    param([string]$HostFile, [string]$JoinFile)
+    $rxV = 'SCENARIO INVOF verdict pass=(\d+) gearOk=(\d+) truncOk=(\d+) additiveOk=(\d+) full=(\d+) eqFull=(\d+) small=(\d+) eqSmall=(\d+) before=(\d+) after=(\d+)'
+    $side = {
+        param($file, $role)
+        $r = [pscustomobject]@{ ok = $false; gear = $false; trunc = $false; additive = $false
+                                full = 0; before = 0; after = 0 }
+        if (-not (Test-Path $file)) { Write-Host "  INV-OVERFLOW [$role] FAIL - no log"; return $r }
+        $ln = Select-String -Path $file -Pattern $rxV -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -eq $ln) { Write-Host "  INV-OVERFLOW [$role] FAIL - no INVOF verdict"; return $r }
+        $g = $ln.Matches[0].Groups
+        $r.gear     = ([int]$g[2].Value -eq 1)
+        $r.trunc    = ([int]$g[3].Value -eq 1)
+        $r.additive = ([int]$g[4].Value -eq 1)
+        $r.full     = [int]$g[5].Value
+        $r.before   = [int]$g[9].Value
+        $r.after    = [int]$g[10].Value
+        $r.ok = $r.gear -and $r.trunc -and $r.additive -and ($r.after -ge $r.before)
+        Write-Host ("  INV-OVERFLOW [$role] " + $(if ($r.ok) { "PASS" } else { "FAIL" }) +
+                    " - gearFirst=$($r.gear) truncFlagged=$($r.trunc) additiveOnly=$($r.additive)" +
+                    " (full=$($r.full) before=$($r.before) after=$($r.after))")
+        if (-not $r.additive -and $r.after -lt $r.before) {
+            Write-Host "    NOTE: reconcile against a TRUNCATED snapshot destroyed $($r.before - $r.after) entries - the backpack item-loss bug"
+        }
+        return $r
+    }
+    $H = & $side $HostFile "host"
+    $J = & $side $JoinFile "join"
+    # Any truncated snapshot that actually crossed the wire must have been applied
+    # additively; surface the counts so a cap that is too low is visible in the run.
+    $sentTrunc = 0; $appliedTrunc = 0
+    foreach ($f in @($HostFile, $JoinFile)) {
+        if (Test-Path $f) {
+            $sentTrunc    += @(Select-String -Path $f -Pattern '\[inv\] SEND-TRUNCATED' -ErrorAction SilentlyContinue).Count
+            $appliedTrunc += @(Select-String -Path $f -Pattern '\[inv\] APPLY-TRUNCATED' -ErrorAction SilentlyContinue).Count
+        }
+    }
+    Write-Host "  INV-OVERFLOW trace: wire truncations sent=$sentTrunc applied=$appliedTrunc (0/0 expected at cap 64)"
+    $ok = $H.ok -and $J.ok
+    Write-Host ("  INV-OVERFLOW " + $(if ($ok) { "PASS" } else { "FAIL" }))
+    return (Add-GateResult -Name "inv_overflow" -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
+                -Metrics @{ hostOk = $H.ok; joinOk = $J.ok
+                            gearFirst = ($H.gear -and $J.gear)
+                            truncFlagged = ($H.trunc -and $J.trunc)
+                            additiveOnly = ($H.additive -and $J.additive)
+                            sentTruncations = $sentTrunc; appliedTruncations = $appliedTrunc })
+}
+
+# inv_dropfull (protocol 46): the W2 drop-vs-snapshot race. The host drops EQUIPPED gear
+# while continuously churning the same container's loose contents, maximizing the chance a
+# bag snapshot overtakes the drop intent. The join must still conserve the gear (bag loses
+# it, ground gains it). Gates both verdicts plus the decisive wire evidence: the peer must
+# log an APPLY with moved>0 and must NEVER log APPLY-LOST (the silent item loss).
+# APPLY-HEALED is tolerated but reported - it means the publish hold was outrun and the
+# fabrication backstop covered it, which is worth seeing.
+function Test-InventoryDropFull {
+    param([string]$HostFile, [string]$JoinFile)
+    $rxHost = 'SCENARIO INVDF verdict role=host pass=(\d+) sid=''([^'']*)'' invBase=(-?\d+) invAfter=(-?\d+) grndAfter=(-?\d+) churns=(\d+)'
+    $rxJoin = 'SCENARIO INVDF verdict role=join pass=(\d+) sid=''([^'']*)'' invBase=(-?\d+) invMin=(-?\d+) grndMax=(-?\d+) conserved=(\d+)'
+    $hostOk = $false; $churns = 0
+    if (Test-Path $HostFile) {
+        $hl = Select-String -Path $HostFile -Pattern $rxHost -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -ne $hl) {
+            $g = $hl.Matches[0].Groups
+            $invBase = [int]$g[3].Value; $invAfter = [int]$g[4].Value; $churns = [int]$g[6].Value
+            $hostOk = ($invBase -ge 1) -and ($invAfter -le $invBase - 1) -and ($churns -gt 0)
+            Write-Host ("  INV-DROPFULL [host] " + $(if ($hostOk) { "PASS" } else { "FAIL" }) +
+                        " - dropped gear mid-churn (invBase=$invBase invAfter=$invAfter churns=$churns)")
+        } else { Write-Host "  INV-DROPFULL [host] FAIL - no host INVDF verdict" }
+    } else { Write-Host "  INV-DROPFULL [host] FAIL - no log" }
+    $joinOk = $false
+    if (Test-Path $JoinFile) {
+        $jl = Select-String -Path $JoinFile -Pattern $rxJoin -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -ne $jl) {
+            $g = $jl.Matches[0].Groups
+            $invBase = [int]$g[3].Value; $invMin = [int]$g[4].Value; $grndMax = [int]$g[5].Value
+            $joinOk = ($invBase -ge 1) -and ($invMin -le $invBase - 1) -and ($grndMax -ge 1)
+            Write-Host ("  INV-DROPFULL [join] " + $(if ($joinOk) { "PASS" } else { "FAIL" }) +
+                        " - conserved own copy (invBase=$invBase invMin=$invMin grndMax=$grndMax)")
+            if (-not $joinOk -and $invMin -le $invBase - 1 -and $grndMax -lt 1) {
+                Write-Host "    NOTE: gear LEFT the bag but never reached the ground => the snapshot beat the drop intent and the reconcile destroyed it"
+            }
+        } else { Write-Host "  INV-DROPFULL [join] FAIL - no join INVDF verdict" }
+    } else { Write-Host "  INV-DROPFULL [join] FAIL - no log" }
+    $authored = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[wd\] DROP id=' -Quiet)
+    $moved    = $false; $lost = $false; $healed = 0
+    if (Test-Path $JoinFile) {
+        $moved  = [bool](Select-String -Path $JoinFile -Pattern '\[wd\] APPLY id=\d+ .* moved=[1-9]' -Quiet)
+        $lost   = [bool](Select-String -Path $JoinFile -Pattern '\[wd\] APPLY-LOST' -Quiet)
+        $healed = @(Select-String -Path $JoinFile -Pattern '\[wd\] APPLY-HEALED' -ErrorAction SilentlyContinue).Count
+    }
+    Write-Host "  INV-DROPFULL trace: host authored DROP=$authored, join moved>0=$moved, APPLY-LOST=$lost, healed=$healed"
+    if ($healed -gt 0) {
+        Write-Host "    NOTE: $healed drop(s) needed the fabrication backstop - the publish hold was outrun; investigate settle/debounce timing"
+    }
+    $ok = $hostOk -and $joinOk -and $authored -and $moved -and (-not $lost)
+    Write-Host ("  INV-DROPFULL " + $(if ($ok) { "PASS" } else { "FAIL" }))
+    return (Add-GateResult -Name "inv_dropfull" -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
+                -Metrics @{ hostOk = $hostOk; joinOk = $joinOk; authored = $authored
+                            moved = $moved; lost = $lost; healed = $healed; churns = $churns })
 }
 
 # weapon_loot: the host's owned leader acquires a NOVEL weapon (a sid in no shared-save

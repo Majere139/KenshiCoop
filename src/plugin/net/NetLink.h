@@ -52,8 +52,10 @@ public:
     // under lock; only enqueued on content-change so the reliable channel stays cheap.
     // keyKind (protocol 34): 0 = cKey is the raw container hand, 1 = cKey is the
     // protocol-27 placer key of a session-placed building (receiver translates).
+    // `flags` carries INV_FLAG_TRUNCATED when the capture overflowed INV_ITEMS_MAX, so
+    // the receiver reconciles additive-only instead of deleting past the cap.
     void queueInvSnapshot(u32 ownerId, u8 keyKind, const u32 cKey[5],
-                          const InvItemEntry* items, unsigned int count);
+                          const InvItemEntry* items, unsigned int count, u8 flags = 0);
 
     // MAIN thread: queue a reliable world-item snapshot (Phase W1). The net thread
     // serializes [WorldItemSnapshotHeader][WorldItemEntry*count] and sends it on the
@@ -64,6 +66,11 @@ public:
     // MAIN thread: queue a reliable world-item cull (Phase W1) - the netIds of ground
     // items that left the world / interest sphere. [WorldItemRemoveHeader][u32*count].
     void queueWorldRemove(u32 ownerId, const u32* netIds, unsigned int count);
+
+    // MAIN thread: queue a reliable world-item CLAIM (protocol 47) - the netIds whose
+    // proxies WE just consumed, so their AUTHOR destroys its real ground copies. The
+    // netIds live in the AUTHOR's space, hence authorId. [WorldItemClaimHeader][u32*count].
+    void queueWorldClaim(u32 ownerId, u32 authorId, const u32* netIds, unsigned int count);
 
     // MAIN thread: queue a reliable wide-radius NPC existence census (protocol
     // 36, host -> join, 1 Hz). 'hands' is count*5 u32s (readObjectHand layout);
@@ -230,6 +237,7 @@ private:
     struct OutInv {
         u32                       ownerId;
         u8                        keyKind; // protocol 34: 0 raw hand, 1 placer key
+        u8                        flags;   // protocol 46: INV_FLAG_TRUNCATED
         u32                       cKey[5];
         std::vector<InvItemEntry> items;
     };
@@ -238,8 +246,10 @@ private:
     // drained + serialized by the net thread. Guarded by outCs_.
     struct OutWorldItems { u32 ownerId; std::vector<WorldItemEntry> items; };
     struct OutWorldRemove { u32 ownerId; std::vector<u32> netIds; };
+    struct OutWorldClaim { u32 ownerId; u32 authorId; std::vector<u32> netIds; };
     std::vector<OutWorldItems>  outWorldItems_;
     std::vector<OutWorldRemove> outWorldRemove_;
+    std::vector<OutWorldClaim>  outWorldClaim_;
     // Reliable NPC existence census (protocol 36): 5xu32 hands, flat. Guarded
     // by outCs_. 1 Hz from the host, so at most a couple pending at once.
     struct OutNpcCensus { u32 ownerId; std::vector<u32> hands; std::vector<float> pos; };

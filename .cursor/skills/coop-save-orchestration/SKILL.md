@@ -81,6 +81,7 @@ VALIDATION saves are referenced by `scripts/scenarios.psd1` and must stay stable
 |------|-------|-----|
 | `sync` | validation | Bar town + 2-tab squad + armed NPCs. The workhorse "live town": npc_sync, player_combat, assault_town, combat_crowd/battle/win, and most probe/sync scenarios. |
 | `squad1` | validation | Baked 2-tab squad. coop_presence, inventory, medical, KO, stats, carry, sneak_pose, squad_sync. |
+| `squad2` | validation (fixture) | Two squads whose PCs WEAR backpacks (itemType 46): inv_backpack_drop, inv_nested_bag. The only fixture with a worn container - `squad1` has none, so those gates read `have=0` there. |
 | `c` | validation | combat_probe / spike captures. |
 | `duel1` | validation (fixture) | Two nearby non-squad NPCs for a duel: combat_order, combat_kill. Baked via bake_scene. |
 | `down1` | validation | down_order, death_order. |
@@ -102,7 +103,7 @@ etc.) are ad-hoc testbeds; confirm intent before reusing them.
 Validation fixtures live under `fixtures/saves/<name>\` (full save folder:
 `quick.save`, `platoon/`, `zone/`, `portraits_texture.png`) - the pristine source
 of truth. The tracked set matches the saves in `scripts/scenarios.psd1`:
-`sync, squad1, c, duel1, down1, craft1, bedcage1, pole1, camp, jailed, coopresume`.
+`sync, squad1, squad2, c, duel1, down1, craft1, bedcage1, pole1, camp, jailed, coopresume`.
 Debug saves (`together`, `separate`, `zoom`) are NOT tracked; drift there is fine.
 
 - **Restore (automatic):** `run_test.ps1` restores the scenario's save from the

@@ -257,16 +257,22 @@ $diagKeys = @(Get-CoopDiagEnvKeys)
 Check "CoopHarness exposes a non-empty DiagEnv keyset" ($diagKeys.Count -gt 0)
 
 $badDiag = @()
+# Every knob is a 0/1 gate EXCEPT the few that carry a magnitude (a batch cap, say). Those are
+# named here rather than loosening the rule, so a typo in a real gate still fails loudly.
+$numericDiagKeys = @('KENSHICOOP_WI_BATCH_MAX')
 foreach ($name in $scenarios.Keys) {
     $e = $scenarios[$name]
     if (-not $e.ContainsKey('DiagEnv')) { continue }
     foreach ($k in $e.DiagEnv.Keys) {
         if ($diagKeys -notcontains $k) { $badDiag += "$name -> unknown key '$k'" }
+        elseif ($numericDiagKeys -contains $k) {
+            if ("$($e.DiagEnv[$k])" -notmatch '^\d+$') { $badDiag += "$name -> '$k' value '$($e.DiagEnv[$k])' not a number" }
+        }
         elseif ("$($e.DiagEnv[$k])" -notin @('0', '1')) { $badDiag += "$name -> '$k' value '$($e.DiagEnv[$k])' not 0/1" }
     }
 }
 if ($badDiag.Count -gt 0) { $badDiag | ForEach-Object { Write-Host "      $_" } }
-Check "every DiagEnv key is known + valued 0/1" ($badDiag.Count -eq 0)
+Check "every DiagEnv key is known + valued 0/1 (or numeric where declared)" ($badDiag.Count -eq 0)
 
 # 5b. Spec table = the exact channel deltas Config.cpp USED to hard-code. If this
 #     drifts from the manifest, a probe would silently run with the wrong channel
@@ -302,6 +308,14 @@ $diagSpec = @{
     weapon_loot    = @{ KENSHICOOP_INV_SYNC = '1' }
     world_weapon_drop = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
     world_armor_drop  = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
+    inv_backpack_drop = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
+    world_pickup_mirror = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
+    inv_regear     = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
+    inv_regear_refuse = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
+    inv_regear_refuse_all = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
+    inv_regear_forget = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
+    world_item_burst = @{ KENSHICOOP_WORLD_SYNC = '1' }
+    inv_nested_bag  = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
     world_item_sync = @{ KENSHICOOP_WORLD_SYNC = '1' }
     world_item_join = @{ KENSHICOOP_WORLD_SYNC = '1' }
     limb_loss       = @{ KENSHICOOP_WORLD_SYNC = '1' }
