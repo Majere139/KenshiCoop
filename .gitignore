@@ -29,10 +29,21 @@ tools/_*.log
 
 # Ad-hoc debug scratch scripts and captured screenshots
 tools/_*.ps1
+tools/_*.png
 tools/_wip_*.dll
 tools/float_fix*/
 tools/p*_validate/
 tools/last_dev_cycle.txt
+
+# A/B and isolation scratch: candidate saves, built DLLs and run logs from a
+# single investigation. A save worth keeping belongs in fixtures/saves via
+# capture_save.ps1; a DLL is stale the moment it lands.
+tools/ab/
+tools/repair/
+
+# capture_baseline.ps1 output. Per-machine until something actually reads it
+# back - committing it would freeze a snapshot no gate consults.
+tools/baseline/
 
 # Downloaded toolchain installers (large Microsoft binaries)
 tools/*.exe
