@@ -1027,6 +1027,129 @@ function Test-NestedBag {
                             nestedSkip = $skip; topLevelChurn = $churn })
 }
 
+function Test-DumpAll {
+    param([string]$HostFile, [string]$JoinFile)
+    $rxH = "WDMP verdict role=host pass=(\d+) kit=(-?\d+) want=(-?\d+) dropped=(-?\d+) grndPeak=(-?\d+) grndFinal=(-?\d+) heldR1=(-?\d+) conserved=(\d+) dist='([^']*)'"
+    $rxJ = "WDMP verdict role=join pass=(\d+) kit=(-?\d+) want=(-?\d+) pickedUp=(-?\d+) tries=(\d+) reDropped=(-?\d+) grndFinal=(-?\d+) held=(-?\d+) conserved=(\d+) dist='([^']*)'"
+    $h = [pscustomobject]@{ found = $false; pass = $false; kit = 0; want = -1; dropped = -1
+                            peak = -1; final = -1; held = -1; conserved = $false; dist = '' }
+    $j = [pscustomobject]@{ found = $false; pass = $false; kit = 0; want = -1; got = -1; tries = 0
+                            reDropped = -1; final = -1; held = -1; conserved = $false; dist = '' }
+    if (Test-Path $HostFile) {
+        $m = Select-String -Path $HostFile -Pattern $rxH -ErrorAction SilentlyContinue |
+             Select-Object -Last 1
+        if ($null -ne $m) {
+            $g = $m.Matches[0].Groups
+            $h.found = $true; $h.pass = ([int]$g[1].Value -eq 1); $h.kit = [int]$g[2].Value
+            $h.want = [int]$g[3].Value; $h.dropped = [int]$g[4].Value; $h.peak = [int]$g[5].Value
+            $h.final = [int]$g[6].Value; $h.held = [int]$g[7].Value
+            $h.conserved = ([int]$g[8].Value -eq 1); $h.dist = $g[9].Value
+        }
+    }
+    if (Test-Path $JoinFile) {
+        $m = Select-String -Path $JoinFile -Pattern $rxJ -ErrorAction SilentlyContinue |
+             Select-Object -Last 1
+        if ($null -ne $m) {
+            $g = $m.Matches[0].Groups
+            $j.found = $true; $j.pass = ([int]$g[1].Value -eq 1); $j.kit = [int]$g[2].Value
+            $j.want = [int]$g[3].Value; $j.got = [int]$g[4].Value; $j.tries = [int]$g[5].Value
+            $j.reDropped = [int]$g[6].Value; $j.final = [int]$g[7].Value; $j.held = [int]$g[8].Value
+            $j.conserved = ([int]$g[9].Value -eq 1); $j.dist = $g[10].Value
+        }
+    }
+    $ok = $true
+    # dist is one 'ground+bag/dumped' triple per template: the conservation ledger. Every instance
+    # the host dumped must exist exactly ONCE on each side, on the ground or in the picker's bag.
+    if (-not $h.found) { Write-Host "  DUMP-ALL [host] FAIL - no WDMP verdict"; $ok = $false }
+    else {
+        Write-Host ("  DUMP-ALL [host] " + $(if ($h.pass) { "PASS" } else { "FAIL" }) +
+                    " - dumped $($h.dropped)/$($h.want) in a burst, ground peaked at $($h.peak); ledger ground+bag/dumped = '$($h.dist)'")
+        if (-not $h.pass) { $ok = $false }
+    }
+    if (-not $j.found) { Write-Host "  DUMP-ALL [join] FAIL - no WDMP verdict"; $ok = $false }
+    else {
+        Write-Host ("  DUMP-ALL [join] " + $(if ($j.pass) { "PASS" } else { "FAIL" }) +
+                    " - picked up $($j.got)/$($j.want) in $($j.tries) tries; ledger ground+bag/dumped = '$($j.dist)'")
+        if (-not $j.pass) { $ok = $false }
+    }
+    foreach ($side in @(@('host', $h), @('join', $j))) {
+        $role = $side[0]; $s = $side[1]
+        if ($s.found -and -not $s.conserved) {
+            Write-Host "    NOTE: [$role] the ledger does not balance ('$($s.dist)'). A template summing ABOVE what was dumped is the duplicate - the peer holds it and our ground copy was never retired, or a mirror fabricated a second one. Summing BELOW it is the item that never arrived."
+        }
+    }
+    if ($h.found -and $h.want -lt 3) {
+        Write-Host "    NOTE: only $($h.want) instance(s) were dumped, so this run was a trickle rather than the burst the scenario is for - the extra same-template copies could not be minted (a weapon needs its manufacturer GameData). The conservation ledger still applies, but the burst-specific paths are not under test."
+    }
+
+    # ---- Log-level gates: the states a converged count can still hide -------------------
+    # A count taken at the verdict can be reached through any number of duplications and
+    # corrections in between, so the signatures that MEAN a duplicate are gated directly.
+    $sig = {
+        param($file, $pattern)
+        if (-not (Test-Path $file)) { return 0 }
+        return @(Select-String -Path $file -Pattern $pattern -ErrorAction SilentlyContinue).Count
+    }
+    # FABRICATION. A mirror that cannot find its own copy mints one from the intent's provenance.
+    # That is only safe when the item is genuinely absent, and after the nested reach landed it
+    # no longer is: the ordinary cause was an item stowed in the worn backpack by a bulk pickup,
+    # invisible to a top-level-only search, so the heal left the real item in the bag AND a minted
+    # copy on the ground. Reported-not-failed is how this hid through several green runs.
+    $healed = (& $sig $HostFile '\[wd\] APPLY-HEALED') + (& $sig $JoinFile '\[wd\] APPLY-HEALED')
+    # A pickup that ran out of retries: the peer holds the item and we could not reach our copy.
+    $gaveUp = (& $sig $HostFile '\[wd\] PICKUP-GAVEUP') + (& $sig $JoinFile '\[wd\] PICKUP-GAVEUP')
+    # The old one-shot verdict. It should not appear at all now that an unsatisfied identified
+    # pickup is parked and retried instead of concluded.
+    $untracked = (& $sig $HostFile '\[wd\] PICKUP-APPLY .* why=untracked') +
+                 (& $sig $JoinFile '\[wd\] PICKUP-APPLY .* why=untracked')
+    # A track retired before WD_DEAD_HOLD_MS: the tick-denominated budget retired tracks ~25 ms
+    # after their own drop, and the streak duration is now in the line so the gate can see it.
+    $prunes = @()
+    foreach ($f in @($HostFile, $JoinFile)) {
+        if (Test-Path $f) {
+            $prunes += @(Select-String -Path $f -ErrorAction SilentlyContinue `
+                -Pattern "\[wd\] ground-prune .* \((\d+) consecutive reads over (\d+)ms, everLive=(\d+)")
+        }
+    }
+    $fastPrune = 0
+    foreach ($m in $prunes) {
+        $g = $m.Matches[0].Groups
+        if ([int]$g[3].Value -eq 1 -and [int]$g[2].Value -lt 3000) { $fastPrune++ }
+    }
+    Write-Host "  DUMP-ALL trace: fabrications=$healed, pickups given up=$gaveUp, one-shot untracked verdicts=$untracked, tracks retired early=$fastPrune (of $($prunes.Count) prunes)"
+    if ($healed -gt 0) {
+        Write-Host "    NOTE: a drop mirror fabricated an item instead of relocating its own copy - if that copy existed anywhere (a carried container, most likely) the result is a duplicate"
+        $ok = $false
+    }
+    if ($gaveUp -gt 0) {
+        Write-Host "    NOTE: an identified pickup exhausted its retries, so the peer holds an item whose local copy is still wherever it was"
+        $ok = $false
+    }
+    if ($untracked -gt 0) {
+        Write-Host "    NOTE: a pickup was answered 'untracked' and dropped - it should be parked and retried, because our ground copy is otherwise left there for the session"
+        $ok = $false
+    }
+    if ($fastPrune -gt 0) {
+        Write-Host "    NOTE: a track that HAD read live was retired after less than WD_DEAD_HOLD_MS of dead reads - the read budget is denominated in engine ticks and the loop runs at ~100-125 Hz, so this is the ~25 ms window that lost tracks 29 ms after their own drop"
+        $ok = $false
+    }
+    # The nested reach, when it fires, is the difference between conserving the object and minting
+    # a duplicate. Not required (the grid may not have overflowed), but recorded either way.
+    $nested = (& $sig $HostFile '\[wd\] RELOCATE-NESTED') + (& $sig $JoinFile '\[wd\] RELOCATE-NESTED')
+    Write-Host "  DUMP-ALL trace: relocations out of a carried container=$nested"
+
+    Write-Host ("  DUMP-ALL " + $(if ($ok) { "PASS" } else { "FAIL" }))
+    return (Add-GateResult -Name "dump_all" -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
+                -Metrics @{ hostOk = $h.pass; joinOk = $j.pass; kit = $h.kit; want = $h.want
+                            dropped = $h.dropped; grndPeak = $h.peak; grndFinal = $h.final
+                            pickedUp = $j.got; joinHeld = $j.held
+                            hostConserved = $h.conserved; joinConserved = $j.conserved
+                            hostDist = $h.dist; joinDist = $j.dist
+                            reDropped = $j.reDropped; healed = $healed; gaveUp = $gaveUp
+                            untracked = $untracked; fastPrune = $fastPrune
+                            prunes = $prunes.Count; relocateNested = $nested })
+}
+
 function Test-WorldItemBurst {
     param([string]$HostFile, [string]$JoinFile)
     $rx = 'WIB verdict role=(host|join) pass=(\d+) n=(\d+) dropped=(-?\d+) peak=(-?\d+) firstMs=(\d+) allMs=(\d+) spreadMs=(-?\d+) limitMs=(\d+)'
@@ -1189,8 +1312,12 @@ function Test-InventoryOverflow {
 # bag snapshot overtakes the drop intent. The join must still conserve the gear (bag loses
 # it, ground gains it). Gates both verdicts plus the decisive wire evidence: the peer must
 # log an APPLY with moved>0 and must NEVER log APPLY-LOST (the silent item loss).
-# APPLY-HEALED is tolerated but reported - it means the publish hold was outrun and the
-# fabrication backstop covered it, which is worth seeing.
+# APPLY-HEALED now FAILS the gate rather than merely being reported. A heal means the mirror
+# could not find its own copy and minted one from the intent's provenance - safe only if the item
+# is genuinely absent, which it usually was not: the reach the mirror lacked was into carried
+# containers, where a bulk pickup stows the tail of a burst. The heal then leaves the real item in
+# the bag and a fabricated duplicate on the ground, and tolerating the signature is exactly how
+# that survived several green runs.
 function Test-InventoryDropFull {
     param([string]$HostFile, [string]$JoinFile)
     $rxHost = 'SCENARIO INVDF verdict role=host pass=(\d+) sid=''([^'']*)'' invBase=(-?\d+) invAfter=(-?\d+) grndAfter=(-?\d+) churns=(\d+)'
@@ -1229,9 +1356,9 @@ function Test-InventoryDropFull {
     }
     Write-Host "  INV-DROPFULL trace: host authored DROP=$authored, join moved>0=$moved, APPLY-LOST=$lost, healed=$healed"
     if ($healed -gt 0) {
-        Write-Host "    NOTE: $healed drop(s) needed the fabrication backstop - the publish hold was outrun; investigate settle/debounce timing"
+        Write-Host "    NOTE: $healed drop(s) needed the fabrication backstop, which mints an item the mirror could not find. That is only safe when the item is genuinely absent, and it usually was not: an item stowed in a worn container by a bulk pickup is invisible to a top-level-only search, so the heal leaves the real one in the bag AND a minted copy on the ground. Reported-not-failed here is how that duplicate survived several green runs."
     }
-    $ok = $hostOk -and $joinOk -and $authored -and $moved -and (-not $lost)
+    $ok = $hostOk -and $joinOk -and $authored -and $moved -and (-not $lost) -and ($healed -eq 0)
     Write-Host ("  INV-DROPFULL " + $(if ($ok) { "PASS" } else { "FAIL" }))
     return (Add-GateResult -Name "inv_dropfull" -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
                 -Metrics @{ hostOk = $hostOk; joinOk = $joinOk; authored = $authored

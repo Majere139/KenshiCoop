@@ -1168,10 +1168,36 @@ private:
         // (a forgotten track means a permanent duplicate, whereas keeping a dead one costs a
         // pointer until the next read).
         unsigned int  deadReads;
+        // ...and WHEN the current dead streak began, because the tick count alone is a ~25 ms
+        // tolerance at engine tick rate - far too short to distinguish "gone" from "streamed out
+        // for a moment". Zero while the last read was live. createdMs/everLive bound the case
+        // where the object never resolved even once, which has no ground copy to protect.
+        unsigned long firstDeadMs;
+        unsigned long createdMs;
+        bool          everLive;
     };
     std::map<std::string, std::deque<GroundWeapon> > groundedWeapons_;
     u32                               nextPickupId_;
     std::set<std::pair<u32, u32> >    appliedPickups_;
+
+    // An IDENTIFIED pickup intent we could not satisfy the moment it arrived, because the named
+    // track had just been retired or we never held it. Concluding from that single attempt is
+    // not neutral: a real object left the ground over there, so our own copy is now a duplicate
+    // for the rest of the session. The only fallback is a site-anchored spatial scan, and that
+    // is the query that fails in towns - which is precisely where the player hit this. So park
+    // the intent instead and retry it from reconcileGroundGear: by the named track if it
+    // resolves again (a streamed-out object usually does), by the site scan otherwise, until
+    // WD_REHOME_MAX_MS. Only identified intents are ever parked; an identity-less one still
+    // gets nothing, because we cannot know which object it took.
+    struct PendingPickup {
+        unsigned int  targetHand[5];
+        std::string   sid;
+        unsigned int  itemType;
+        u32           refOwnerId;
+        u32           refDropId;
+        unsigned long sinceMs;
+    };
+    std::deque<PendingPickup> pendingPickups_;
 
     // Start tracking a just-grounded conservation item: records the drop identity both
     // clients share, the raw Item*, AND the object's engine hand (so a later re-home
@@ -1181,6 +1207,13 @@ private:
     // picker, or no identified pickup is ever sent at all).
     void trackGroundGear(const std::string& sid, u32 dropOwnerId, u32 dropId, void* item,
                          bool authored);
+
+    // Park an identified pickup we could not satisfy on arrival (see PendingPickup), and the
+    // per-tick retry that drains it. Idempotent in (refOwnerId, refDropId) so a reliable resend
+    // of the same intent does not stack retries.
+    void parkPendingPickup(const unsigned int targetHand[5], const char* sid,
+                           unsigned int itemType, u32 refOwnerId, u32 refDropId);
+    void retryPendingPickups(GameWorld* gw);
 
     // Protocol 37 cross-owner transfer state.
     // xferBase_: last-known per-item totals (sid,type)->qty per tracked container - the

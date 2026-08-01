@@ -1586,6 +1586,49 @@
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'smoke'; WanVariant = $false
         }
+        # The player's actual workflow: dump a character's ENTIRE kit at once and hoover all of it
+        # up with a second character. The one-item gates above pass on a trickle and cannot see
+        # what a burst does - a ground track retired ~25 ms after its own drop (the read budget was
+        # denominated in engine ticks, not time), and a receiving grid that fills so the tail is
+        # stowed in the worn backpack, where the drop mirror's top-level-only search could not
+        # reach it and fabricated a duplicate instead.
+        inv_dump_all = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'
+                         KENSHICOOP_INV_DUMP = '1' }
+            Save = 'squad2'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'dump_all'
+            Gating   = @('dump_all', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+        # The same burst with the author's ground tracks discarded as they are made. A lost track
+        # is what a ~25 ms retirement window produced in the wild, and the lever makes it certain:
+        # the peer's pickup then arrives NAMED but unmatchable, and the author must keep trying
+        # instead of answering once and leaving its copy on the ground.
+        inv_dump_all_forget = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'
+                         KENSHICOOP_INV_DUMP = '1'; KENSHICOOP_WD_FORGET_TRACK = '1' }
+            Save = 'squad2'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'dump_all'
+            Gating   = @('dump_all', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+        # The decisive one. The author's FIRST pickup-time read of the tracked object reports it
+        # gone, then reads normally - the transient the engine produces by streaming an object out
+        # and back, and the actual cause of the duplicate a player reported. Concluding from that
+        # one read erases the track and answers the peer with nothing, so the author's copy stays
+        # on the ground beside the item the peer now holds; the conservation ledger then shows that
+        # template summing to two. Parking the intent and retrying it converges instead.
+        inv_dump_all_transient = @{
+            DiagEnv = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1'
+                         KENSHICOOP_INV_DUMP = '1'; KENSHICOOP_WD_TRANSIENT_DEAD = '1' }
+            Save = 'squad2'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'dump_all'
+            Gating   = @('dump_all', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
         # A BURST of non-gear drops in one tick, overflowing the per-tick W1 send batch (shrunk
         # to 2 so five drops reach it). The overflow used to be booked as sent without being
         # sent, so the tail of the burst was invisible until the 5 s safety resend - the

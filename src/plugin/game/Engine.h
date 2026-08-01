@@ -492,6 +492,15 @@ bool applyContainerContents(GameWorld* gw, const unsigned int cHand[5],
 int addItemToNestedContainer(GameWorld* gw, const unsigned int cHand[5], const char* sid,
                             unsigned int typeCat, int qty, unsigned int which = 0);
 
+// SEH-guarded: drop `qty` of (sid,type) out of a CARRIED CONTAINER onto the ground, searching
+// every container the character holds in carry order. Returns the number dropped and reports
+// the last grounded object via outLastDropped (optional) so the conservation channel can track
+// that exact instance. dropItemFromInventory is top-level-only ON PURPOSE; this is the separate
+// reach the drop MIRROR needs, because a bulk pickup overflows the grid into the worn backpack
+// and a mirror that cannot see in there fabricates a duplicate instead of relocating.
+int dropItemFromNestedContainer(GameWorld* gw, const unsigned int cHand[5], const char* sid,
+                                unsigned int typeCat, int qty, void** outLastDropped = 0);
+
 // SEH-guarded (protocol 48): summed quantity of (sid,type) INSIDE carried container `which`.
 // Returns -1 when the character carries no such container, so a caller can distinguish "the
 // bag has not arrived yet" from "the bag is here and the item is missing".

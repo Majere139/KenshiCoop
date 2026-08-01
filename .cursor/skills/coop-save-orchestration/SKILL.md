@@ -81,7 +81,7 @@ VALIDATION saves are referenced by `scripts/scenarios.psd1` and must stay stable
 |------|-------|-----|
 | `sync` | validation | Bar town + 2-tab squad + armed NPCs. The workhorse "live town": npc_sync, player_combat, assault_town, combat_crowd/battle/win, and most probe/sync scenarios. |
 | `squad1` | validation | Baked 2-tab squad. coop_presence, inventory, medical, KO, stats, carry, sneak_pose, squad_sync. |
-| `squad2` | validation (fixture) | Two squads whose PCs WEAR backpacks (itemType 46): inv_backpack_drop, inv_nested_bag. The only fixture with a worn container - `squad1` has none, so those gates read `have=0` there. |
+| `squad2` | validation (fixture) | Two squads whose PCs WEAR backpacks (itemType 46): inv_backpack_drop, inv_nested_bag, inv_dump_all(_forget/_transient). The only fixture with a worn container - `squad1` has none, so those gates read `have=0` there. |
 | `c` | validation | combat_probe / spike captures. |
 | `duel1` | validation (fixture) | Two nearby non-squad NPCs for a duel: combat_order, combat_kill. Baked via bake_scene. |
 | `down1` | validation | down_order, death_order. |

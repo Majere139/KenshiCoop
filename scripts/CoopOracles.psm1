@@ -198,6 +198,7 @@ function Invoke-OneOracle {
                                             -GateName "gear_repickup_recover" -RequireSiteRecovery) }
         "world_item_burst" { return (Test-WorldItemBurst -HostFile $HostLog -JoinFile $JoinLog) }
         "nested_bag"    { return (Test-NestedBag       -HostFile $HostLog -JoinFile $JoinLog) }
+        "dump_all"      { return (Test-DumpAll         -HostFile $HostLog -JoinFile $JoinLog) }
         "no_phantom_pickups" { return (Test-NoPhantomPickups -HostFile $HostLog -JoinFile $JoinLog) }
         "weapon_loot"   { return (Test-WeaponLoot      -HostFile $HostLog -JoinFile $JoinLog) }
         "rejoin_items"  { return (Test-RejoinItems     -HostFile $HostLog -JoinFile $JoinLog) }
@@ -402,7 +403,7 @@ Export-ModuleMember -Function @(
     "Test-InventoryReequip", "Test-AddEquip", "Test-TradeProbe", "Test-TradePeer", "Test-DropProbe",
     "Test-WorldItemSync", "Test-RejoinItems", "Test-WpnRelocate", "Test-WeaponDrop",
     "Test-WorldPickupMirror", "Test-GearRepickup", "Test-NoPhantomPickups", "Test-WorldItemBurst",
-    "Test-NestedBag",
+    "Test-NestedBag", "Test-DumpAll",
     "Test-Smoothness", "Test-AnimTruth", "Test-MarchInPlace",
     "Test-SnapRate", "Test-SuppressChurn", "Test-RestFlap",
     "Test-ExistenceParity",

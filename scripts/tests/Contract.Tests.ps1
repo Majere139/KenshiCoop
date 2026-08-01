@@ -259,7 +259,7 @@ Check "CoopHarness exposes a non-empty DiagEnv keyset" ($diagKeys.Count -gt 0)
 $badDiag = @()
 # Every knob is a 0/1 gate EXCEPT the few that carry a magnitude (a batch cap, say). Those are
 # named here rather than loosening the rule, so a typo in a real gate still fails loudly.
-$numericDiagKeys = @('KENSHICOOP_WI_BATCH_MAX')
+$numericDiagKeys = @('KENSHICOOP_WI_BATCH_MAX', 'KENSHICOOP_WD_TRANSIENT_DEAD')
 foreach ($name in $scenarios.Keys) {
     $e = $scenarios[$name]
     if (-not $e.ContainsKey('DiagEnv')) { continue }
@@ -316,6 +316,9 @@ $diagSpec = @{
     inv_regear_forget = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
     world_item_burst = @{ KENSHICOOP_WORLD_SYNC = '1' }
     inv_nested_bag  = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
+    inv_dump_all    = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
+    inv_dump_all_forget = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
+    inv_dump_all_transient = @{ KENSHICOOP_INV_SYNC = '1'; KENSHICOOP_WORLD_SYNC = '1' }
     world_item_sync = @{ KENSHICOOP_WORLD_SYNC = '1' }
     world_item_join = @{ KENSHICOOP_WORLD_SYNC = '1' }
     limb_loss       = @{ KENSHICOOP_WORLD_SYNC = '1' }

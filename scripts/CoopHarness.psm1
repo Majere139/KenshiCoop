@@ -68,6 +68,11 @@ $script:CoopDiagEnvKeys = @(
     # Shrinks the per-tick W1 send batch so a handful of drops can overflow it. NOT a 0/1
     # gate - it carries the cap itself.
     'KENSHICOOP_WI_BATCH_MAX'
+    # Makes the first N pickup-time resolutions of a tracked ground object read as dead, then lets
+    # them succeed - the transient the engine produces by streaming an object out and back, which
+    # is what made an author conclude an item had left the ground while its copy was still there.
+    # NOT a 0/1 gate: it carries the count.
+    'KENSHICOOP_WD_TRANSIENT_DEAD'
 )
 
 function Get-CoopDiagEnvKeys {

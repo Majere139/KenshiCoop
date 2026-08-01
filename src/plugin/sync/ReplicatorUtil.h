@@ -212,6 +212,23 @@ const unsigned long WD_REHOME_MAX_MS = 8000;
 // there forever - so the read has to agree with itself first.
 const unsigned int  WD_DEAD_READS_MAX = 3;
 
+// ...and how long that disagreement must LAST. The read count alone is denominated in engine
+// ticks, and the main loop runs at ~100-125 Hz, so three of them is a ~25 ms tolerance: a
+// player's session showed a track retired 29 ms after its own drop, and the pickup that
+// arrived 32 s later was answered "untracked" with the ground copy left lying there - the
+// duplicate. The cost is asymmetric (a forgotten track is a permanent duplicate; a stale one
+// costs a pointer until the next read), so the streak must also survive real time.
+const unsigned long WD_DEAD_HOLD_MS = 3000;
+
+// Ceiling for a track whose object has NEVER once read live. WD_DEAD_HOLD_MS assumes there was
+// something there to lose; a track minted around an object that never resolved at all has
+// nothing to protect and would otherwise be retried forever.
+const unsigned long WD_NEVER_LIVE_MAX_MS = 10000;
+
+// Cap on parked-but-unsatisfied pickup intents (see Replicator::PendingPickup). Each expires on
+// its own within WD_REHOME_MAX_MS, so this only bounds a pathological burst.
+const unsigned int  WD_PENDING_PICKUPS_MAX = 64;
+
 // Radius for the LAST-RESORT spatial re-home: an identified pickup arrived for a drop we no
 // longer have tracked, so the object is found by (sid,type) near the picking character
 // instead. Only ever used for an intent that NAMES a drop, never for an identity-less one.

@@ -2070,6 +2070,334 @@ private:
 };
 const int InvNestedBagScenario::WANT[2] = { 2, 1 };
 
+// inv_dump_all: the player's ACTUAL workflow, which is a burst rather than the one-item round
+// trip every other gear gate exercises - dump a character's ENTIRE kit on the ground at once and
+// hoover all of it up with a second character. That difference is what the previous gates missed,
+// in three ways at once:
+//
+//  1) MANY drops in one tick. Each authored drop mints a ground track, and a track was retired
+//     after WD_DEAD_READS_MAX *engine ticks* - about 25 ms at the main loop's ~100-125 Hz. A
+//     player's session showed a track pruned 29 ms after its own drop; the pickup that arrived
+//     32 s later was answered "untracked" and the author's copy stayed on the ground forever.
+//     Asserting the author's ground count returns to ZERO is what catches that leftover.
+//
+//  2) ONE character receives everything, so its grid fills and the engine stows the tail INSIDE
+//     the worn backpack. A bagged item is invisible to the top-level-only search the drop mirror
+//     uses, so the mirror concluded it had no copy and FABRICATED one (APPLY-HEALED) - the real
+//     item stayed in the bag and a minted duplicate landed on the ground. Counting the picker's
+//     holdings WITH nested contents is the only way to see the items at all, and the re-drop leg
+//     below is what forces the mirror to reach into the bag.
+//
+//  3) CONSERVATION over the whole burst, not per item: totals on both sides must add up. A gate
+//     that checks one item cannot see a burst lose its tail or duplicate its head.
+//
+// Every count is a DELTA against each side's own baseline - the kit templates are ordinary gear
+// the receiving character may already carry, so absolute counts would pass on the save's own
+// contents with nothing having crossed the wire.
+class InvDumpAllScenario : public Scenario {
+public:
+    explicit InvDumpAllScenario(const char* scenarioName)
+        : scenarioName_(scenarioName),
+          passed_(false), have_(false), isHost_(false), nKit_(0), wantTotal_(0), minted_(0),
+          dropped_(0), pickedUp_(0), reDropped_(0), grndPeak_(0), grndFinal_(-1), heldFinal_(-1),
+          lastTryMs_(0), tries_(0), lastLogMs_(0), step_(0) {
+        for (int i = 0; i < 5; ++i) { r0_[i] = 0; r1_[i] = 0; }
+        for (int i = 0; i < KIT_MAX; ++i) baseOf_[i] = 0;
+    }
+    virtual const char* name() const { return scenarioName_; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        isHost_ = ctx.isHost;
+        have_ = ovlRankContainer(ctx.gw, 0u, r0_) && ovlRankContainer(ctx.gw, 1u, r1_);
+        // BOTH sides enumerate rank 0's kit from their own copy: the fixture is shared, so the
+        // host learns what to drop and the join learns what to hunt for without a side channel.
+        if (have_) have_ = readKit(ctx.gw);
+        // The fixture's own kit is a couple of pieces - a trickle, which is what every existing
+        // gear gate already covers. Mint extra copies of the FIRST template so the dump is a real
+        // BURST, and same-template copies at that: several indistinguishable instances in flight
+        // at once is precisely what the drop identity has to keep straight.
+        if (have_) {
+            for (int i = 0; i < nKit_; ++i) baseOf_[i] = heldOf(ctx.gw, i);
+            // Both clients mint their own copies: a fabricated item does not replicate, and the
+            // conservation ledger below is evaluated per side against that side's own count.
+            int mi = mintable();
+            if (mi >= 0) {
+                // Into the worn BACKPACK, not the character's own grid: a character has two
+                // weapon slots and Kenshi refuses the rest ("[mk] tryAddItem-fail ... type=2"),
+                // so top-level minting cannot build a burst at all. The bag is also where the
+                // player's own items sit, and dumping from it is what exercises the mirror's
+                // reach into a carried container - the reach whose absence fabricated duplicates.
+                minted_ = engine::addItemToNestedContainer(ctx.gw, r0_, kit_[mi].sid,
+                                                           kit_[mi].type, BURST_EXTRA, 0);
+                if (minted_ == 0)
+                    minted_ = engine::addItemsToContainerBySid(ctx.gw, r0_, kit_[mi].sid,
+                                                               kit_[mi].type, BURST_EXTRA,
+                                                               kit_[mi].quality,
+                                                               kit_[mi].manufacturer,
+                                                               kit_[mi].material);
+                if (minted_ > 0) kit_[mi].want += minted_;
+            }
+        }
+        for (int i = 0; i < nKit_; ++i) wantTotal_ += kit_[i].want;
+        char b[260]; _snprintf(b, sizeof(b) - 1,
+            "WDMP start role=%s have=%d kit=%d want=%d minted=%d r0=%u,%u,%u,%u,%u "
+            "r1=%u,%u,%u,%u,%u", isHost_ ? "host" : "join", have_ ? 1 : 0, nKit_, wantTotal_,
+            minted_, r0_[0], r0_[1], r0_[2], r0_[3], r0_[4], r1_[0], r1_[1], r1_[2], r1_[3], r1_[4]);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!have_ || nKit_ == 0) {
+            if (ctx.elapsedMs >= 6000) { passed_ = false; return true; }
+            return false;
+        }
+
+        // ---- Leg 1: the host dumps the WHOLE kit in a single tick ----------------------
+        if (isHost_ && step_ == 0 && ctx.elapsedMs >= DROP_MS) {
+            step_ = 1;
+            for (int i = 0; i < nKit_; ++i)
+                for (int c = 0; c < kit_[i].want; ++c) {
+                    int d = engine::dropItemFromInventory(ctx.gw, r0_, kit_[i].sid, kit_[i].type, 1);
+                    if (d == 0) {
+                        int un = engine::unequipItemToLoose(ctx.gw, r0_, kit_[i].sid,
+                                                            kit_[i].type, 1);
+                        if (un > 0)
+                            d = engine::dropItemFromInventory(ctx.gw, r0_, kit_[i].sid,
+                                                              kit_[i].type, 1);
+                        if (d == 0)
+                            d = engine::dropItemFromInventory(ctx.gw, r0_, kit_[i].sid,
+                                                              kit_[i].type, 1, 0,
+                                                              /*allowEquipped*/ true);
+                        // The burst lives in the worn bag (see onStart), which no top-level drop
+                        // can reach - the same blind spot the drop mirror had.
+                        if (d == 0)
+                            d = engine::dropItemFromNestedContainer(ctx.gw, r0_, kit_[i].sid,
+                                                                    kit_[i].type, 1);
+                    }
+                    kit_[i].dropped += d; dropped_ += d;
+                }
+            char b[180]; _snprintf(b, sizeof(b) - 1,
+                "WDMP host-dumped kit=%d want=%d dropped=%d ground=%d", nKit_, wantTotal_,
+                dropped_, groundCount(ctx.gw));
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        // ---- Leg 2: the JOIN hoovers all of it into ONE character ----------------------
+        // Retried per template: the peer's conservation relocation is debounced, and a burst
+        // arrives over several ticks.
+        if (!isHost_ && pickedUp_ < wantTotal_ && ctx.elapsedMs >= PICKUP_MS &&
+            tries_ < MAX_TRIES && (ctx.elapsedMs - lastTryMs_ >= TRY_EVERY_MS)) {
+            lastTryMs_ = ctx.elapsedMs; ++tries_;
+            for (int i = 0; i < nKit_; ++i)
+                while (kit_[i].got < kit_[i].want) {
+                    if (engine::pickupWorldItemIntoInventory(ctx.gw, r1_, kit_[i].sid,
+                                                             kit_[i].type, RADIUS) <= 0) break;
+                    ++kit_[i].got; ++pickedUp_;
+                }
+            char b[200]; _snprintf(b, sizeof(b) - 1,
+                "WDMP join-hoover try=%u got=%d/%d held=%d", tries_, pickedUp_, wantTotal_,
+                heldCount(ctx.gw));
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        // ---- Leg 3: the JOIN re-drops one item, which by now may live in the backpack ---
+        // This is what forces the drop MIRROR to reach into a carried container instead of
+        // fabricating: the grid is full after leg 2, so the engine stowed the tail in the bag.
+        if (!isHost_ && step_ == 0 && pickedUp_ > 0 && ctx.elapsedMs >= REDROP_MS) {
+            step_ = 1;
+            int last = -1;
+            for (int i = 0; i < nKit_; ++i) if (kit_[i].got > 0) last = i;
+            if (last >= 0) {
+                reDropped_ = engine::dropItemFromInventory(ctx.gw, r1_, kit_[last].sid,
+                                                           kit_[last].type, 1, 0,
+                                                           /*allowEquipped*/ true);
+                if (reDropped_ == 0)
+                    reDropped_ = engine::dropItemFromNestedContainer(ctx.gw, r1_, kit_[last].sid,
+                                                                     kit_[last].type, 1);
+                char b[200]; _snprintf(b, sizeof(b) - 1,
+                    "WDMP join-redrop sid='%s' type=%u n=%d", kit_[last].sid, kit_[last].type,
+                    reDropped_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+
+        // The AUTHOR's series is the evidence for the leftover: its ground total must rise with
+        // the dump and come back to zero once every pickup is honoured.
+        if (isHost_ && (ctx.elapsedMs - lastLogMs_ >= 1000 || lastLogMs_ == 0)) {
+            lastLogMs_ = ctx.elapsedMs;
+            int grnd = groundCount(ctx.gw);
+            if (grnd > grndPeak_) grndPeak_ = grnd;
+            char b[180]; _snprintf(b, sizeof(b) - 1,
+                "WDMP host t=%lu ground=%d peak=%d heldR1=%d",
+                (unsigned long)ctx.elapsedMs, grnd, grndPeak_, heldCount(ctx.gw));
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        unsigned long dur = isHost_ ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            // CONSERVATION, per template and per SIDE. Every instance the host dumped must exist
+            // exactly once on this client - either still on the ground or in the picker's bag.
+            // Stating it that way is what makes the assertion hold no matter how much of the
+            // burst the harness's own pickup managed to take, and it catches both failures the
+            // player reported with one equality: a SURPLUS is the duplicate (the peer holds it
+            // and our ground copy was never retired, or a mirror fabricated a second one), and a
+            // DEFICIT is the item that never arrived.
+            char dist[200]; dist[0] = '\0';
+            bool conserved = true;
+            for (int i = 0; i < nKit_; ++i) {
+                int g = engine::countFreeGroundItemsNear(ctx.gw, r0_, kit_[i].sid, kit_[i].type,
+                                                         RADIUS);
+                int b = heldOf(ctx.gw, i) - baseOf_[i];
+                if (g + b != kit_[i].want) conserved = false;
+                char one[48]; _snprintf(one, sizeof(one) - 1, "%s%d+%d/%d", i ? "," : "", g, b,
+                                        kit_[i].want);
+                one[sizeof(one) - 1] = '\0';
+                strncat(dist, one, sizeof(dist) - strlen(dist) - 1);
+            }
+            grndFinal_ = groundCount(ctx.gw);
+            heldFinal_ = heldCount(ctx.gw);
+            if (isHost_) {
+                passed_ = (dropped_ == wantTotal_) && (grndPeak_ >= wantTotal_) && conserved;
+                char b[300]; _snprintf(b, sizeof(b) - 1,
+                    "WDMP verdict role=host pass=%d kit=%d want=%d dropped=%d grndPeak=%d "
+                    "grndFinal=%d heldR1=%d conserved=%d dist='%s'", passed_ ? 1 : 0, nKit_,
+                    wantTotal_, dropped_, grndPeak_, grndFinal_, heldFinal_, conserved ? 1 : 0,
+                    dist);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            } else {
+                // The harness's own pickup is best-effort (an armour slot can be occupied, a grid
+                // full), so requiring the WHOLE burst would make the gate flaky about something
+                // other than replication. It only has to move enough of it to have signal; the
+                // conservation equality above is the actual invariant.
+                int need = (wantTotal_ >= 3) ? MIN_PICKED : 1;
+                passed_ = (pickedUp_ >= need) && conserved;
+                char b[300]; _snprintf(b, sizeof(b) - 1,
+                    "WDMP verdict role=join pass=%d kit=%d want=%d pickedUp=%d tries=%u "
+                    "reDropped=%d grndFinal=%d held=%d conserved=%d dist='%s'", passed_ ? 1 : 0,
+                    nKit_, wantTotal_, pickedUp_, tries_, reDropped_, grndFinal_, heldFinal_,
+                    conserved ? 1 : 0, dist);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            return true;
+        }
+        return false;
+    }
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long DROP_MS           = 8000;
+    static const unsigned long PICKUP_MS         = 14000;
+    static const unsigned long REDROP_MS         = 30000;
+    static const unsigned long TRY_EVERY_MS      = 1500;
+    static const unsigned int  MAX_TRIES         = 12;
+    static const unsigned long JOIN_DURATION_MS  = 46000;
+    // Outlive the join by the author's full re-home + parked-pickup window (WD_REHOME_MAX_MS)
+    // plus slack, so a deferred pickup has actually run out of retries by the verdict.
+    static const unsigned long HOST_DURATION_MS  = 58000;
+    static const int           KIT_MAX           = 16;
+    // Extra same-template copies minted onto the dumping character, so the dump is a burst rather
+    // than the trickle the fixture's own kit provides.
+    static const int           BURST_EXTRA       = 5;
+    // Enough of the burst moved to give the conservation equality something to say.
+    static const int           MIN_PICKED        = 2;
+    static const float         RADIUS;
+
+    // manufacturer/material are carried because the engine factory REQUIRES the manufacturer to
+    // build a weapon at all - minting the burst with an empty one silently adds nothing.
+    struct KitItem {
+        char sid[48]; unsigned int type; int quality;
+        char manufacturer[48]; char material[48];
+        int want; int dropped; int got;
+    };
+
+    // Tab 0's CONSERVED kit (weapons/armour/containers ride the W2 relocation channel, which is
+    // the channel under test). One entry per distinct instance, capped: the point is a burst, and
+    // KIT_MAX is already well past the batch sizes that used to starve.
+    bool readKit(GameWorld* gw) {
+        InvItemEntry it[INV_ITEMS_MAX];
+        unsigned int n = engine::captureContainerContents(gw, r0_, it, INV_ITEMS_MAX, 0);
+        for (unsigned int i = 0; i < n && nKit_ < KIT_MAX; ++i) {
+            if (!engine::isConservedItemType(it[i].itemType)) continue;
+            // A container must not be dumped here: fabricating one is forbidden by design, so a
+            // bag that fails to relocate has no convergent end state to assert.
+            if (engine::isContainerItemType(it[i].itemType)) continue;
+            // Same template twice in the kit would double-count in the conservation sums.
+            bool dup = false;
+            for (int k = 0; k < nKit_ && !dup; ++k)
+                if (kit_[k].type == it[i].itemType &&
+                    strcmp(kit_[k].sid, it[i].stringID) == 0) { ++kit_[k].want; dup = true; }
+            if (dup) continue;
+            KitItem& k = kit_[nKit_++];
+            strncpy(k.sid, it[i].stringID, sizeof(k.sid) - 1);
+            k.sid[sizeof(k.sid) - 1] = '\0';
+            strncpy(k.manufacturer, it[i].manufacturer, sizeof(k.manufacturer) - 1);
+            k.manufacturer[sizeof(k.manufacturer) - 1] = '\0';
+            strncpy(k.material, it[i].material, sizeof(k.material) - 1);
+            k.material[sizeof(k.material) - 1] = '\0';
+            k.type = it[i].itemType; k.quality = (int)it[i].quality;
+            k.want = 1; k.dropped = 0; k.got = 0;
+        }
+        return nKit_ > 0;
+    }
+
+    // Which kit template to mint the burst from. ARMOUR first: a character has two weapon slots
+    // and both its own grid and its worn bag refuse a third weapon ("[mk] tryAddItem-fail
+    // ... type=2"), so a weapon simply cannot be multiplied. A weapon is the fallback and needs
+    // its manufacturer GameData or the factory returns null. Returns -1 when nothing qualifies,
+    // in which case the run still exercises the fixture's own (small) kit and says so.
+    int mintable() {
+        for (int i = 0; i < nKit_; ++i) if (kit_[i].type == 3u) return i;
+        for (int i = 0; i < nKit_; ++i)
+            if (kit_[i].type != 2u || kit_[i].manufacturer[0] != '\0') return i;
+        return -1;
+    }
+
+    // What the RECEIVING character holds of kit template `i`, INCLUDING what its carried
+    // containers hold - after a bulk pickup the tail of the burst lives in the backpack, so a
+    // top-level count reads a successful transfer as a loss.
+    int heldOf(GameWorld* gw, int i) {
+        InvItemEntry it[INV_ITEMS_MAX];
+        unsigned int n = engine::captureContainerContents(gw, r1_, it, INV_ITEMS_MAX, 0, 0,
+                                                          /*includeNested=*/true);
+        int c = 0;
+        for (unsigned int j = 0; j < n; ++j) {
+            if (it[j].itemType != kit_[i].type) continue;
+            if (strcmp(it[j].stringID, kit_[i].sid) != 0) continue;
+            int q = it[j].quantity; if (q < 1) q = 1;
+            c += q;
+        }
+        return c;
+    }
+
+    int heldCount(GameWorld* gw) {
+        int c = 0;
+        for (int i = 0; i < nKit_; ++i) c += heldOf(gw, i);
+        return c;
+    }
+
+    // Free ground items of the kit templates near the DROP site (rank 0's character).
+    int groundCount(GameWorld* gw) {
+        int c = 0;
+        for (int k = 0; k < nKit_; ++k)
+            c += engine::countFreeGroundItemsNear(gw, r0_, kit_[k].sid, kit_[k].type, RADIUS);
+        return c;
+    }
+
+    const char*   scenarioName_;
+    bool          passed_, have_, isHost_;
+    unsigned int  r0_[5], r1_[5];
+    KitItem       kit_[KIT_MAX];
+    int           baseOf_[KIT_MAX];
+    int           nKit_, wantTotal_, minted_;
+    int           dropped_, pickedUp_, reDropped_;
+    int           grndPeak_, grndFinal_, heldFinal_;
+    unsigned long lastTryMs_;
+    unsigned int  tries_;
+    unsigned long lastLogMs_;
+    int           step_;
+};
+const float InvDumpAllScenario::RADIUS = 60.0f;
+
 Scenario* makeInventoryScenario(const std::string& name) {
     // Same scenario twice: the plain run proves the round trip converges, and the
     // _refuse run drives it with the first re-home refused (KENSHICOOP_WD_REFUSE_REHOME),
@@ -2087,6 +2415,20 @@ Scenario* makeInventoryScenario(const std::string& name) {
     // recovery (re-home a same-sid free ground item at the pickup location).
     if (name == "inv_regear_forget")      return new InventoryRegearScenario("inv_regear_forget");
     if (name == "inv_nested_bag") return new InvNestedBagScenario();
+    // The burst the one-item gates above cannot express: a whole kit dumped at once and hoovered
+    // up by a single character, which is how the player drives it and where the tick-denominated
+    // track retirement and the top-level-only drop mirror both showed.
+    if (name == "inv_dump_all")   return new InvDumpAllScenario("inv_dump_all");
+    // Same burst with the author's ground tracks discarded the instant they are made
+    // (KENSHICOOP_WD_FORGET_TRACK). That is the state the tick-denominated retirement put a real
+    // session into, and it is the only deterministic way to gate what happens next: the author
+    // must PARK the peer's identified pickup and keep trying, rather than answer it once and
+    // leave its own copy on the ground for the rest of the session.
+    if (name == "inv_dump_all_forget") return new InvDumpAllScenario("inv_dump_all_forget");
+    // ...and the same burst where the author's first pickup-time read of the object reports it
+    // gone and later reads succeed (KENSHICOOP_WD_TRANSIENT_DEAD). A verdict drawn from that one
+    // read is the duplicate; a retry converges.
+    if (name == "inv_dump_all_transient") return new InvDumpAllScenario("inv_dump_all_transient");
     if (name == "inv_order")    return new InventorySyncScenario();
     if (name == "inv_overflow") return new InventoryOverflowScenario();
     if (name == "inv_dropfull") return new InventoryDropFullScenario();

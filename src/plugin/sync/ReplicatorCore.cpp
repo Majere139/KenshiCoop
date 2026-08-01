@@ -211,6 +211,7 @@ void Replicator::resetSession() {
     appliedDrops_.clear();
     appliedPickups_.clear();
     groundedWeapons_.clear();
+    pendingPickups_.clear(); // the objects those intents named belong to the old world
     // Protocol 37: every container hand and Item* baseline is stale in the new world.
     xferBase_.clear();
     xferSeeded_.clear();

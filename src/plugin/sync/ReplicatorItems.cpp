@@ -1062,6 +1062,20 @@ static bool injectForgetTrack(bool authored) {
     return on == 1 && authored;
 }
 
+void Replicator::parkPendingPickup(const unsigned int targetHand[5], const char* sid,
+                                   unsigned int itemType, u32 refOwnerId, u32 refDropId) {
+    // Idempotent: a reliable resend of the same intent must not stack retries.
+    for (std::deque<PendingPickup>::iterator it = pendingPickups_.begin();
+         it != pendingPickups_.end(); ++it)
+        if (it->refOwnerId == refOwnerId && it->refDropId == refDropId) return;
+    if (pendingPickups_.size() >= WD_PENDING_PICKUPS_MAX) pendingPickups_.pop_front();
+    PendingPickup pp;
+    for (int k = 0; k < 5; ++k) pp.targetHand[k] = targetHand[k];
+    pp.sid = sid ? sid : ""; pp.itemType = itemType;
+    pp.refOwnerId = refOwnerId; pp.refDropId = refDropId; pp.sinceMs = nowMs();
+    pendingPickups_.push_back(pp);
+}
+
 void Replicator::trackGroundGear(const std::string& sid, u32 dropOwnerId, u32 dropId,
                                  void* item, bool authored) {
     if (injectForgetTrack(authored)) {
@@ -1075,6 +1089,7 @@ void Replicator::trackGroundGear(const std::string& sid, u32 dropOwnerId, u32 dr
     g.dropOwnerId = dropOwnerId; g.dropId = dropId; g.item = item;
     for (int k = 0; k < 5; ++k) { g.hand[k] = 0; g.pendingHand[k] = 0; }
     g.pendingType = 0; g.pendingSinceMs = 0; g.deadReads = 0;
+    g.firstDeadMs = 0; g.createdMs = nowMs(); g.everLive = false;
     // The object's save-stable hand, so the re-home can re-resolve it. A runtime-minted
     // item may have no useful hand; the raw pointer stays as the fallback.
     if (item) engine::readObjectHand(reinterpret_cast<RootObject*>(item), g.hand);
@@ -1122,6 +1137,30 @@ bool injectRehomeRefusal() {
     return true;
 }
 
+// TEST-ONLY fault injection: KENSHICOOP_WD_TRANSIENT_DEAD=N makes the first N PICKUP-time
+// resolutions of a tracked ground object read as dead, then lets them succeed. That is the real
+// cause of the duplicate the player saw - the engine streams an object out and back, so a single
+// read disagrees with the world for a moment - and it cannot be arranged deterministically any
+// other way. Consulted ONLY at the pickup site: the per-tick reconcile would otherwise eat the
+// budget before the intent ever arrives.
+//
+// The distinction it gates is whether an unsatisfied pickup is a VERDICT or a retry. Concluding
+// from the one bad read erases the track and answers the peer with nothing, leaving our ground
+// copy next to the item the peer now holds; parking it lets the next read - which succeeds -
+// finish the re-home.
+static bool injectTransientDead() {
+    static int budget = -1;
+    if (budget < 0) {
+        const char* e = getenv("KENSHICOOP_WD_TRANSIENT_DEAD");
+        budget = e ? atoi(e) : 0;
+        if (budget < 0) budget = 0;
+    }
+    if (budget == 0) return false;
+    --budget;
+    coop::logLine("[wd] TRANSIENT-DEAD-INJECTED (test lever: this read reports the object gone)");
+    return true;
+}
+
 // Resolve a tracked ground item to a LIVE free ground object, or 0 if it is no longer one.
 // The CACHED pointer is tried first and on purpose: it is the object we actually relocated,
 // and the liveness probe is SEH-guarded so a dangling pointer simply reads as dead. Trusting
@@ -1147,7 +1186,61 @@ RootObject* resolveGroundGear(const unsigned int hand[5], void* cached) {
 }
 } // namespace
 
+void Replicator::retryPendingPickups(GameWorld* gw) {
+    if (pendingPickups_.empty()) return;
+    unsigned long now = nowMs();
+    for (std::deque<PendingPickup>::iterator it = pendingPickups_.begin();
+         it != pendingPickups_.end(); ) {
+        int moved = 0;
+        const char* how = "site";
+        // Prefer the named instance if its track resolves again - that re-homes the EXACT object
+        // the picker took, where the site scan can only match template + proximity.
+        std::map<std::string, std::deque<GroundWeapon> >::iterator sit =
+            groundedWeapons_.find(it->sid);
+        if (sit != groundedWeapons_.end()) {
+            for (std::deque<GroundWeapon>::iterator g = sit->second.begin();
+                 g != sit->second.end(); ++g) {
+                if (g->dropOwnerId != it->refOwnerId || g->dropId != it->refDropId) continue;
+                RootObject* ro = resolveGroundGear(g->hand, g->item);
+                if (!ro) break;
+                moved = injectRehomeRefusal()
+                            ? 0 : engine::addItemPtrToInventory(gw, it->targetHand, ro);
+                if (moved) { how = "track"; sit->second.erase(g); }
+                break;
+            }
+        }
+        if (!moved && !injectRehomeRefusal())
+            moved = engine::pickupWorldItemIntoInventory(gw, it->targetHand, it->sid.c_str(),
+                                                         it->itemType, WD_REHOME_SCAN_R);
+        if (moved) {
+            char b[220]; _snprintf(b, sizeof(b) - 1,
+                "[wd] PICKUP-RETRY-OK sid='%s' ref=%u/%u via=%s afterMs=%lu",
+                it->sid.c_str(), it->refOwnerId, it->refDropId, how,
+                (unsigned long)(now - it->sinceMs));
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            Key tk; tk.t = it->targetHand[0]; tk.c = it->targetHand[1]; tk.cs = it->targetHand[2];
+            tk.i = it->targetHand[3]; tk.s = it->targetHand[4];
+            xferRebase(gw, tk); // keep the drag detector blind to our own relocation
+            it = pendingPickups_.erase(it);
+            continue;
+        }
+        if (now - it->sinceMs < WD_REHOME_MAX_MS) { ++it; continue; }
+        // Out of patience. Unconditional, because this is the state the player SEES: the peer
+        // holds the item and we still have a copy somewhere we could not reach.
+        char b[240]; _snprintf(b, sizeof(b) - 1,
+            "[wd] PICKUP-GAVEUP sid='%s' ref=%u/%u afterMs=%lu (peer took it; our copy could not "
+            "be re-homed - expect a duplicate)", it->sid.c_str(), it->refOwnerId, it->refDropId,
+            (unsigned long)(now - it->sinceMs));
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        it = pendingPickups_.erase(it);
+    }
+}
+
 void Replicator::reconcileGroundGear(GameWorld* gw) {
+    // Ordered FIRST and outside the groundedWeapons_ guard below: a parked pickup exists
+    // precisely because there is no track for it, so gating it on a non-empty track map would
+    // never retry the case it was written for.
+    retryPendingPickups(gw);
     if (groundedWeapons_.empty()) return;
     static int dumpWd = -1;
     if (dumpWd < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dumpWd = (e && e[0] == '1') ? 1 : 0; }
@@ -1162,15 +1255,23 @@ void Replicator::reconcileGroundGear(GameWorld* gw) {
                 // bad read is exactly what used to make us forget a live ground copy and
                 // answer a real pickup with "untracked". Only a REPEATED failure retires the
                 // track (nothing is on the ground then, so there is no duplicate to resolve).
-                if (++g->deadReads < WD_DEAD_READS_MAX) { ++g; continue; }
-                char b[200]; _snprintf(b, sizeof(b) - 1,
-                    "[wd] ground-prune sid='%s' drop=%u/%u (%u consecutive reads: not a free "
-                    "ground item)", sit->first.c_str(), g->dropOwnerId, g->dropId, g->deadReads);
+                if (++g->deadReads == 1) g->firstDeadMs = now;
+                // The read count is denominated in ENGINE TICKS (~100-125 Hz), so on its own it
+                // retires a track ~25 ms after the drop that created it. The streak has to
+                // survive real time too, or a momentary unreadable frame costs the author its
+                // only handle on the object and the peer's pickup is answered with nothing.
+                unsigned long deadFor = now - g->firstDeadMs;
+                unsigned long hold = g->everLive ? WD_DEAD_HOLD_MS : WD_NEVER_LIVE_MAX_MS;
+                if (g->deadReads < WD_DEAD_READS_MAX || deadFor < hold) { ++g; continue; }
+                char b[240]; _snprintf(b, sizeof(b) - 1,
+                    "[wd] ground-prune sid='%s' drop=%u/%u (%u consecutive reads over %lums, "
+                    "everLive=%d: not a free ground item)", sit->first.c_str(), g->dropOwnerId,
+                    g->dropId, g->deadReads, deadFor, g->everLive ? 1 : 0);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
                 g = q.erase(g);
                 continue;
             }
-            g->deadReads = 0;
+            g->deadReads = 0; g->firstDeadMs = 0; g->everLive = true;
             bool pending = false;
             for (int k = 0; k < 5; ++k) if (g->pendingHand[k] != 0) { pending = true; break; }
             if (!pending) { ++g; continue; }
@@ -1261,10 +1362,17 @@ void Replicator::applyWeaponPickups(GameWorld* gw, Inbound& in) {
             // Re-resolve rather than trust the cached Item*: it may name an object the engine
             // has since despawned, and a dead pointer into addItemPtrToInventory is how a
             // re-home "succeeded" at nothing while our ground copy stayed put.
-            RootObject* ro = resolveGroundGear(pick->hand, pick->item);
+            RootObject* ro = injectTransientDead() ? 0
+                                                   : resolveGroundGear(pick->hand, pick->item);
             if (!ro) {
-                why = "gone";
-                q.erase(pick); // not on the ground any more; nothing to duplicate
+                // One unreadable read is NOT proof the object left the ground - the engine
+                // streams objects out and back, and reconcileGroundGear deliberately needs a
+                // sustained streak before it believes the same thing. Erasing here on a single
+                // read threw away the handle AND the intent together, leaving our ground copy
+                // with nothing left to retire it. Park the intent and keep trying.
+                why = "deferred";
+                parkPendingPickup(targetHand, p.stringID, p.itemType,
+                                  p.refDropOwnerId, p.refDropId);
             } else {
                 moved = injectRehomeRefusal() ? 0
                                              : engine::addItemPtrToInventory(gw, targetHand, ro);
@@ -1296,7 +1404,19 @@ void Replicator::applyWeaponPickups(GameWorld* gw, Inbound& in) {
                         ? 0
                         : engine::pickupWorldItemIntoInventory(gw, targetHand, p.stringID,
                                                                p.itemType, WD_REHOME_SCAN_R);
-            why = moved ? "recovered-by-site" : "untracked";
+            // A miss here is not a verdict either: this scan is the spatial query that fails in
+            // towns, so answering "untracked" and stopping is how a town pickup left a permanent
+            // duplicate. Park it and retry - the track may also come back before the deadline.
+            // A miss here is not a verdict either: this scan is the spatial query that fails in
+            // towns, so answering "untracked" and stopping is how a town pickup left a permanent
+            // duplicate. Park it and retry - the track may also come back before the deadline.
+            if (moved) {
+                why = "recovered-by-site";
+            } else {
+                why = "deferred";
+                parkPendingPickup(targetHand, p.stringID, p.itemType,
+                                  p.refDropOwnerId, p.refDropId);
+            }
         } else {
             // NO FALLBACK for an identity-less pickup. Re-homing "the oldest same-sid copy" on
             // a ref=0/0 intent means a bogus pickup TELEPORTS an unrelated ground item into a

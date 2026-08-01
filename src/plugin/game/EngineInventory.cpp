@@ -814,6 +814,48 @@ int addItemToNestedContainer(GameWorld* gw, const unsigned int cHand[5], const c
     return added;
 }
 
+// SEH-guarded: drop `qty` of (sid,type) out of a CARRIED CONTAINER straight onto the ground,
+// searching every container the character holds in carry order. This is the reach that
+// dropItemFromInventory deliberately lacks - it reads top-level only, because a bagged item
+// belongs to a different inventory and must not be counted as this character's loose kit.
+//
+// The drop MIRROR needs that reach anyway: a peer who hoovers a pile of loot into one character
+// overflows the grid, so the engine puts the tail inside the worn backpack. When that character
+// later drops such an item, a top-level-only search finds nothing, the mirror concludes it has
+// no copy, and fabricates one - leaving the real item in the bag and a minted duplicate on the
+// ground. Relocating out of the bag conserves the object instead.
+int dropItemFromNestedContainer(GameWorld* gw, const unsigned int cHand[5], const char* sid,
+                                unsigned int typeCat, int qty, void** outLastDropped) {
+    if (outLastDropped) *outLastDropped = 0;
+    if (!gw || !sid || !sid[0] || qty <= 0) return 0;
+    int dropped = 0;
+    __try {
+        int bags = nestedContainerCount(gw, cHand);
+        for (int which = 0; which >= 0 && which < bags && dropped < qty; ++which) {
+            for (;;) {
+                // Re-resolve each iteration: dropItem mutates the sub-inventory's item list,
+                // so a cached Item* (or Inventory*) could dangle.
+                Inventory* sub = nestedInventoryOf(gw, cHand, (unsigned int)which);
+                if (!sub) break;
+                InvItemEntry cur[INV_ITEMS_MAX];
+                Item* curItems[INV_ITEMS_MAX];
+                unsigned int n = readInvItems(sub, cur, curItems, INV_ITEMS_MAX, 0);
+                Item* victim = 0;
+                for (unsigned int i = 0; i < n; ++i) {
+                    if (cur[i].itemType != typeCat) continue;
+                    if (strcmp(cur[i].stringID, sid) != 0) continue;
+                    victim = curItems[i]; break;
+                }
+                if (!victim) break;
+                sub->dropItem(victim);                          // virtual: bag -> ground
+                if (outLastDropped) *outLastDropped = victim;    // the now-grounded object
+                if (++dropped >= qty) break;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return dropped;
+}
+
 // SEH-guarded: how many of (sid,type) sit INSIDE the carried container `which` (summed
 // quantities). -1 when the character holds no such container, so a gate can tell "the bag is
 // not here" apart from "the bag is here and empty" - the difference between an unfinished
@@ -1804,6 +1846,22 @@ int relocateWeaponToGround(GameWorld* gw, const unsigned int ownerHand[5],
         if (dropped == 0)
             dropped = dropItemFromInventory(gw, ownerHand, sid, typeCat, 1, &droppedItem,
                                             /*allowEquipped*/ true);
+        // Still nothing at top level: the item may be INSIDE a carried container. A peer that
+        // loots a pile into one character overflows the grid and the engine stows the tail in
+        // the worn backpack, so this is the ordinary state after a bulk pickup - not an edge
+        // case. Without this reach the caller concludes it has no copy and FABRICATES one,
+        // which leaves the real item in the bag and a duplicate on the ground.
+        if (dropped == 0) {
+            dropped = dropItemFromNestedContainer(gw, ownerHand, sid, typeCat, 1, &droppedItem);
+            // Unconditional: this is the difference between conserving the object and minting a
+            // duplicate, and it was invisible while the mirror simply reported "no local copy".
+            if (dropped > 0) {
+                char b[200]; _snprintf(b, sizeof(b) - 1,
+                    "[wd] RELOCATE-NESTED sid='%s' type=%u (found inside a carried container, "
+                    "not at top level)", sid, typeCat);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
     }
     if (dropped == 0) return 0;
     if (outDropped) *outDropped = droppedItem;
