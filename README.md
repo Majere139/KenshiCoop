@@ -35,7 +35,7 @@ src/netsim/       Protocol simulator
 src/prototest/    Wire-protocol unit tests
 src/tunneltest/   Steam-tunnel socket-hook tests
 scripts/          Build, deploy, session, and automated-test tooling (PowerShell)
-docs/             Build guide + engine/API reference
+docs/             Build guide, engine/API reference, replication pitfalls
 third_party/      ENet patches, VC10 compat shim (deps are fetched, not committed)
 ```
 
