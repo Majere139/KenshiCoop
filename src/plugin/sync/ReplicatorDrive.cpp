@@ -1155,7 +1155,13 @@ void Replicator::applyTargets(GameWorld* gw) {
         // spike in the stream - srcVel 90-150 u/s on a seg snap - held a
         // genuinely SEATED divergent NPC in the walk branch for ~7 s per
         // spike, hard-snapping every frame; spawn_far run 124346.)
-        const unsigned long NPC_MOVE_HOLD_MS = 1000;
+        // The floor is what a NEAR-tier body gets, and it only has to outlast a
+        // sample-boundary dip: at ~50 ms segments a 1000 ms floor is 20x longer
+        // than needed, and every millisecond past the dip is hold that outlives a
+        // real stop (holdStop - the visible idle jitter). The cadence scaling below
+        // still gives sparse mid-tier bodies their drought protection.
+        // A/B toggle (2026-08-01): 1000 restores the pre-fix arm.
+        const unsigned long NPC_MOVE_HOLD_MS = 300;
         // Phase 2 mid-band tier: the per-entity stream cadence. Near-tier
         // bodies see ~50 ms segments; a round-robin mid-tier body sees the
         // rotation period (~500 ms +, growing with the mid population). The
@@ -1181,6 +1187,37 @@ void Replicator::applyTargets(GameWorld* gw) {
         if (haveNewest && vlen > NPC_MOVE_VEL) d.moveSeenMs = now;
         bool npcMoving = haveNewest && d.moveSeenMs != 0 &&
                          (now - d.moveSeenMs) <= moveHold;
+        // This hold is what the idle march-in-place costs: while it runs the drive
+        // stays in the walk branch and keeps walk-ORDERING a body that has already
+        // arrived, so the engine holds currentlyMoving with no translation - what
+        // the march oracle counts. marchFrac went from ~0.000 to 0.05-0.36 across
+        // EVERY scenario the afternoon the hold replaced the instantaneous
+        // classifier (2026-07-11, bracketed to 14:33-14:40 by leader_move
+        // 0.001 -> 0.192), and the oracle note further down was written knowing
+        // the hold "keeps the drive in the walk branch through source stops" -
+        // it re-scored zeroFrac around that instead, which hid the cost from
+        // smoothness but left the body visibly marching.
+        //
+        // But most of that marchFrac is the ORACLE disagreeing with this debounce,
+        // not a visible defect. The holdDip/holdStop split (see the counter decls)
+        // measured 86-93% of march frames as holdDip across leader_move / npc_sync
+        // / craft_order: the source is genuinely WALKING, a fast sample landed
+        // within 200 ms, and the instantaneous velocity is in the sample-boundary
+        // dip this hold exists to bridge - while the oracle calls the host "at
+        // rest" on that same instantaneous velocity. Only holdStop (the hold
+        // outliving a real stop) is the visible idle jitter, and it runs
+        // 310-505 frames per run = ~0.013-0.019 of rest samples, against the
+        // pre-hold marchFrac of ~0.001. So the real regression is ~13-19x, an
+        // order of magnitude smaller than marchFrac reports.
+        //
+        // Two consequences before touching this code. First, marchFrac cannot
+        // judge a fix here - holdStop is the signal; a source-displacement stop
+        // detector (0.5 u / 500 ms) was tried on 2026-08-01 and reverted after an
+        // interleaved A/B (5 clean runs/arm) moved marchFrac the WRONG way
+        // (leader_move 0.095 -> 0.100, npc_sync 0.087 -> 0.142) - it can only ever
+        // touch the ~13% holdStop slice, and dip noise swamped it. Second, single
+        // runs cannot judge anything here: marchFrac spans 0.046-0.183 WITHIN one
+        // arm, so fewer than ~5 runs per arm just reports the last run.
         // Mid-tier body = sparse stream cadence (the round-robin period).
         // Its drive shares the near-tier code below, but its counters/oracles
         // are tracked apart: the near-tier gates guard the validated 20 Hz
@@ -1444,9 +1481,13 @@ void Replicator::applyTargets(GameWorld* gw) {
             // what stops the local AI from standing an NPC back up. For a
             // squad member this is what makes a join squad-mate sit on the
             // same chair instead of standing on it.
+            // Stamp the rest-entry edge before applyRest, so a march frame in the
+            // engine's post-endAction settle can be told apart from a later relapse.
+            if (d.walkBranchPrev || d.restEnterMs == 0) d.restEnterMs = now;
             applyRest(c, d, out, haveActual, ax, ay, az, now, isSquad);
             d.haveDest = false;
         }
+        d.walkBranchPrev = genuinelyMoving;
 
         // ---- Oracles (measured from the body's ACTUAL rendered motion) --------
         // "Active" == the host is genuinely translating, matching the drive's own
@@ -1516,8 +1557,28 @@ void Replicator::applyTargets(GameWorld* gw) {
             float step = dist3(ax, ay, az, d.lx, d.ly, d.lz);
             ++restSampleFrames_;
             bool m = false; float sp = 0.0f;
-            if (step < TRANSLATE_EPS && engine::readMotion(c, &m, &sp) && m && sp > 0.1f)
+            if (step < TRANSLATE_EPS && engine::readMotion(c, &m, &sp) && m && sp > 0.1f) {
                 ++marchFrames_;
+                // Attribute the frame so the fix can target the site that actually
+                // dominates. Note sp is currentSpeed - the locomotion speed SETTING,
+                // which stays high on a standing body (a parked Garru streams
+                // cSpeed=15.2), so the condition above is really "currentlyMoving
+                // set while not translating", not a speed measurement.
+                const unsigned long MARCH_SETTLE_MS = 250;
+                const unsigned long MARCH_DIP_MS    = 200;
+                // Only an NPC can land here: a squad body reaches this block with
+                // !hostMoving, which is exactly its genuinelyMoving, so the hold
+                // buckets are NPC-only and moveSeenMs is always the right clock.
+                if (genuinelyMoving) {
+                    ++marchHold_;
+                    if (d.moveSeenMs != 0 &&
+                        (now - d.moveSeenMs) <= MARCH_DIP_MS) ++marchHoldDip_;
+                    else ++marchHoldStop_;
+                }
+                else if (d.restEnterMs != 0 &&
+                         (now - d.restEnterMs) <= MARCH_SETTLE_MS) ++marchSettle_;
+                else ++marchRelapse_;
+            }
         }
         if (haveActual) { d.haveActual = true; d.lx = ax; d.ly = ay; d.lz = az; }
     }

@@ -70,7 +70,8 @@ function Test-AnimTruth {
 
 # March-in-place (inverse of anim-truth). Too few rest samples -> SKIP.
 function Test-MarchInPlace {
-    param([string]$File, [string]$Label = "join", [double]$MaxMarchFrac = 0.20)
+    param([string]$File, [string]$Label = "join", [double]$MaxMarchFrac = 0.20,
+          [double]$MaxIdleFrac = 0.01)
     if (-not (Test-Path $File)) {
         return (Add-GateResult -Name "march" -Status SKIP -Detail "no log")
     }
@@ -85,9 +86,37 @@ function Test-MarchInPlace {
         Write-Host "  [$Label] march-in-place SKIP - only $rest at-rest frame(s)"
         return (Add-GateResult -Name "march" -Status SKIP -Metrics @{ restSamples = $rest } -Detail "too few rest samples")
     }
+    # Score holdStop, not marchFrac (2026-08-01). marchFrac counts every frame the
+    # drive held a walk verdict while the oracle called the host at rest, and the
+    # C++ attribution measured 86-93% of those as holdDip: the source is genuinely
+    # WALKING and its instantaneous velocity is in the sample-boundary dip the
+    # walk/rest debounce exists to bridge, while this oracle decides "at rest" from
+    # that same instantaneous velocity. Scoring the disagreement made a ~13-19x
+    # regression read as 100x+ and sent a fix attempt after the wrong lever.
+    # holdStop - the debounce hold outliving a REAL stop, leaving a walk order on a
+    # body already standing where it belongs - is the visible idle jitter.
+    # marchFrac stays recorded for continuity with pre-2026-08-01 history.
+    #
+    # The 0.01 ceiling is ~2x the worst run measured after the near-tier hold floor
+    # was cut to 300 ms (leader_move 0.0024 mean / 0.0041 worst, craft_order 0.0042
+    # mean / 0.0052 worst over 4 clean runs each). Before that cut the same
+    # scenarios sat at 0.0086 and 0.0165, so this ceiling would catch a relapse.
+    if ($line.Line -match "holdStop=(\d+)") {
+        $holdStop = [int]$Matches[1]
+        $dip = 0
+        if ($line.Line -match "holdDip=(\d+)") { $dip = [int]$Matches[1] }
+        $idleFrac = [math]::Round($holdStop / [double]$rest, 4)
+        $ok = ($idleFrac -le $MaxIdleFrac)
+        $v = if ($ok) { "PASS" } else { "FAIL" }
+        Write-Host "  [$Label] march-in-place $v - idleFrac=$idleFrac (<= $MaxIdleFrac), holdStop=$holdStop, holdDip=$dip (scored at rest, not a defect), marchFrac=$marchFrac, restSamples=$rest"
+        return (Add-GateResult -Name "march" -Status $v -Metrics @{
+                    idleFrac = $idleFrac; holdStop = $holdStop; holdDip = $dip
+                    marchFrac = $marchFrac; restSamples = $rest })
+    }
+    # Pre-attribution DLL: only the conflated metric exists.
     $ok = ($marchFrac -le $MaxMarchFrac)
     $v = if ($ok) { "PASS" } else { "FAIL" }
-    Write-Host "  [$Label] march-in-place $v - marchFrac=$marchFrac (<= $MaxMarchFrac), restSamples=$rest"
+    Write-Host "  [$Label] march-in-place $v - marchFrac=$marchFrac (<= $MaxMarchFrac, conflated: no holdStop in this log), restSamples=$rest"
     return (Add-GateResult -Name "march" -Status $v -Metrics @{ marchFrac = $marchFrac; restSamples = $rest })
 }
 

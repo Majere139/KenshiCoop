@@ -779,6 +779,10 @@ private:
         // The classifier's previous verdict, so genuine walk->rest
         // transitions can be counted (restFlipNpc_) as a flap-rate signal.
         bool         wasMoving;
+        // March attribution: when this body last ENTERED the rest branch, and
+        // which branch it took last frame (so the entry edge can be detected).
+        unsigned long restEnterMs;
+        bool         walkBranchPrev;
         // Per-hand smoothness attribution (Phase 2 diagnosis): cumulative
         // active/zero-step frames this body contributed to the oracle, so a
         // zeroFrac regression can name its worst offenders in the stat line.
@@ -806,6 +810,7 @@ private:
                    furnHealTick(0), furnNoSeeTick(0), furnPeerTick(0),
                    haveChainOwner(false), chainHealTick(0),
                    sneakTick(0), velPeak(0.0f), moveSeenMs(0), wasMoving(false),
+                   restEnterMs(0), walkBranchPrev(false),
                    zeroF(0), activeF(0), midSeenMs(0) {
             chainOwner[0] = chainOwner[1] = chainOwner[2] = chainOwner[3] = chainOwner[4] = 0;
         }
@@ -1331,6 +1336,29 @@ private:
     // the spot where the host sits" bug. This is the failure anim-truth cannot see.
     unsigned long restSampleFrames_;
     unsigned long marchFrames_;
+    // Attribution of those march frames, so a fix can target the right site
+    // instead of re-tuning the walk hold (which an A/B on 2026-08-01 measured as
+    // the wrong lever - see the note at the walk/rest classifier):
+    //   hold    - the drive was still in the WALK branch (the hold outliving the
+    //             source's stop), so it is walk-ordering an arrived body
+    //   settle  - within MARCH_SETTLE_MS of entering rest: endAction has fired but
+    //             the engine has not yet dropped the walk state
+    //   relapse - at rest well past the settle: the body RE-ACQUIRED a walk while
+    //             parked (the class quietRelapse_ re-quiets)
+    unsigned long marchHold_;
+    unsigned long marchSettle_;
+    unsigned long marchRelapse_;
+    // The hold bucket split by WHY the hold was still up, which decides whether a
+    // march frame is a real defect or the oracle disagreeing with the debounce:
+    //   dip  - a fast sample arrived moments ago, so the source is genuinely
+    //          WALKING and this is the sample-boundary velocity dip the hold was
+    //          built to bridge. The oracle calls the host "at rest" on that same
+    //          instantaneous velocity, so it scores a correctly-walking body.
+    //   stop - no fast sample for a long time: the hold is outliving a real stop
+    //          and the body is being walk-ordered where it already stands. THIS is
+    //          the visible idle jitter.
+    unsigned long marchHoldDip_;
+    unsigned long marchHoldStop_;
 
     // AI-gating spike: how often does a driven NPC's LOCAL task match the host's
     // streamed rawTask? High agreement => we can gate the local AI (freeze when it

@@ -32,6 +32,8 @@ Replicator::Replicator()
       interpLogTick_(0),
       translateFrames_(0), walkTruthFrames_(0),
       restSampleFrames_(0), marchFrames_(0),
+      marchHold_(0), marchSettle_(0), marchRelapse_(0),
+      marchHoldDip_(0), marchHoldStop_(0),
       gateSamples_(0), gateAgree_(0), gateLogTick_(0),
       probeRecruit_(false), probedCount_(0),
       aiSuspend_(false), aiLogTick_(0), nextEventId_(1),
@@ -440,10 +442,15 @@ void Replicator::logSmoothSummary() {
     float marchFrac = (restSampleFrames_ > 0)
                           ? (float)marchFrames_ / (float)restSampleFrames_
                           : 0.0f;
-    char m[160];
+    // hold/settle/rlps attribute those march frames (see the counter decls). They
+    // are appended AFTER marchFrac so Test-MarchInPlace's regex still matches.
+    char m[224];
     _snprintf(m, sizeof(m) - 1,
-              "SCENARIO MARCH restSamples=%lu march=%lu marchFrac=%.3f",
-              restSampleFrames_, marchFrames_, marchFrac);
+              "SCENARIO MARCH restSamples=%lu march=%lu marchFrac=%.3f "
+              "hold=%lu settle=%lu rlps=%lu holdDip=%lu holdStop=%lu",
+              restSampleFrames_, marchFrames_, marchFrac,
+              marchHold_, marchSettle_, marchRelapse_,
+              marchHoldDip_, marchHoldStop_);
     m[sizeof(m) - 1] = '\0';
     coop::logLine(m);
 
