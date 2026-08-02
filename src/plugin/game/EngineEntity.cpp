@@ -24,6 +24,30 @@ namespace engine {
 // ---- Entity capture / resolve / apply --------------------------------------
 
 namespace {
+// A body working a CONSTRUCTION SITE (2026-08-01 building sync). BUILD is the
+// right-click "build this" order, JOB_BUILDER the standing builder job; both pin
+// the body at the site playing the hammering animation. Kept as its own predicate
+// because a build site differs from every other pose fixture in one way that the
+// callers must handle: the site is created AT RUNTIME, so its hand is DIFFERENT on
+// each client (a placement logged 0.3409.11111.2.3348877056 on the placer and
+// ...2871948288 on the peer). The subject therefore has to be translated through
+// the protocol-27 build key maps on both the publish and apply side - see
+// Replicator::buildKeyForLocalHand / localHandForBuildKey. Every other pose
+// fixture comes out of the shared save and needs no translation.
+//
+// ADD_MATERIALS_TO_BUILDING is deliberately NOT here: that task WALKS the body to
+// the site carrying materials, and reproducing a movement task drifts the body
+// (see the exclusion note below).
+bool isBuildSiteTaskImpl(int t) {
+    switch (t) {
+        case BUILD:
+        case JOB_BUILDER:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // Anchored rest poses worth reproducing: the body stays put AT a fixture (a stool,
 // throne, bed, machine), so committing the same task on the join seats/poses it in
 // place. We deliberately EXCLUDE movement tasks (WANDER_TOWN, GO_TO_THE_BAR...) and
@@ -62,7 +86,7 @@ bool isReproduciblePose(int t) {
         case JOB_REPAIR_ROBOT:
             return true;
         default:
-            return false;
+            return isBuildSiteTaskImpl(t);
     }
 }
 
@@ -531,6 +555,8 @@ int readTaskKey(Character* c) {
 }
 
 bool isNodeAnchoredPose(int taskKey) { return isNodeAnchoredPoseImpl(taskKey); }
+
+bool isBuildSiteTask(int taskKey) { return isBuildSiteTaskImpl(taskKey); }
 
 bool recruitNpc(GameWorld* gw, Character* c) {
     if (!gw || !c || !g_recruitFn) return false;

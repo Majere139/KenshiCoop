@@ -62,6 +62,7 @@
 #include <kenshi/Tasker.h>          // Tasker::key() -> TaskType, Tasker::subject (hand)
 #include <kenshi/util/hand.h>       // hand (5-field identity, getRootObject)
 #include <kenshi/util/lektor.h>     // lektor<T> (playerCharacters, interest query)
+#include <kenshi/util/UtilityT.h>   // UtilityT::getTerrainHeight (peer-mint grounding)
 #include <kenshi/Gear.h>            // Sword (spike 451 weapon-mint ctor trace)
 #include <kenshi/Faction.h>         // Faction::getData / FactionManager::getFactionByStringID (protocol 21)
 #include <kenshi/FactionRelations.h> // FactionRelations (protocol 24 faction-relation sync)
@@ -242,6 +243,10 @@ typedef Building* (__fastcall* CreateBuildingFn)(
     Layout* furnitureOf, Building* isDoorOf, GameSaveState* saveState,
     Building* isIndoorsOf, bool invisible, bool completed, bool isFoliage,
     int floorNumber, bool isOutsideFurniture);
+// Terrain height under an x/z. createBuilding treats position.y as an offset
+// ABOVE this, so a peer minting the placer's absolute Y must subtract it.
+// Static (not a member), so it resolves and calls like a plain function.
+typedef float (*TerrainHeightFn)(float x, float z);
 typedef void (__fastcall* GetDataOfTypeFn)(
     GameDataContainer* self, lektor<GameData*>* list, itemType type);
 typedef RootObjectBase* (__fastcall* CreateObjFn)(
@@ -450,7 +455,13 @@ extern AddCharacterAtFn g_addCharacterAtFn;
 
 // build placement / dismantle edges
 extern std::vector<BuildEdgeRec> g_buildEdges;
+extern bool g_buildCaptureArmed;
+extern int  g_buildCaptureDepth;
+extern int  g_buildCaptureSuppress;
 extern PlaceFinalFn g_placeFinalOrig;
+// Trampoline for the createBuilding capture hook. g_createBldgFn is repointed
+// here at install so our own placements bypass capture and cannot echo.
+extern CreateBuildingFn g_createBldgOrig;
 extern std::vector<unsigned int> g_removeEdges; // flat, 5 u32 per edge
 extern DismantleFn g_dismantleOrig;
 
@@ -465,6 +476,7 @@ extern unsigned long        g_dmgPassedHits;
 // factory / inventory / faction
 extern CreateCharFn     g_createCharFn;
 extern CreateBuildingFn g_createBldgFn;
+extern TerrainHeightFn  g_terrainHeightFn;
 extern CreateObjFn      g_createObjFn;
 extern DestroyObjFn     g_destroyObjFn;
 extern GetDataOfTypeFn  g_getDataOfTypeFn;

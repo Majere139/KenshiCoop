@@ -1053,6 +1053,43 @@ void Replicator::applyResearch(const SyncContext& ctx) {
     }
 }
 
+// Build-site pose subject translation. A construction site is created at RUNTIME,
+// so unlike every other pose fixture its hand is client-local: a placement logged
+// 0.3409.11111.2.3348877056 on the placer and ...2871948288 on the peer. A streamed
+// BUILD/JOB_BUILDER pose therefore has to cross in the placer's key space, or the
+// peer resolves nothing, parks the builder, and the body just jitters under the
+// position drive with no construction animation.
+bool Replicator::buildKeyForLocalHand(const Key& local, Key& outWire) const {
+    // A site WE placed already IS the key - nothing to rewrite.
+    if (ownBuilds_.find(local) != ownBuilds_.end()) {
+        outWire = local;
+        return true;
+    }
+    // A site we MINTED for the peer's placement: express it as the placer's key.
+    std::map<Key, Key>::const_iterator mit = mintByLocal_.find(local);
+    if (mit != mintByLocal_.end()) {
+        outWire = mit->second;
+        return true;
+    }
+    return false; // not a placed site (save-resident building) - no translation
+}
+
+bool Replicator::localHandForBuildKey(const Key& wire, unsigned int out[5]) const {
+    if (!out) return false;
+    std::map<Key, OwnBuild>::const_iterator ob = ownBuilds_.find(wire);
+    if (ob != ownBuilds_.end()) {
+        if (ob->second.removed) return false;
+        memcpy(out, ob->second.hand, sizeof(unsigned int) * 5);
+        return true;
+    }
+    std::map<Key, PeerBuild>::const_iterator pb = peerBuilds_.find(wire);
+    if (pb != peerBuilds_.end() && pb->second.minted == 1 && !pb->second.removed) {
+        memcpy(out, pb->second.localHand, sizeof(unsigned int) * 5);
+        return true;
+    }
+    return false; // unknown / refused / tombstoned key
+}
+
 void Replicator::publishBuilds(const SyncContext& ctx) {
     NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
     if (!buildSync_) return;
@@ -1227,7 +1264,11 @@ void Replicator::applyBuilds(const SyncContext& ctx) {
             if (cur.complete) continue; // completion is latched locally
         }
         engine::BuildRead post;
-        bool ok = engine::writeBuildProgressByHand(pb.localHand, p.progress, &post);
+        // The placer's own isComplete drives completion here - see the note on
+        // writeBuildProgressByHand. Inferring it from progress crossing 1.0
+        // finished the peer's copy long before the placer's.
+        bool ok = engine::writeBuildProgressByHand(pb.localHand, p.progress,
+                                                   p.complete != 0, &post);
         char b[208];
         _snprintf(b, sizeof(b) - 1,
                   "[build] STATE-RECV key=%u.%u.%u.%u.%u prog=%.3f complete=%u "

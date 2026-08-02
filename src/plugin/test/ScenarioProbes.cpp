@@ -171,7 +171,8 @@ private:
             r4Step_ = 2;
             if (r4Placed_) {
                 engine::BuildRead post;
-                bool ok = engine::writeBuildProgressByHand(r4Hand_, 1.0f, &post);
+                bool ok = engine::writeBuildProgressByHand(r4Hand_, 1.0f,
+                                                          /*markComplete*/true, &post);
                 logSpike("bench ramp ok=%d complete=%d", ok ? 1 : 0,
                          ok ? post.complete : -1);
             }

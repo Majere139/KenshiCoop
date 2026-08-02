@@ -967,6 +967,13 @@ int readTaskKey(Character* c);
 // node behavior - i.e. do NOT suspend its AI and do NOT park it at rest.
 bool isNodeAnchoredPose(int taskKey);
 
+// True if 'taskKey' is a CONSTRUCTION-SITE task (BUILD / JOB_BUILDER): the body
+// stands at a building site playing the construction animation. Unlike every other
+// reproducible pose, the subject is created at RUNTIME, so its hand differs per
+// client and the sync layer must translate it through the protocol-27 build key
+// maps before ordering the pose on the peer.
+bool isBuildSiteTask(int taskKey);
+
 // AI-gating probe lever: recruit a world NPC into the local player's squad (the
 // "inhabit" path) so it stops self-assigning town tasks and obeys our drive.
 // Join-side only. Returns the engine's recruit() result (false if unresolved).
@@ -1513,13 +1520,23 @@ struct BuildEdge {
     float x, y, z;        // placement transform (what the peer mints at)
     float yaw;
     int   floorNum;
-    int   fromUi;         // 1 = the PreviewBuilding detour, 0 = programmatic
+    int   fromUi;         // 1 = captured at the factory, 0 = programmatic probe
     char  sid[48];        // template sid
 };
-// Detour PreviewBuilding::placeFinalPreviewBuilding - the ONE engine path a
-// player's build-mode commit lands on (justBeenBuilt carries the new Building).
-// Every successful placement queues a BuildEdge the Replicator drains.
+// Detour RootObjectFactory::createBuilding - the choke point EVERY building
+// creation passes through, including a player's build-mode commit. Each new
+// construction site queues a BuildEdge the Replicator drains. Capturing here
+// rather than off PreviewBuilding::justBeenBuilt is deliberate: that field read
+// 0 for placements that visibly succeeded, so no player build ever streamed.
 bool installBuildHook();
+// Gate capture to live gameplay. Pass the same worldLive that gates
+// replication; while false, capture ignores creations, which is what keeps
+// world load and world swaps (the whole save's buildings) off the wire.
+void setBuildCaptureArmed(bool armed);
+// SEH-guarded terrain height under an x/z. Returns false if the engine's
+// terrain query is unresolved. Callers that want a building to sit ON the
+// ground pass this as the absolute Y to placeBuildingAt.
+bool terrainHeightAt(float x, float z, float* outY);
 unsigned int drainBuildEdges(BuildEdge* out, unsigned int maxOut);
 // SEH-guarded enumeration of INCOMPLETE construction sites among BUILDING
 // objects within radius of the interest centers (complete/baked buildings are
@@ -1531,12 +1548,22 @@ bool readBuildingByHand(const unsigned int bHand[5], BuildRead* out);
 // (setConstructionProgress; notifyConstructionComplete fires once at >= 1.0 so
 // the site "finishes" natively - scaffold off, materials restored, navmesh).
 // Returns false on resolve failure or fault; *outAfter when non-null.
+// markComplete is the AUTHORITY's own isComplete, never a threshold inferred
+// from progress: constructionProgress is an absolute amount against the
+// building's total, so a site legitimately passes 1.0 while still going up.
 bool writeBuildProgressByHand(const unsigned int bHand[5], float progress,
-                              BuildRead* outAfter);
+                              bool markComplete, BuildRead* outAfter);
 // SEH-guarded programmatic placement by template sid at explicit coordinates
 // (the peer-side MINT primitive; completed=false mints a construction site).
 // Returns 1 placed, 0 template-miss/factory-refused, -1 fault. outHand gets
 // the minted building's local hand.
+// `y` is the ABSOLUTE world Y to land at. createBuilding treats the Y it is
+// given as an offset ABOVE the terrain, so this subtracts the terrain height to
+// convert; `dy` on the mint line reports how far off the landing was, and
+// `ground` reports the terrain height used. Passing an absolute straight through
+// put peer mints ~terrain-height into the sky; grounding at x/z instead dropped
+// them below any placer who built on a slope or a foundation. Callers wanting a
+// building ON the ground pass terrainHeightAt() as `y`.
 int placeBuildingAt(GameWorld* gw, const char* sid, float x, float y, float z,
                     float heading, bool completed, unsigned int outHand[5]);
 // Probe convenience: pick a deterministic small BUILDING template, place it

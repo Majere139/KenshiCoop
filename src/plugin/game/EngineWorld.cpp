@@ -542,7 +542,7 @@ bool readBuildingByHand(const unsigned int bHand[5], BuildRead* out) {
 }
 
 bool writeBuildProgressByHand(const unsigned int bHand[5], float progress,
-                              BuildRead* outAfter) {
+                              bool markComplete, BuildRead* outAfter) {
     if (outAfter) memset(outAfter, 0, sizeof(*outAfter));
     if (!bHand || !g_buildSetProgFn) return false;
     RootObject* ro = resolveObjectByHand(bHand);
@@ -552,10 +552,17 @@ bool writeBuildProgressByHand(const unsigned int bHand[5], float progress,
         bool wasComplete = b->_buildState.isComplete;
         if (!wasComplete) {
             g_buildSetProgFn(b, progress);
-            // If the engine's setter does not self-complete at the threshold,
-            // fire the completion notification exactly once ourselves so the
-            // site finishes NATIVELY (scaffold off, navmesh, materials).
-            if (progress >= 1.0f && !b->_buildState.isComplete && g_buildNotifyDoneFn)
+            // If the engine's setter does not self-complete, fire the
+            // completion notification exactly once ourselves so the site
+            // finishes NATIVELY (scaffold off, navmesh, materials).
+            //
+            // Only the CALLER decides that. constructionProgress is an absolute
+            // amount measured against the building's own total, NOT a 0..1
+            // fraction - a real site passes 1.0 and keeps going (a two-storey
+            // was still building at 2.005) - so completing here at a hardcoded
+            // 1.0 finished every peer's copy roughly when the placer's was a
+            // fifth of the way up.
+            if (markComplete && !b->_buildState.isComplete && g_buildNotifyDoneFn)
                 g_buildNotifyDoneFn(b);
         }
         if (outAfter) fillBuildRead(b, outAfter);
@@ -564,6 +571,14 @@ bool writeBuildProgressByHand(const unsigned int bHand[5], float progress,
         coop::logLine("[build] progress-write SEH-except");
         return false;
     }
+}
+
+bool terrainHeightAt(float x, float z, float* outY) {
+    if (!outY || !g_terrainHeightFn) return false;
+    __try {
+        *outY = g_terrainHeightFn(x, z);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
 int placeBuildingAt(GameWorld* gw, const char* sid, float x, float y, float z,
@@ -579,12 +594,31 @@ int placeBuildingAt(GameWorld* gw, const char* sid, float x, float y, float z,
     }
     __try {
         Ogre::Quaternion rot(Ogre::Radian(heading), Ogre::Vector3::UNIT_Y);
-        Ogre::Vector3 pos(x, y, z); // createBuilding re-grounds vertically
+        // createBuilding ADDS the terrain height to position.y rather than
+        // replacing it, so the Y we pass is an offset ABOVE ground, not an
+        // absolute (the seat/machine spawns pass 0 for this reason). The wire
+        // carries the placer's ABSOLUTE Y, and grounding at x/z instead is not
+        // good enough: a player placing on a slope or a foundation commits a
+        // building tens of units above the bare terrain, so grounding drops the
+        // peer's copy below the placer's. Subtracting the terrain height turns
+        // the absolute back into the offset the factory wants.
+        float ground = 0.0f;
+        bool haveGround = false;
+        if (g_terrainHeightFn) {
+            ground = g_terrainHeightFn(x, z);
+            haveGround = true;
+        }
+        Ogre::Vector3 pos(x, haveGround ? (y - ground) : 0.0f, z);
+        // Our own creations must not be captured as local placements, and the
+        // engine NESTS a createBuilding per extra floor inside this call - those
+        // nested ones re-enter the capture hook and would echo this mint back.
+        ++g_buildCaptureSuppress;
         Building* bld = g_createBldgFn(
             gw->theFactory, tmpl, pos, /*town*/0, /*owner*/0, rot, /*cb*/0,
             /*furnitureOf*/0, /*isDoorOf*/0, /*saveState*/0, /*isIndoorsOf*/0,
             /*invisible*/false, completed, /*isFoliage*/false,
             /*floor*/0, /*isOutsideFurniture*/false);
+        --g_buildCaptureSuppress;
         if (!bld) {
             char b[160];
             _snprintf(b, sizeof(b) - 1,
@@ -598,12 +632,18 @@ int placeBuildingAt(GameWorld* gw, const char* sid, float x, float y, float z,
         bool haveHand = readObjectHand(ro, h);
         if (outHand && haveHand) memcpy(outHand, h, sizeof(h));
         Ogre::Vector3 ap = ro->getPosition();
-        char b[224];
+        // dy is the whole ballgame for cross-client visibility: the caller asked
+        // for an absolute Y and this is where we landed. They should agree, and
+        // a building the peer cannot see is a building whose dy ran away.
+        // ground is logged alongside so a dy that DOES run away says whether the
+        // terrain query or the factory's own placement was responsible.
+        char b[300];
         _snprintf(b, sizeof(b) - 1,
                   "[build] mint OK sid='%s' completed=%d hand=%u.%u.%u.%u.%u(%d) "
-                  "pos=%.1f,%.1f,%.1f prog=%.3f",
+                  "pos=%.1f,%.1f,%.1f wantY=%.1f dy=%.1f ground=%.1f(%d) prog=%.3f",
                   sid, completed ? 1 : 0, h[0], h[1], h[2], h[3], h[4],
-                  haveHand ? 1 : 0, ap.x, ap.y, ap.z,
+                  haveHand ? 1 : 0, ap.x, ap.y, ap.z, y, ap.y - y,
+                  ground, haveGround ? 1 : 0,
                   bld->_buildState.constructionProgress);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         return 1;
@@ -658,11 +698,13 @@ int probePlaceBuilding(GameWorld* gw, float fwd, float side, bool wantDoor,
         strncpy(outSid, sid, sidLen - 1);
         outSid[sidLen - 1] = '\0';
     }
-    if (outX) *outX = pos.x;
-    if (outY) *outY = pos.y;
-    if (outZ) *outZ = pos.z;
     if (outYaw) *outYaw = yaw;
     unsigned int localHand[5] = { 0, 0, 0, 0, 0 };
+    // placeBuildingAt takes an ABSOLUTE Y. pos is the leader's anchor, tens of
+    // units above the ground the building should sit on, so ask for the terrain
+    // height instead - otherwise the probe's site floats at head height.
+    float groundY = pos.y;
+    if (terrainHeightAt(pos.x, pos.z, &groundY)) pos.y = groundY;
     int rc = placeBuildingAt(gw, sid, pos.x, pos.y, pos.z, yaw,
                              /*completed*/false, localHand);
     if (outHand) memcpy(outHand, localHand, sizeof(localHand));
@@ -670,6 +712,16 @@ int probePlaceBuilding(GameWorld* gw, float fwd, float side, bool wantDoor,
     // would (fromUi=0), so the sync layer announces it. Peer-side MINTS call
     // placeBuildingAt directly and never land here - echo-free.
     if (rc == 1) {
+        // Announce where the building ACTUALLY landed, not where it was asked
+        // to go. The placement grounds to terrain and the anchor's Y is the
+        // LEADER's, tens of units off the ground the building sits on; the UI
+        // detour reports the real object position, so a probe that announced
+        // its request would aim the peer at a height the placer never used and
+        // make the programmatic path unrepresentative of the player's.
+        BuildRead landed;
+        if (readBuildingByHand(localHand, &landed)) {
+            pos.x = landed.x; pos.y = landed.y; pos.z = landed.z;
+        }
         BuildEdgeRec e;
         memset(&e, 0, sizeof(e));
         memcpy(e.hand, localHand, sizeof(e.hand));
@@ -679,6 +731,9 @@ int probePlaceBuilding(GameWorld* gw, float fwd, float side, bool wantDoor,
         e.fromUi = 0;
         if (g_buildEdges.size() < 32) g_buildEdges.push_back(e);
     }
+    if (outX) *outX = pos.x;
+    if (outY) *outY = pos.y;
+    if (outZ) *outZ = pos.z;
     return rc;
 }
 
@@ -1044,6 +1099,10 @@ int probePlaceMachine(GameWorld* gw, float fwd, float side, int kind,
         const char* sid = 0;
         __try { sid = tmpl->stringID.c_str(); } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
         unsigned int localHand[5] = { 0, 0, 0, 0, 0 };
+        // Absolute Y, and pos is the leader's anchor - ground it (see the same
+        // step in probePlaceBuilding).
+        float machineGroundY = pos.y;
+        if (terrainHeightAt(pos.x, pos.z, &machineGroundY)) pos.y = machineGroundY;
         int rc = placeBuildingAt(gw, sid, pos.x, pos.y, pos.z, yaw,
                                  /*completed*/false, localHand);
         if (rc != 1) {
@@ -1076,12 +1135,19 @@ int probePlaceMachine(GameWorld* gw, float fwd, float side, int kind,
         }
         // Queue the protocol-27 edge so the peer mints the same site (the
         // probe then ramps it complete through writeBuildProgressByHand).
+        // Announce the LANDED transform, not the anchor we asked for - see the
+        // same step in probePlaceBuilding.
+        Ogre::Vector3 at = pos;
+        BuildRead landed;
+        if (readBuildingByHand(localHand, &landed)) {
+            at.x = landed.x; at.y = landed.y; at.z = landed.z;
+        }
         BuildEdgeRec e;
         memset(&e, 0, sizeof(e));
         memcpy(e.hand, localHand, sizeof(e.hand));
         strncpy(e.sid, sid, sizeof(e.sid) - 1);
         e.sid[sizeof(e.sid) - 1] = '\0';
-        e.x = pos.x; e.y = pos.y; e.z = pos.z; e.yaw = yaw;
+        e.x = at.x; e.y = at.y; e.z = at.z; e.yaw = yaw;
         e.fromUi = 0;
         if (g_buildEdges.size() < 32) g_buildEdges.push_back(e);
         return 1;

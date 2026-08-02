@@ -243,7 +243,8 @@ private:
         float want = 0.5f * (float)rampStep_;
         if (want > 1.0f) want = 1.0f;
         engine::BuildRead post;
-        int ok = engine::writeBuildProgressByHand(buildHand_, want, &post) ? 1 : 0;
+        int ok = engine::writeBuildProgressByHand(buildHand_, want,
+                                                   want >= 1.0f, &post) ? 1 : 0;
         if (ok && post.complete) buildDone_ = true;
         char b[176];
         _snprintf(b, sizeof(b) - 1,
@@ -980,9 +981,9 @@ public:
                 ++rampStep_;
                 nextRampMs_ = ctx.elapsedMs + RAMP_STEP_MS;
                 engine::BuildRead post;
-                int ok = engine::writeBuildProgressByHand(ownHand_,
-                                                          0.25f * (float)rampStep_,
-                                                          &post) ? 1 : 0;
+                int ok = engine::writeBuildProgressByHand(
+                             ownHand_, 0.25f * (float)rampStep_,
+                             0.25f * (float)rampStep_ >= 1.0f, &post) ? 1 : 0;
                 char b[160];
                 _snprintf(b, sizeof(b) - 1,
                           "SCENARIO SAVEPROG step=%u ok=%d prog=%.3f t=%lu",

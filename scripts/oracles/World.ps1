@@ -1191,6 +1191,56 @@ function Get-BuildSeries {
 
 $script:BuildPlaceRegex = "SCENARIO BUILDPLACE who=(host|join) rc=(-?\d+) ok=(\d) sid='([^']*)' hand=([\d.]+) pos=\(([^)]*)\) yaw=([-\d.]+) t=(\d+)"
 $script:BuildProgRegex  = "SCENARIO BUILDPROG who=(host|join) step=(\d+) write=([-\d.]+) ok=(\d) prog=([-\d.]+) complete=(-?\d+) t=(\d+)"
+# Every mint reports the Y the caller asked for and the Y the terrain gave it.
+# `ground=` (the terrain height the mint subtracted, plus a resolved flag) is
+# optional so this still parses a build from before that field existed - the
+# height check below is what decides those, not the regex.
+$script:BuildMintOkRegex = "\[build\] mint OK sid='([^']*)' completed=(\d) hand=([\d.]+)\((\d)\) pos=([-\d.]+),([-\d.]+),([-\d.]+) wantY=([-\d.]+) dy=([-\d.]+)(?: ground=([-\d.]+)\((\d)\))? prog="
+
+# A building nobody can see is the failure players actually report, and the only
+# way it shows up in a log is a mint that landed somewhere other than where the
+# placer put it. createBuilding ADDS terrain height to the Y it is handed, so
+# forwarding the placer's absolute Y put peer copies a full terrain-height into
+# the sky (~1555 units on the 'sync' save) while every log line still said rc=1.
+# Gate the landing, not the return code.
+function Test-BuildMintHeights {
+    param([string]$File, [string]$Side, [double]$TolY = 8.0)
+    $why = @()
+    $checked = 0
+    # Only PEER mints make a co-location claim. A LOCAL placement's requested Y
+    # is the leader anchor's, which sits tens of units above the ground the
+    # building grounds to, so its dy is noise. A sync mint's requested Y came
+    # off the wire as the placer's real building position, so its dy is the
+    # answer to "is this in the same place on both screens".
+    $syncHands = @{}
+    $mintRx = "\[build\] MINT key=[\d.]+ sid='[^']*' ui=\d rc=1 local=([\d.]+)"
+    foreach ($m in @(Select-String -Path $File -Pattern $mintRx -ErrorAction SilentlyContinue)) {
+        $syncHands[$m.Matches[0].Groups[1].Value] = $true
+    }
+    if ($syncHands.Count -eq 0) { return @{ Why = $why; Checked = 0 } }
+    # Count sync mints the loose way too: a mint line carrying no wantY/dy is a
+    # PRE-FIX build, and reporting "0 violations" for it would pass this gate on
+    # no evidence at all - the exact shape of green run this bug hid behind.
+    $loose = 0
+    foreach ($m in @(Select-String -Path $File -Pattern "\[build\] mint OK sid='[^']*' completed=\d hand=([\d.]+)\(" -ErrorAction SilentlyContinue)) {
+        if ($syncHands.ContainsKey($m.Matches[0].Groups[1].Value)) { $loose++ }
+    }
+    foreach ($m in @(Select-String -Path $File -Pattern $script:BuildMintOkRegex -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups
+        $sid = $g[1].Value; $hand = $g[3].Value
+        if (-not $syncHands.ContainsKey($hand)) { continue }
+        $landedY = [double]$g[6].Value; $wantY = [double]$g[8].Value
+        $dy = [double]$g[9].Value
+        $checked++
+        if ([Math]::Abs($dy) -gt $TolY) {
+            $why += "$Side peer-mint sid='$sid' hand=$hand landed $([Math]::Round($dy,1)) off in Y (wantY=$wantY landedY=$landedY, tol=$TolY) - not co-located with the placer's building"
+        }
+    }
+    if ($loose -gt 0 -and $checked -eq 0) {
+        $why += "$Side logged $loose peer-mint(s) with no wantY/dy - height unverifiable (stale build?)"
+    }
+    return @{ Why = $why; Checked = $checked }
+}
 
 # build_probe (protocol 27 phase 0): placed-building baseline diagnostic
 # (buildSync forced OFF). Gates that both sides ATTEMPTED the programmatic
@@ -1265,7 +1315,11 @@ function Test-BuildProbe {
 #   2. each placement was MINTED on the peer (a "[build] MINT key=<placer
 #      hand> ... rc=1" with the placer's key);
 #   3. the placer's progress ramp CROSSED: the peer applied at least one
-#      STATE row for that key (ok=1) and observed the complete=1 latch.
+#      STATE row for that key (ok=1) and observed the complete=1 latch;
+#   4. every mint LANDED where its caller asked (|dy| within tolerance) - a
+#      mint can return rc=1, apply progress and latch complete while sitting
+#      hundreds of units above the ground, which is invisible to the player and
+#      was invisible to steps 1-3 as well.
 function Test-BuildSync {
     param([string]$HostFile, [string]$JoinFile)
     $why = @()
@@ -1300,11 +1354,24 @@ function Test-BuildSync {
         Write-Host "    FINDING: $side key=$key minted on peer (local=$($mint.Matches[0].Groups[2].Value)), applied rows=$($applied.Count), complete latched"
     }
 
+    # 4. every mint on either client must have landed at the height it asked for.
+    $hY = Test-BuildMintHeights -File $HostFile -Side 'host'
+    $jY = Test-BuildMintHeights -File $JoinFile -Side 'join'
+    $offY = @($hY.Why) + @($jY.Why)
+    $checkedY = $hY.Checked + $jY.Checked
+    $why += $offY
+    # Each minted key should have produced a height-checked mint on the peer; if
+    # none did, the height leg measured nothing and must not report success.
+    if ($minted -gt 0 -and $checkedY -eq 0) {
+        $why += "no mint height was verified despite minted=$minted - the height gate measured nothing"
+    }
+
     $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
     $detail = $why -join "; "
-    Write-Host "  BUILD-SYNC $v - minted=$minted crossed=$crossed $detail"
+    Write-Host "  BUILD-SYNC $v - minted=$minted crossed=$crossed checkedY=$checkedY offY=$($offY.Count) $detail"
     return (Add-GateResult -Name "build_sync" -Status $v `
-                -Metrics @{ minted = $minted; crossed = $crossed } -Detail $detail)
+                -Metrics @{ minted = $minted; crossed = $crossed
+                            checkedY = $checkedY; offY = $offY.Count } -Detail $detail)
 }
 
 # Parse the 1 Hz SCENARIO BDOOR census into doorHand -> ordered samples

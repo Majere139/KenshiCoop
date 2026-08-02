@@ -1504,6 +1504,11 @@ void mainLoop_hook(GameWorld* gw, float dt) {
     // packets + file IO + loadSave, never cached world pointers.
     const bool worldLive = g_gameStarted && coop::engine::gameplayLive(gw);
 
+    // Build capture runs inside an engine factory call, not on our tick, so it
+    // needs worldLive handed to it: a world load creates every building in the
+    // save through that same factory and none of them are player placements.
+    coop::engine::setBuildCaptureArmed(worldLive);
+
     // Replication publish (pre-engine, worldLive-gated): ingest received targets,
     // then stream every owned channel so applied state is current this tick.
     tickReplicatePublish(gw, worldLive);
@@ -2035,16 +2040,16 @@ void installEngineDetours() {
             coopLog("[recruit] FAILED to install recruit detour; recruitment sync degraded (no local-edge detection)");
     }
 
-    // Build-placement observability (protocol 27): detour PreviewBuilding::
-    // placeFinalPreviewBuilding so every REAL build-mode commit logs its
-    // template + transform + runtime hand ("[build] LOCAL-PLACE") and queues
-    // an edge for the sync layer. Installed for the sync AND for build_probe
-    // (which measures the unsynced baseline but wants the UI-edge evidence).
+    // Build-placement observability (protocol 27): detour RootObjectFactory::
+    // createBuilding so every REAL build-mode commit logs its template +
+    // transform + runtime hand ("[build] LOCAL-PLACE") and queues an edge for
+    // the sync layer. Installed for the sync AND for build_probe (which
+    // measures the unsynced baseline but wants the placement evidence).
     if (g_cfg.buildSync || g_cfg.scenario == "build_probe") {
         if (coop::engine::installBuildHook())
-            coopLog("[build] placeFinalPreviewBuilding detour installed; placement logging ON");
+            coopLog("[build] createBuilding capture installed; placement logging ON");
         else
-            coopLog("[build] FAILED to install placement detour; placement logging degraded");
+            coopLog("[build] FAILED to install placement capture; placement sync OFF");
     }
 
     // Dismantle observability (protocol 28): detour Building::

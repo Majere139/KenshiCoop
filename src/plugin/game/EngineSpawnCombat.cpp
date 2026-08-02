@@ -1232,7 +1232,13 @@ static bool isWorkFixtureTask(int task) {
         case PRETEND_TO_OPERATE_MACHINERY:
             return true;
         default:
-            return false;
+            // A construction site (BUILD / JOB_BUILDER) is identity-trusted for
+            // the SAME reason as a mine: it is a unique building and the sync
+            // layer hands us the LOCAL hand for it (translated from the placer's
+            // key), so if it resolved at all it is the right one. Distance-gating
+            // it would reject correct large sites, whose origin sits well away
+            // from where the builder actually stands.
+            return isBuildSiteTask(task);
     }
 }
 

@@ -251,7 +251,8 @@ private:
         float want = 0.25f * (float)rampStep_;
         if (want > 1.0f) want = 1.0f;
         engine::BuildRead post;
-        int ok = engine::writeBuildProgressByHand(ownHand_, want, &post) ? 1 : 0;
+        int ok = engine::writeBuildProgressByHand(ownHand_, want,
+                                                  want >= 1.0f, &post) ? 1 : 0;
         if (ok && post.complete) rampDoneOk_ = true;
         char b[192];
         _snprintf(b, sizeof(b) - 1,
@@ -398,7 +399,8 @@ private:
         float want = 0.25f * (float)rampStep_;
         if (want > 1.0f) want = 1.0f;
         engine::BuildRead post;
-        int ok = engine::writeBuildProgressByHand(ownHand_, want, &post) ? 1 : 0;
+        int ok = engine::writeBuildProgressByHand(ownHand_, want,
+                                                  want >= 1.0f, &post) ? 1 : 0;
         if (ok && post.complete) rampDoneOk_ = true;
         char b[192];
         _snprintf(b, sizeof(b) - 1,
@@ -644,11 +646,11 @@ private:
         if (want > 1.0f) want = 1.0f;
         engine::BuildRead post;
         if (placeGenOk_ && !rampGenDone_) {
-            if (engine::writeBuildProgressByHand(genHand_, want, &post) &&
+            if (engine::writeBuildProgressByHand(genHand_, want, want >= 1.0f, &post) &&
                 post.complete) rampGenDone_ = true;
         }
         if (placeBenchOk_ && !rampBenchDone_) {
-            if (engine::writeBuildProgressByHand(benchHand_, want, &post) &&
+            if (engine::writeBuildProgressByHand(benchHand_, want, want >= 1.0f, &post) &&
                 post.complete) rampBenchDone_ = true;
         }
         char b[160];
@@ -1089,11 +1091,11 @@ private:
         if (want > 1.0f) want = 1.0f;
         engine::BuildRead post;
         if (placeBenchOk_ && !rampBenchDone_) {
-            if (engine::writeBuildProgressByHand(benchHand_, want, &post) &&
+            if (engine::writeBuildProgressByHand(benchHand_, want, want >= 1.0f, &post) &&
                 post.complete) rampBenchDone_ = true;
         }
         if (placeChestOk_ && !rampChestDone_) {
-            if (engine::writeBuildProgressByHand(chestHand_, want, &post) &&
+            if (engine::writeBuildProgressByHand(chestHand_, want, want >= 1.0f, &post) &&
                 post.complete) rampChestDone_ = true;
         }
         char b[160];

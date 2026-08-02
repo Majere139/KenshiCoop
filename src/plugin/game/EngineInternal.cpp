@@ -955,45 +955,125 @@ typedef void     (__fastcall* AddCharacterAtFn)(ActivePlatoon* self,
 PlayerFactionFn  g_playerFactionFn = 0;
 AddCharacterAtFn g_addCharacterAtFn = 0;
 
-// Build-placement edge detour (protocol 27). PreviewBuilding::
-// placeFinalPreviewBuilding is the ONE engine path a player's build-mode
-// commit lands on: it constructs the real Building and parks it in
-// `justBeenBuilt`. A placed building is a RUNTIME object (host-only hand -
-// the protocol-21 identity problem for structures), so the peer can never
-// resolve it from its save; the detour captures every successful placement
-// (template sid + transform + the placer's local hand as the wire key) into
-// a small queue the Replicator drains once per tick into PKT_BUILD_PLACE.
-// Engine tick and plugin tick share the main thread - no lock needed.
+// Build-placement edge capture (protocol 27). A placed building is a RUNTIME
+// object (host-only hand - the protocol-21 identity problem for structures), so
+// the peer can never resolve it from its save; capture describes every local
+// placement (template sid + landed transform + the placer's local hand as the
+// wire key) into a small queue the Replicator drains once per tick into
+// PKT_BUILD_PLACE. Engine tick and plugin tick share the main thread - no lock.
 std::vector<BuildEdgeRec> g_buildEdges;
+
+// Set from the plugin tick to the same worldLive it gates replication on, so
+// capture is deaf during world load and world swaps (when the engine creates
+// every building in the save) and awake only during live gameplay.
+bool g_buildCaptureArmed = false;
+void setBuildCaptureArmed(bool armed) { g_buildCaptureArmed = armed; }
+
+// Creating ONE building can create more: a multi-storey commit nests a
+// createBuilding per floor inside the outermost call. Only the outermost is the
+// player's intent - the peer's engine performs the identical nesting when it
+// mints, so capturing the inner ones too would mint them a second time.
+int g_buildCaptureDepth = 0;
+// Non-zero while WE are the ones creating (a peer-driven mint, or a probe
+// placement that queues its own edge). Our top-level call already bypasses the
+// hook via the trampoline, but the engine's NESTED calls re-enter it, and those
+// are what echoed a minted building straight back to the placer.
+int g_buildCaptureSuppress = 0;
+
+// Describe a building that was just created locally. Reads the LANDED transform
+// off the object itself rather than whatever was requested, so the peer aims at
+// where the building really ended up. Caller holds SEH.
+static void queueLocalBuildEdge(Building* b, int floorNum) {
+    BuildEdgeRec e;
+    memset(&e, 0, sizeof(e));
+    RootObject* ro = static_cast<RootObject*>(b);
+    GameData* gd = ro->getGameData();
+    if (gd) {
+        strncpy(e.sid, gd->stringID.c_str(), sizeof(e.sid) - 1);
+        e.sid[sizeof(e.sid) - 1] = '\0';
+    }
+    // Every way capture can decline to stream gets its own line: a player who
+    // built something the peer never saw must be diagnosable from one log.
+    if (!readObjectHand(ro, e.hand)) {
+        char nb[176];
+        _snprintf(nb, sizeof(nb) - 1,
+                  "[build] LOCAL-PLACE-NOHAND sid='%s' "
+                  "(hand unreadable - no wire key, nothing can stream)",
+                  e.sid);
+        nb[sizeof(nb) - 1] = '\0'; coop::logLine(nb);
+        return;
+    }
+    Ogre::Vector3 p = ro->getPosition();
+    e.x = p.x; e.y = p.y; e.z = p.z;
+    e.yaw = ro->getOrientation().getYaw().valueRadians();
+    e.floorNum = floorNum;
+    e.fromUi = 1;
+    if (g_buildEdges.size() >= 32) {
+        coop::logLine("[build] LOCAL-PLACE-DROP edge queue full (32) "
+                      "- this placement will never stream");
+        return;
+    }
+    g_buildEdges.push_back(e);
+    char lb[240];
+    _snprintf(lb, sizeof(lb) - 1,
+              "[build] LOCAL-PLACE ui=1 sid='%s' hand=%u.%u.%u.%u.%u "
+              "pos=%.1f,%.1f,%.1f yaw=%.2f floor=%d",
+              e.sid, e.hand[0], e.hand[1], e.hand[2], e.hand[3], e.hand[4],
+              e.x, e.y, e.z, e.yaw, e.floorNum);
+    lb[sizeof(lb) - 1] = '\0'; coop::logLine(lb);
+}
+
+// RootObjectFactory::createBuilding is the choke point EVERY building creation
+// passes through, which is why capture lives here: it needs no PreviewBuilding
+// field offsets. The previous capture point (the placeFinalPreviewBuilding
+// detour, reading PreviewBuilding::justBeenBuilt) read 0 for placements that
+// visibly succeeded on screen, so every real player build was silently dropped
+// and nothing ever streamed - see placeFinal_hook below.
+CreateBuildingFn g_createBldgOrig = 0;
+Building* __fastcall createBuilding_hook(
+    RootObjectFactory* self, GameData* data, Ogre::Vector3 position, TownBase* t,
+    Faction* owner, Ogre::Quaternion rotation, FactoryCallbackInterface* cb,
+    Layout* furnitureOf, Building* isDoorOf, GameSaveState* saveState,
+    Building* isIndoorsOf, bool invisible, bool completed, bool isFoliage,
+    int floorNumber, bool isOutsideFurniture) {
+    ++g_buildCaptureDepth;
+    Building* b = g_createBldgOrig(self, data, position, t, owner, rotation, cb,
+                                   furnitureOf, isDoorOf, saveState, isIndoorsOf,
+                                   invisible, completed, isFoliage, floorNumber,
+                                   isOutsideFurniture);
+    --g_buildCaptureDepth;
+    __try {
+        // A player's build-mode commit is the creation that is a BRAND-NEW
+        // VISIBLE construction site: buildings restored from the save carry a
+        // saveState, finished structures arrive completed, and foliage and
+        // invisible helpers are not things a peer places.
+        if (!b || saveState || completed || invisible || isFoliage ||
+            !g_buildCaptureArmed)
+            return b;
+        // Depth 0 here means the call we just ran was the OUTERMOST one, so
+        // this is the commit itself and not a floor the engine nested inside
+        // it. Suppression covers the creations we drive ourselves.
+        if (g_buildCaptureDepth != 0 || g_buildCaptureSuppress) return b;
+        queueLocalBuildEdge(b, floorNumber);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return b;
+}
+
+// Diagnostic ONLY - capture moved to createBuilding_hook. This still marks the
+// player's build-mode commit in the log next to the edge the factory hook
+// queued, and reports whether justBeenBuilt was readable, so the layout
+// assumption that broke placement sync stays visible instead of being
+// rediscovered later.
 typedef void (__fastcall* PlaceFinalFn)(PreviewBuilding* self);
 PlaceFinalFn g_placeFinalOrig = 0;
 void __fastcall placeFinal_hook(PreviewBuilding* self) {
     g_placeFinalOrig(self);
     __try {
         if (!self) return;
-        Building* b = self->justBeenBuilt;
-        if (!b) return; // commit refused (placement rules) - nothing placed
-        BuildEdgeRec e;
-        memset(&e, 0, sizeof(e));
-        RootObject* ro = static_cast<RootObject*>(b);
-        if (!readObjectHand(ro, e.hand)) return;
-        GameData* gd = ro->getGameData();
-        if (gd) {
-            strncpy(e.sid, gd->stringID.c_str(), sizeof(e.sid) - 1);
-            e.sid[sizeof(e.sid) - 1] = '\0';
-        }
-        Ogre::Vector3 p = ro->getPosition();
-        e.x = p.x; e.y = p.y; e.z = p.z;
-        e.yaw = self->yaw;
-        e.floorNum = self->floorNum;
-        e.fromUi = 1;
-        if (g_buildEdges.size() < 32) g_buildEdges.push_back(e);
-        char lb[224];
-        _snprintf(lb, sizeof(lb) - 1,
-                  "[build] LOCAL-PLACE ui=1 sid='%s' hand=%u.%u.%u.%u.%u pos=%.1f,%.1f,%.1f yaw=%.2f floor=%d",
-                  e.sid, e.hand[0], e.hand[1], e.hand[2], e.hand[3], e.hand[4],
-                  e.x, e.y, e.z, e.yaw, e.floorNum);
-        lb[sizeof(lb) - 1] = '\0'; coop::logLine(lb);
+        char b[112];
+        _snprintf(b, sizeof(b) - 1, "[build] UI-COMMIT justBeenBuilt=%d",
+                  self->justBeenBuilt ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
@@ -1163,6 +1243,10 @@ typedef Building* (__fastcall* CreateBuildingFn)(
     Layout* furnitureOf, Building* isDoorOf, GameSaveState* saveState,
     Building* isIndoorsOf, bool invisible, bool completed, bool isFoliage,
     int floorNumber, bool isOutsideFurniture);
+// Terrain height under an x/z. createBuilding treats position.y as an offset
+// ABOVE this, so a peer minting the placer's absolute Y must subtract it.
+// Static (not a member), so it resolves and calls like a plain function.
+typedef float (*TerrainHeightFn)(float x, float z);
 typedef void (__fastcall* GetDataOfTypeFn)(
     GameDataContainer* self, lektor<GameData*>* list, itemType type);
 // RootObjectFactory::create - the GENERIC "spawn any RootObject into the world at a
@@ -1218,6 +1302,7 @@ typedef bool  (__fastcall* RelBoolFn)(FactionRelations* self, Faction* c);
 
 CreateCharFn     g_createCharFn   = 0;
 CreateBuildingFn g_createBldgFn   = 0;
+TerrainHeightFn  g_terrainHeightFn = 0;
 CreateObjFn      g_createObjFn    = 0; // Phase W1 world-item proxy spawn
 DestroyObjFn     g_destroyObjFn   = 0; // Phase W1 world-item proxy cull
 GetDataOfTypeFn  g_getDataOfTypeFn = 0;
@@ -1549,6 +1634,10 @@ void resolve() {
         &RootObjectFactory::createRandomCharacter);
     g_createBldgFn = (CreateBuildingFn)KenshiLib::GetRealAddress(
         &RootObjectFactory::createBuilding);
+    // Non-fatal: unresolved -> peer mints fall back to grounding at x/z, which
+    // is right on flat terrain and drops the copy low on a slope.
+    g_terrainHeightFn = (TerrainHeightFn)KenshiLib::GetRealAddress(
+        &UtilityT::getTerrainHeight);
     // Phase W1 world-item proxy spawn/cull (non-fatal: unresolved -> world-item sync off).
     g_createObjFn = (CreateObjFn)KenshiLib::GetRealAddress(&RootObjectFactory::create);
     g_destroyObjFn = (DestroyObjFn)KenshiLib::GetRealAddress(
@@ -2027,11 +2116,25 @@ bool installRecruitHook() {
 }
 
 bool installBuildHook() {
+    // The FUNCTIONAL capture is the factory choke point; the preview detour is
+    // diagnostic only. Point our own createBuilding calls at the trampoline so
+    // peer-side mints and probe placements bypass the hook entirely - that is
+    // the echo suppression, and it needs no in-flight flag.
+    intptr_t cAddr = KenshiLib::GetRealAddress(&RootObjectFactory::createBuilding);
+    bool captured = false;
+    if (cAddr &&
+        KenshiLib::AddHook(cAddr, (void*)&createBuilding_hook,
+                           (void**)&g_createBldgOrig) == KenshiLib::SUCCESS &&
+        g_createBldgOrig) {
+        g_createBldgFn = g_createBldgOrig;
+        captured = true;
+    }
     intptr_t addr = KenshiLib::GetRealAddress(
         &PreviewBuilding::_NV_placeFinalPreviewBuilding);
-    if (!addr) return false;
-    return KenshiLib::AddHook(addr, (void*)&placeFinal_hook,
-                              (void**)&g_placeFinalOrig) == KenshiLib::SUCCESS;
+    if (addr)
+        KenshiLib::AddHook(addr, (void*)&placeFinal_hook,
+                           (void**)&g_placeFinalOrig);
+    return captured;
 }
 
 bool installDismantleHook() {

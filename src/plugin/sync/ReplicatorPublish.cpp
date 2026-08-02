@@ -156,6 +156,39 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
             coop::logLine(b);
         }
     }
+    // Build-site subject translation (2026-08-01 construction animation). Same
+    // shape as the combat rewrite above and for the same underlying reason: the
+    // capture reads the site's LOCAL hand, but a construction site is created at
+    // RUNTIME so that hand means nothing on the peer. Publish it in the PLACER's
+    // key space (our own hand if we placed it, the placer's key if we minted it)
+    // so the peer can map it back to its own copy. A subject that is not a placed
+    // site at all is left alone - a save-resident building resolves directly.
+    for (unsigned int i = 0; i < n; ++i) {
+        EntityState& e = buf[i];
+        if (!engine::isBuildSiteTask((int)e.task)) continue;
+        Key lk; lk.t = e.sType; lk.c = e.sContainer; lk.cs = e.sContainerSerial;
+        lk.i = e.sIndex; lk.s = e.sSerial;
+        Key wk;
+        if (!buildKeyForLocalHand(lk, wk)) continue;
+        if (wk.t == lk.t && wk.c == lk.c && wk.cs == lk.cs &&
+            wk.i == lk.i && wk.s == lk.s)
+            continue; // we placed it: local hand already is the wire key
+        char b[192]; _snprintf(b, sizeof(b) - 1,
+            "[build] POSE-CAP xlate hand=%u,%u task=%u site local=%u.%u.%u.%u.%u "
+            "-> wire=%u.%u.%u.%u.%u",
+            e.hIndex, e.hSerial, (unsigned)e.task,
+            lk.t, lk.c, lk.cs, lk.i, lk.s, wk.t, wk.c, wk.cs, wk.i, wk.s);
+        b[sizeof(b) - 1] = '\0';
+        e.sType = wk.t; e.sContainer = wk.c; e.sContainerSerial = wk.cs;
+        e.sIndex = wk.i; e.sSerial = wk.s;
+        // Throttle per site (the rewrite itself runs every publish frame).
+        unsigned long pNow = nowMs();
+        std::map<Key, unsigned long>::iterator pt = buildPoseCapMs_.find(wk);
+        if (pt == buildPoseCapMs_.end() || (pNow - pt->second) >= 2000) {
+            buildPoseCapMs_[wk] = pNow;
+            coop::logLine(b);
+        }
+    }
     // Capture-side combat visibility (join-initiated town combat investigation):
     // the receive side logs [combat] order when an intent ARRIVES, but nothing
     // ever recorded what this client SENDS - a fight that never crosses is

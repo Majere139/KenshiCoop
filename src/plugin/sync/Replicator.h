@@ -868,6 +868,8 @@ private:
     // (throttle). Records what this client SENDS on the wire - the missing
     // half of the audit trail for join-initiated fights.
     std::map<Key, unsigned long> combatCapMs_;
+    // Same throttle for the "[build] POSE-CAP xlate" line, keyed by wire site key.
+    std::map<Key, unsigned long> buildPoseCapMs_;
     u32                   nextEventId_;
     // Stage 6: world NPCs we've hidden+frozen on the join because the host isn't
     // streaming them. Keyed by hand so we restore the exact body when it re-enters
@@ -1505,6 +1507,19 @@ private:
     // in the placer's key space, and the protocol-26 filter recognize placed
     // doors by their parent hand.
     std::map<Key, Key> mintByLocal_;
+    // Build-site POSE subject translation (2026-08-01 construction animation).
+    // A placed site's hand differs per client, so a streamed BUILD/JOB_BUILDER
+    // pose whose subject is that site is meaningless on the peer unless it is
+    // carried in the placer's key space. These are the two directions:
+    //
+    //   buildKeyForLocalHand - PUBLISH: our builder's local subject -> wire key.
+    //     Only rewrites a hand we MINTED (mintByLocal_); a site WE placed is
+    //     already the key. Returns false when the subject is not a placed site
+    //     at all (a save-resident building), which needs no translation.
+    //   localHandForBuildKey - APPLY: wire key -> the hand that site has HERE,
+    //     whether we placed it (ownBuilds_) or minted it (peerBuilds_).
+    bool buildKeyForLocalHand(const Key& local, Key& outWire) const;
+    bool localHandForBuildKey(const Key& wire, unsigned int out[5]) const;
     u32           buildSeqOut_;
     unsigned long buildSampleMs_;
     bool          buildSync_;

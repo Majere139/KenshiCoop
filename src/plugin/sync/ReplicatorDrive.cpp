@@ -1764,29 +1764,79 @@ void Replicator::applyRest(Character* c, Driven& d, const EntityState& out,
             d.detached = engine::detachFromTownAI(c);
             if (d.detached) ++detachUses_;
         }
-        int r = engine::applyTaskOrder(c, out);
-        ++sitOrders_;
-        d.taskTick = now;
-        { char b[176]; _snprintf(b, sizeof(b) - 1,
-            "[pose] applyOrder hand=%u,%u task=%u subj=%u,%u,%u det=%d r=%d try=%u",
-            out.hIndex, out.hSerial, (unsigned)out.task,
-            out.sIndex, out.sSerial, out.sType, d.detached ? 1 : 0, r,
-            d.taskRetries);
-          b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
-        if (r == 2) { d.taskApplied = true; d.taskRetries = 0; } // posed at the fixture
-        else if (r == 1) d.taskBad = true; // fixture not loaded here -> park
-        else if (r == 3) {
-            // Far fixture: usually the interp target lagging a snap-into-fixture
-            // on the owner (bed entry teleports the body instantly). The park
-            // drive converges the body meanwhile; retry until the gate passes,
-            // latch bad only when the mismatch persists (genuinely wrong fixture).
-            if (++d.taskRetries >= TASK_FAR_RETRY_MAX) d.taskBad = true;
+        // A construction site arrives in the PLACER's key space (its runtime hand
+        // differs per client - see buildKeyForLocalHand). Map it to the hand that
+        // site has HERE before ordering, or applyTaskOrder resolves nothing, the
+        // builder parks, and the body jitters with no construction animation.
+        const EntityState* posed = &out;
+        EntityState xlated;
+        bool siteUnresolved = false;
+        if (engine::isBuildSiteTask((int)out.task)) {
+            Key sk; sk.t = out.sType; sk.c = out.sContainer;
+            sk.cs = out.sContainerSerial; sk.i = out.sIndex; sk.s = out.sSerial;
+            unsigned int lh[5];
+            if (localHandForBuildKey(sk, lh)) {
+                xlated = out;
+                xlated.sType = lh[0]; xlated.sContainer = lh[1];
+                xlated.sContainerSerial = lh[2];
+                xlated.sIndex = lh[3]; xlated.sSerial = lh[4];
+                posed = &xlated;
+            } else {
+                siteUnresolved = true;
+            }
         }
-        // r <= 0 / -1: leave unapplied this frame; fall through to park.
+        if (siteUnresolved) {
+            // The PLACE row that mints this site rides a DIFFERENT channel, so a
+            // build pose can arrive first. Ordering the placer's untranslated hand
+            // would resolve nothing and latch taskBad, parking the builder for the
+            // whole construction - retry until the mint lands, and only give up on
+            // the same bounded streak a far fixture gets (a genuinely removed site
+            // never resolves).
+            d.taskTick = now;
+            if (++d.taskRetries >= TASK_FAR_RETRY_MAX) d.taskBad = true;
+            char b[176]; _snprintf(b, sizeof(b) - 1,
+                "[pose] build-site unresolved hand=%u,%u wire=%u.%u.%u.%u.%u try=%u bad=%d",
+                out.hIndex, out.hSerial, out.sType, out.sContainer,
+                out.sContainerSerial, out.sIndex, out.sSerial, d.taskRetries,
+                d.taskBad ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        } else {
+            int r = engine::applyTaskOrder(c, *posed);
+            ++sitOrders_;
+            d.taskTick = now;
+            { char b[208]; _snprintf(b, sizeof(b) - 1,
+                "[pose] applyOrder hand=%u,%u task=%u subj=%u,%u,%u wire=%u,%u det=%d r=%d try=%u",
+                out.hIndex, out.hSerial, (unsigned)out.task,
+                posed->sIndex, posed->sSerial, posed->sType,
+                out.sIndex, out.sSerial, d.detached ? 1 : 0, r,
+                d.taskRetries);
+              b[sizeof(b) - 1] = '\0'; coop::logLine(b); }
+            if (r == 2) { d.taskApplied = true; d.taskRetries = 0; } // posed at the fixture
+            else if (r == 1) d.taskBad = true; // fixture not loaded here -> park
+            else if (r == 3) {
+                // Far fixture: usually the interp target lagging a snap-into-fixture
+                // on the owner (bed entry teleports the body instantly). The park
+                // drive converges the body meanwhile; retry until the gate passes,
+                // latch bad only when the mismatch persists (genuinely wrong fixture).
+                if (++d.taskRetries >= TASK_FAR_RETRY_MAX) d.taskBad = true;
+            }
+            // r <= 0 / -1: leave unapplied this frame; fall through to park.
+        }
     }
     // Drift guard: a committed pose that wandered off the host transform (the
     // engine re-pathed the body to the fixture) is abandoned for a held park.
+    //
+    // EXCEPT a construction site (2026-08-01). Two builders working the same
+    // structure legitimately stand at DIFFERENT points on it - each client's
+    // engine picks its own work spot along the footprint, which for anything
+    // bigger than a shack exceeds TASK_DRIFT_MAX (field: 4.26 m apart on a
+    // two-storey against a 4.0 m limit). Drift is not evidence of a wrong
+    // fixture here the way it is for a seat: the site was resolved by explicit
+    // key translation, so it IS the right one. Abandoning it latches taskBad,
+    // which drops the builder back to the position drive - the jitter that
+    // reproducing this pose exists to remove.
     if (d.taskApplied && haveActual && (now - d.taskTick) > TASK_GRACE_MS &&
+        !engine::isBuildSiteTask((int)out.task) &&
         dist3(ax, ay, az, out.x, out.y, out.z) > TASK_DRIFT_MAX) {
         float dd = dist3(ax, ay, az, out.x, out.y, out.z);
         { char b[160]; _snprintf(b, sizeof(b) - 1,
