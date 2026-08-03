@@ -37,6 +37,59 @@ function Test-LogHealth {
                 -Metrics @{ errors = $errs.Count } -Detail ($why -join "; "))
 }
 
+# Engine-side bookkeeping integrity, read from the archived kenshi_info.log
+# (run_test.ps1 copies it as <label>_engine.log; absent for older runs -> SKIP).
+#
+# Two lines Kenshi prints when its object bookkeeping has been damaged:
+#   "<obj> was not removed from any zones"  - destroyed while a zone still holds
+#                                             a pointer to it (a dangling entry)
+#   "alredy has destroy reason <a> (<b>)"   - destroyed twice; the engine's typo
+#
+# The second names both destroy reasons, so a line mentioning "coop-" is one WE
+# caused - that is the tripwire, and it is what the 2026-08-03 join crash left
+# behind (a world-item proxy culled after its block had already unloaded).
+# Unattributed lines are reported but not judged: Kenshi does this on its own
+# too, and we have no baseline for how often.
+#
+# ADVISORY for now (not in the always-on gate list) precisely because that
+# baseline is missing. Promote it to gating once a full tier run shows the
+# coop-attributed count is reliably zero.
+function Test-EngineIntegrity {
+    param([string]$OutDir)
+    $gate  = "engine_integrity"
+    $dblRe = "al(?:ready|redy) has destroy reason"
+    $zoneRe = "was not removed from any zones"
+    $ours = @(); $dbl = 0; $zone = 0; $seen = 0
+    if ($OutDir -eq "" -or -not (Test-Path $OutDir)) {
+        return (Add-GateResult -Name $gate -Status SKIP -Detail "no run dir")
+    }
+    foreach ($label in @("host", "join")) {
+        $f = Join-Path $OutDir "${label}_engine.log"
+        if (-not (Test-Path $f)) { continue }
+        $seen++
+        foreach ($m in @(Select-String -Path $f -Pattern $dblRe -ErrorAction SilentlyContinue)) {
+            $dbl++
+            if ($m.Line -match "coop-") { $ours += "[$label] $($m.Line.Trim())" }
+        }
+        $zone += @(Select-String -Path $f -Pattern $zoneRe -ErrorAction SilentlyContinue).Count
+    }
+    if ($seen -eq 0) {
+        return (Add-GateResult -Name $gate -Status SKIP -Detail "no engine log archived")
+    }
+    $m = @{ doubleDestroy = $dbl; coopAttributed = $ours.Count; zoneLeak = $zone }
+    if ($ours.Count -gt 0) {
+        Write-Host "  ENGINE-INTEGRITY FAIL - $($ours.Count) object(s) destroyed twice with a coop reason"
+        foreach ($l in ($ours | Select-Object -First 5)) { Write-Host "      $l" }
+        return (Add-GateResult -Name $gate -Status FAIL -Metrics $m `
+                    -Detail "coop-attributed double destroy")
+    }
+    Write-Host "  ENGINE-INTEGRITY PASS - no coop-attributed double destroy (engine's own: doubleDestroy=$dbl, zoneLeak=$zone)"
+    if ($dbl -gt 0 -or $zone -gt 0) {
+        Write-Host "  FINDING: engine reported $dbl double-destroy and $zone zone-leak line(s) with no coop reason attached"
+    }
+    return (Add-GateResult -Name $gate -Status PASS -Metrics $m)
+}
+
 # Report any in-plugin "CHECK <key> FAIL" lines across both logs.
 function Test-NoCheckFail {
     param([string]$HostFile, [string]$JoinFile)

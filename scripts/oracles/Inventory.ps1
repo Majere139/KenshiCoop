@@ -830,6 +830,70 @@ function Test-WorldPickupMirror {
                             claimed = $claimed; applied = $applied })
 }
 
+# world_item_stale: the join's proxy is destroyed by the ENGINE (as a zone unload does)
+# and the mod must notice by re-resolving the proxy's hand rather than by touching the
+# object. What it must NOT do is the point, so the gate is mostly negative:
+#   no [wi] CLAIM        - the scenario contains no pickup, so any claim came from reading
+#                          isInInventory out of freed heap; the host answers a claim by
+#                          destroying its REAL item, which is this bug's quiet form
+#   no CLAIM-APPLY destroyed=1 - the host end of that same phantom
+#   [wi] PROXY-GONE      - positive proof the mod DETECTED the loss (an unresolvable hand),
+#                          rather than the run passing because nothing happened to look
+# SKIPs unless the staging held (host dropped + culled, join saw a proxy + evicted it):
+# a vacuous "no phantom claim" is trivially true when no proxy ever existed.
+# staleCull counts culls that arrived after the object was already gone; it is normally 0
+# because the publish sweep drops the mapping first, and it is reported, not required.
+function Test-WorldItemStale {
+    param([string]$HostFile, [string]$JoinFile)
+    $rx = 'SCENARIO WIS verdict role=(\w+) pass=(\d+) peak=(-?\d+) dropped=(-?\d+) evicted=(-?\d+) despawned=(-?\d+)'
+    $read = {
+        param($file)
+        $r = [pscustomobject]@{ found = $false; peak = 0; dropped = 0; evicted = 0; despawned = 0 }
+        if (-not (Test-Path $file)) { return $r }
+        $ln = Select-String -Path $file -Pattern $rx -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -eq $ln) { return $r }
+        $g = $ln.Matches[0].Groups
+        $r.found = $true; $r.peak = [int]$g[3].Value; $r.dropped = [int]$g[4].Value
+        $r.evicted = [int]$g[5].Value; $r.despawned = [int]$g[6].Value
+        return $r
+    }
+    $h = & $read $HostFile
+    $j = & $read $JoinFile
+    $staged = $h.found -and $j.found -and ($h.dropped -ge 1) -and ($h.despawned -ge 1) `
+              -and ($j.peak -ge 1) -and ($j.evicted -ge 1)
+    if (-not $staged) {
+        Write-Host "  WI-STALE SKIP - staging incomplete (host dropped=$($h.dropped) despawned=$($h.despawned); join proxyPeak=$($j.peak) evicted=$($j.evicted))"
+        Write-Host "    Nothing was made stale, so the negative assertions would pass vacuously."
+        return (Add-GateResult -Name "world_item_stale" -Status SKIP `
+                    -Metrics @{ hostDropped = $h.dropped; hostDespawned = $h.despawned
+                                joinPeak = $j.peak; joinEvicted = $j.evicted } `
+                    -Detail "staging incomplete")
+    }
+    $claim   = (Test-Path $JoinFile) -and (Select-String -Path $JoinFile -Pattern '\[wi\] CLAIM author=' -Quiet)
+    $applied = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[wi\] CLAIM-APPLY netId=\d+ .* destroyed=1' -Quiet)
+    $gone    = (Test-Path $JoinFile) -and (Select-String -Path $JoinFile -Pattern '\[wi\] PROXY-GONE' -Quiet)
+    $stale   = 0
+    if (Test-Path $JoinFile) {
+        $stale = @(Select-String -Path $JoinFile -Pattern '\[wi\] (CULL|MOVE) .* live=0' -ErrorAction SilentlyContinue).Count
+    }
+    $ok = (-not $claim) -and (-not $applied) -and $gone
+    Write-Host ("  WI-STALE " + $(if ($ok) { "PASS" } else { "FAIL" }) +
+                " - detected=$gone phantomClaim=$claim hostDestroyedReal=$applied staleCull=$stale")
+    if ($claim) {
+        Write-Host "    NOTE: the join claimed a pickup for a proxy the engine had already destroyed - a read off freed memory"
+    }
+    if ($applied) {
+        Write-Host "    NOTE: the host destroyed its REAL item answering that claim - the item is gone from both worlds"
+    }
+    if (-not $gone) {
+        Write-Host "    NOTE: no PROXY-GONE line - the mod never noticed the proxy died, so this run proves nothing"
+    }
+    return (Add-GateResult -Name "world_item_stale" -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
+                -Metrics @{ detected = $gone; phantomClaim = $claim; hostDestroyedReal = $applied
+                            staleCull = $stale; joinPeak = $j.peak; joinEvicted = $j.evicted
+                            hostDropped = $h.dropped; hostDespawned = $h.despawned })
+}
+
 # inv_regear (protocol 47): the ONE-INSTANCE invariant across a full W2 round trip. Both
 # halves must hold, because either alone is satisfied by a broken outcome:
 #   host grndFinal=0  - our ground copy was retired ... but on its own, losing the item does that

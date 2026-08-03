@@ -1008,8 +1008,145 @@ private:
 };
 const float WorldItemBurstScenario::RADIUS = 60.0f;
 
+// world_item_stale (a proxy pointer outliving its object): the join holds each
+// host-authored ground item as a raw RootObject*, but the ENGINE owns when that
+// object dies - a zone block deactivating destroys everything standing in it,
+// which is exactly what happens once the players travel out of the block. The
+// 2026-08-03 join crash was the mod then culling, moving and READING that freed
+// object; the quiet form is a stale isInInventory read out of freed heap making
+// the join report a pickup, so the host destroys a real item nobody touched.
+//
+// Staging the literal zone unload would need both squads to leave the block AND
+// the deactivation countdown to expire on the JOIN strictly before the host
+// notices its own copy is gone. That is a race between two engines running the
+// same timer, so a test built on it is a coin flip. This evicts the proxy
+// directly instead: the join calls destroyWorldItemsNear, the same
+// GameWorld::destroy the zone teardown uses, which leaves the mod's map pointing
+// at freed memory with nothing having told it - the state, reached deterministically.
+// The host then culls the real item, so a REMOVE arrives for an object already gone.
+//
+// The scenario only stages; the assertions are the oracle's, because they are
+// about what the mod did NOT do (no CLAIM off a dead read, no second destroy).
+// Needs KENSHICOOP_INV_DUMP=1 (manifest DiagEnv) for the [wi] trace lines.
+class WorldItemStaleScenario : public Scenario {
+public:
+    WorldItemStaleScenario()
+        : passed_(false), have_(false), step_(0), lastSampleMs_(0), seeded_(0),
+          dropped_(0), type_(0), evicted_(0), despawned_(0), peak_(0),
+          sawProxy_(false) {
+        for (int i = 0; i < 5; ++i) hand_[i] = 0;
+        sid_[0] = '\0';
+    }
+
+    virtual const char* name() const { return "world_item_stale"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        have_ = engine::pickInventoryContainer(ctx.gw, hand_);
+        // Both sides resolve the same template from the same gamedata, so the
+        // join can count the item without being told what to look for.
+        engine::commonTestItemSid(ctx.gw, sid_, sizeof(sid_), &type_);
+        char b[200];
+        _snprintf(b, sizeof(b) - 1,
+            "SCENARIO WIS anchor host=%d have=%d sid='%s' type=%u",
+            ctx.isHost ? 1 : 0, have_ ? 1 : 0, sid_[0] ? sid_ : "(none)", type_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (sid_[0] && (ctx.elapsedMs - lastSampleMs_ >= 250 || lastSampleMs_ == 0)) {
+            lastSampleMs_ = ctx.elapsedMs;
+            int n = engine::countFreeGroundItemsNear(ctx.gw, hand_, sid_, type_, RADIUS);
+            if (n > peak_) peak_ = n;
+            if (n >= 1) sawProxy_ = true;
+            char b[176];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO WIS %s t=%lu ground=%d peak=%d",
+                      ctx.isHost ? "HOST" : "JOIN", (unsigned long)ctx.elapsedMs, n, peak_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        if (ctx.isHost && have_ && step_ == 0 && ctx.elapsedMs >= DROP_MS) {
+            step_ = 1;
+            seeded_ = engine::addTestItemsToContainer(ctx.gw, hand_, 1, sid_, sizeof(sid_));
+            InvItemEntry items[INV_ITEMS_MAX];
+            unsigned int n = engine::captureContainerContents(ctx.gw, hand_, items, INV_ITEMS_MAX, 0);
+            for (unsigned int i = 0; i < n; ++i)
+                if (!items[i].equipped && strcmp(items[i].stringID, sid_) == 0) {
+                    type_ = items[i].itemType; break;
+                }
+            dropped_ = engine::dropItemFromInventory(ctx.gw, hand_, sid_, type_, 1);
+            char b[200];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO WIS DROP seeded=%d dropped=%d sid='%s' type=%u",
+                      seeded_, dropped_, sid_[0] ? sid_ : "(none)", type_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        // JOIN: destroy the proxy the way a zone teardown would - through the
+        // engine, with the mod none the wiser. Everything the mod does with that
+        // pointer from here on is the thing under test.
+        if (!ctx.isHost && step_ == 0 && ctx.elapsedMs >= EVICT_MS) {
+            step_ = 1;
+            evicted_ = engine::destroyWorldItemsNear(ctx.gw, RADIUS);
+            char b[200];
+            _snprintf(b, sizeof(b) - 1,
+                "SCENARIO WIS EVICT destroyed=%d sawProxy=%d "
+                "(engine destroy behind the mod's back)",
+                evicted_, sawProxy_ ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        // HOST: now cull the real item, so the join's cull lands on the corpse.
+        if (ctx.isHost && step_ == 1 && ctx.elapsedMs >= DESPAWN_MS) {
+            step_ = 2;
+            despawned_ = engine::destroyWorldItemsNear(ctx.gw, RADIUS);
+            char b[144];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO WIS DESPAWN destroyed=%d", despawned_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (ctx.elapsedMs >= dur) {
+            // Both legs only assert the STAGING: the host authored an item and
+            // then culled it, the join saw a proxy and then had it destroyed
+            // underneath. Whether the mod handled that is judged from the log.
+            if (ctx.isHost) passed_ = have_ && (dropped_ > 0) && (despawned_ > 0);
+            else            passed_ = sawProxy_ && (evicted_ > 0);
+            char b[240];
+            _snprintf(b, sizeof(b) - 1,
+                "SCENARIO WIS verdict role=%s pass=%d peak=%d dropped=%d "
+                "evicted=%d despawned=%d",
+                ctx.isHost ? "host" : "join", passed_ ? 1 : 0, peak_, dropped_,
+                evicted_, despawned_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long DROP_MS          = 5000;
+    static const unsigned long EVICT_MS         = 13000; // proxy minted and settled
+    static const unsigned long DESPAWN_MS       = 20000; // strictly after the eviction
+    static const unsigned long HOST_DURATION_MS = 34000;
+    static const unsigned long JOIN_DURATION_MS = 30000;
+    static const float         RADIUS;
+    bool          passed_, have_;
+    int           step_;
+    unsigned long lastSampleMs_;
+    int           seeded_, dropped_;
+    unsigned int  type_;
+    int           evicted_, despawned_;
+    int           peak_;
+    bool          sawProxy_;
+    unsigned int  hand_[5];
+    char          sid_[48];
+};
+const float WorldItemStaleScenario::RADIUS = 60.0f;
+
 Scenario* makeWorldItemScenario(const std::string& name) {
     if (name == "drop_probe")   return new DropProbeScenario();
+    if (name == "world_item_stale") return new WorldItemStaleScenario();
     if (name == "world_item_burst") return new WorldItemBurstScenario();
     if (name == "world_item_sync") return new WorldItemSyncScenario();
     if (name == "world_item_drop") return new WorldItemDropScenario();

@@ -65,7 +65,8 @@ Write-Host ""
 $expSkew = if ($ExpectedSkewMs -ne "") { [int]$ExpectedSkewMs } else { $null }
 $verdict = Invoke-RunAnalysis -HostLog $HostLog -JoinLog $JoinLog -Scenario $Scenario `
               -Tolerance $Tolerance -JoinExpected ($JoinLog -ne "") `
-              -RunInfo @{ offline = $true; hostLog = $HostLog; joinLog = $JoinLog } `
+              -RunInfo @{ offline = $true; hostLog = $HostLog; joinLog = $JoinLog
+                          outDir = $RunDir } `
               -ExpectedSkewMs $expSkew -WanActive ([bool]$WanActive) -OutJson $OutJson
 
 Write-Host ""

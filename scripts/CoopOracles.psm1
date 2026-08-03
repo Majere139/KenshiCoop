@@ -197,6 +197,7 @@ function Invoke-OneOracle {
         "gear_repickup_recover" { return (Test-GearRepickup -HostFile $HostLog -JoinFile $JoinLog `
                                             -GateName "gear_repickup_recover" -RequireSiteRecovery) }
         "world_item_burst" { return (Test-WorldItemBurst -HostFile $HostLog -JoinFile $JoinLog) }
+        "world_item_stale" { return (Test-WorldItemStale -HostFile $HostLog -JoinFile $JoinLog) }
         "nested_bag"    { return (Test-NestedBag       -HostFile $HostLog -JoinFile $JoinLog) }
         "dump_all"      { return (Test-DumpAll         -HostFile $HostLog -JoinFile $JoinLog) }
         "no_phantom_pickups" { return (Test-NoPhantomPickups -HostFile $HostLog -JoinFile $JoinLog) }
@@ -269,6 +270,14 @@ function Invoke-RunAnalysis {
     [void](Test-LogHealth -File $HostLog -Label "host" -Required $true -CleanPattern $cleanPattern)
     [void](Test-LogHealth -File $JoinLog -Label "join" -Required $JoinExpected -CleanPattern $cleanPattern)
 
+    # 1a. Engine bookkeeping integrity (always). Reads the archived kenshi_info.log,
+    # so it SKIPs on runs predating the archiving and on log-only re-judges - but it
+    # always registers a result, because a scenario is allowed to gate on it and a
+    # gate with no result at all reads as "missing" (a FAIL) rather than "no signal".
+    $engineDir = ""
+    if ($null -ne $RunInfo -and $RunInfo.ContainsKey("outDir")) { $engineDir = "$($RunInfo.outDir)" }
+    [void](Test-EngineIntegrity -OutDir $engineDir)
+
     # 1b. Clock catch-up visibility (always, advisory). The join closes its
     # load skew by simming at up to 2x (protocol 25); any oracle that scores
     # motion while the slew is engaged is measuring the transient, not the
@@ -304,7 +313,12 @@ function Invoke-RunAnalysis {
                     }
                 }
             }
+            # Gates already evaluated above (they read run artifacts rather than the
+            # two client logs, so Invoke-OneOracle cannot dispatch them). A scenario
+            # may still LIST one to gate on it; skip the re-dispatch, keep the result.
+            $preRun = @("engine_integrity")
             foreach ($id in ($gating + $advisory)) {
+                if ($preRun -contains $id) { continue }
                 [void](Invoke-OneOracle -Id $id -HostLog $HostLog -JoinLog $JoinLog `
                           -Tolerance $Tolerance -ExpectedSkewMs $ExpectedSkewMs)
             }
@@ -314,6 +328,11 @@ function Invoke-RunAnalysis {
             [void](Test-Crosscheck -HostFile $HostLog -JoinFile $JoinLog -Tol $Tolerance)
         }
     }
+
+    # engine_integrity runs on every scenario but is not yet trusted to judge one
+    # (no baseline for Kenshi's own rate), so label it advisory rather than let
+    # the summary imply it gates - unless a scenario opted into gating on it.
+    if ($gating -notcontains "engine_integrity") { $advisory += "engine_integrity" }
 
     # 4. Compute the verdict.
     $gates = Get-GateResults
@@ -373,7 +392,7 @@ Export-ModuleMember -Function @(
     "Reset-GateResults", "Add-GateResult", "Get-GateResults", "Merge-Status",
     "Get-LogClockOffsetMs", "Get-ClockSyncStats", "Convert-StampToMs",
     "Get-ScenarioLines", "Get-ScenarioSeries", "Get-MarkerTimeMs",
-    "Test-LogHealth", "Test-NoCheckFail", "Test-ScenarioResultPass", "Test-ClockSync",
+    "Test-LogHealth", "Test-EngineIntegrity", "Test-NoCheckFail", "Test-ScenarioResultPass", "Test-ClockSync",
     "Test-Crosscheck", "Measure-NpcSync", "Test-NpcTrack", "Test-CoopPresence",
     "Test-NpcPose", "Test-NpcPoseState", "Test-NpcBodyState", "Test-BedPose", "Test-BedWake", "Test-BedLay",
     "Test-CraftOrder", "Test-DownOrder", "Test-DeathOrder",

@@ -1721,6 +1721,18 @@
         # to 2 so five drops reach it). The overflow used to be booked as sent without being
         # sent, so the tail of the burst was invisible until the 5 s safety resend - the
         # "dropped it here, never showed up there" report.
+        # The join's proxy is destroyed by the ENGINE mid-run (what a zone unload does when
+        # players travel out of a block), then the host culls the real item. Locks the
+        # 2026-08-03 join crash: the mod used to cull, move and READ that freed object.
+        # Gates engine_integrity too - a coop-attributed double destroy IS the bug.
+        world_item_stale = @{
+            DiagEnv = @{ KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'world_item_stale'
+            Gating   = @('world_item_stale', 'engine_integrity', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'smoke'; WanVariant = $false
+        }
         world_item_burst = @{
             DiagEnv = @{ KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1'
                          KENSHICOOP_WI_BATCH_MAX = '2' }

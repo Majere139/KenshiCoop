@@ -492,6 +492,20 @@ if ($null -ne $wanProc -and -not $wanProc.HasExited) {
     try { Stop-Process -Id $wanProc.Id -Force -ErrorAction SilentlyContinue } catch {}
 }
 
+# Archive the ENGINE's own log next to ours. kenshi_info.log is where Kenshi
+# reports damage to its internal bookkeeping - a destroyed object still
+# registered in a zone, an object destroyed twice - and those lines name the
+# destroy reason, so ours are attributable ("coop-*"). It lives in the install
+# directory and is OVERWRITTEN on every launch, which is why we had no history
+# at all the first time a crash asked the question. Copy after exit so the
+# engine has flushed. Best-effort: a missing file must never fail a run.
+foreach ($e in @(@{ dir = $HostDir; label = "host" }, @{ dir = $JoinDir; label = "join" })) {
+    $src = Join-Path $e.dir "kenshi_info.log"
+    if (-not (Test-Path $src)) { continue }
+    try { Copy-Item $src (Join-Path $OutDir "$($e.label)_engine.log") -Force -ErrorAction Stop }
+    catch { Write-Warning "could not archive $($e.label) engine log: $($_.Exception.Message)" }
+}
+
 Write-Host ""
 Write-Host "== Results =="
 Write-Host "  host log: $hostLog"
