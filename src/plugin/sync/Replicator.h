@@ -1138,7 +1138,20 @@ private:
         u32 netId; u32 hash; unsigned long lastSendMs; float x, y, z; bool seen;
         char stringID[48]; u32 itemType; u16 quantity; u16 quality; bool baseline;
     };
-    struct WorldProxy { RootObject* obj; float x, y, z; u32 hash; };
+    // `hand` is the proxy's engine identity, captured (and round-trip verified) at
+    // mint. The engine owns the object's lifetime: when the block it stands in
+    // unloads - which is what travelling far DOES - the item is destroyed and `obj`
+    // becomes freed memory we still hold. Every use goes through liveWorldProxy(),
+    // which re-resolves the hand and hands back only a pointer the engine still
+    // owns. An all-zero hand means the round-trip failed at mint; those fall back
+    // to the raw pointer, because dropping them instead would leak the proxy.
+    struct WorldProxy { RootObject* obj; unsigned int hand[5]; float x, y, z; u32 hash; };
+    // The one gate between a stored proxy pointer and the engine. Returns 0 once
+    // the object is gone (hand no longer resolves, or its table slot was recycled
+    // by a different object), in which case the caller must drop its mapping and
+    // touch nothing: the engine already destroyed the item, and destroying,
+    // moving or even READING it a second time is a use-after-free.
+    RootObject* liveWorldProxy(const WorldProxy& wp);
     std::map<Key, WorldTrack> worldTrack_;
     // Spawned proxies for PEER-authored ground items, keyed by (ownerId, netId):
     // W1 is bidirectional (each client streams the free ground items it authors),

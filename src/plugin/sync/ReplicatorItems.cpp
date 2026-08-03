@@ -335,6 +335,18 @@ static u32 worldTrackHash(const char* sid, u32 type, u16 qty, u16 qual) {
     return h ? h : 1u;
 }
 
+RootObject* Replicator::liveWorldProxy(const WorldProxy& wp) {
+    if (!wp.obj) return 0;
+    // No verified hand: nothing to check against, so this is the pre-existing
+    // pointer-trust behaviour. Rare (the mint round-trip nearly always succeeds)
+    // and visible in the log as "SPAWN ... hand=0,0".
+    if (!wp.hand[3] && !wp.hand[4]) return wp.obj;
+    RootObject* ro = engine::resolveObjectByHand(wp.hand);
+    // A DIFFERENT object behind our hand means the engine recycled the table slot
+    // after destroying our proxy, so ours is gone and this one is somebody else's.
+    return (ro == wp.obj) ? ro : 0;
+}
+
 void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
     // Owner-authoritative world stream, BOTH directions since the W1 bidir fix (each
     // client streams the free ground items IT authors). DISCOVERY has two sources now:
@@ -358,10 +370,15 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
     // RootObject and enumerates like any other ground item - re-publishing it would
     // bounce the item back to its author as a duplicate. Filter every discovery row
     // that resolves to an object in our proxy set.
+    // Only LIVE proxies belong in the filter: a dead one's address can be reused by
+    // a genuinely new ground item, and a stale entry would then silence that item
+    // as an echo of itself and it would never stream.
     std::set<RootObject*> proxyObjs;
     for (std::map<std::pair<u32, u32>, WorldProxy>::iterator pi = worldProxies_.begin();
-         pi != worldProxies_.end(); ++pi)
-        proxyObjs.insert(pi->second.obj);
+         pi != worldProxies_.end(); ++pi) {
+        RootObject* live = liveWorldProxy(pi->second);
+        if (live) proxyObjs.insert(live);
+    }
 
     // ---- First-scan baseline (Phase 3 item-dup fix) ------------------------
     // Every non-gear ground item present at the FIRST publish pass after a load
@@ -570,7 +587,12 @@ void Replicator::publishWorldItems(GameWorld* gw, NetLink& net, u32 ownerId) {
         for (std::map<std::pair<u32, u32>, WorldProxy>::iterator pi = worldProxies_.begin();
              pi != worldProxies_.end(); ) {
             bool pickedUp = false;
-            if (engine::groundObjectLiveness(pi->second.obj, 0, &pickedUp)) { ++pi; continue; }
+            // A proxy the engine has already destroyed reads as "not picked up", so
+            // it falls through to the erase below and claims nothing. That is the
+            // right way round: a zone unload must not be mistaken for a pickup, or
+            // we would tell the author to destroy an item nobody took.
+            RootObject* live = liveWorldProxy(pi->second);
+            if (live && engine::groundObjectLiveness(live, 0, &pickedUp)) { ++pi; continue; }
             if (pickedUp) {
                 claims[pi->first.first].push_back(pi->first.second);
                 if (dumpWi) { char b[160]; _snprintf(b, sizeof(b) - 1,
@@ -609,24 +631,36 @@ void Replicator::applyWorldItems(GameWorld* gw, Inbound& in) {
             std::pair<u32, u32> pk(b->ownerId, e->netId);
             std::map<std::pair<u32, u32>, WorldProxy>::iterator pit = worldProxies_.find(pk);
             if (pit == worldProxies_.end()) {
+                WorldProxy wp;
                 RootObject* obj = engine::spawnWorldItemProxy(gw, e->stringID, e->itemType,
-                                                              (int)e->quantity, e->x, e->y, e->z);
+                                                              (int)e->quantity, e->x, e->y, e->z,
+                                                              wp.hand);
                 if (obj) {
-                    WorldProxy wp; wp.obj = obj; wp.x = e->x; wp.y = e->y; wp.z = e->z; wp.hash = 0;
+                    wp.obj = obj; wp.x = e->x; wp.y = e->y; wp.z = e->z; wp.hash = 0;
                     worldProxies_[pk] = wp;
                 }
-                char b2[200]; _snprintf(b2, sizeof(b2) - 1,
-                    "[wi] SPAWN owner=%u netId=%u ok=%d sid='%s' pos=%.2f,%.2f,%.2f",
-                    b->ownerId, e->netId, obj ? 1 : 0, e->stringID, e->x, e->y, e->z);
-                b2[sizeof(b2) - 1] = '\0'; if (dumpWi || !obj) coop::logLine(b2);
+                // hand=0,0 marks a proxy we can only track by pointer - the one
+                // remaining way a stale pointer can reach the engine.
+                char b2[224]; _snprintf(b2, sizeof(b2) - 1,
+                    "[wi] SPAWN owner=%u netId=%u ok=%d sid='%s' pos=%.2f,%.2f,%.2f hand=%u,%u",
+                    b->ownerId, e->netId, obj ? 1 : 0, e->stringID, e->x, e->y, e->z,
+                    wp.hand[3], wp.hand[4]);
+                b2[sizeof(b2) - 1] = '\0';
+                if (dumpWi || !obj || (obj && !wp.hand[3] && !wp.hand[4])) coop::logLine(b2);
             } else {
                 WorldProxy& wp = pit->second;
                 float dx = e->x - wp.x, dy = e->y - wp.y, dz = e->z - wp.z;
                 if ((dx*dx + dy*dy + dz*dz) > (POS_EPS * POS_EPS)) {
-                    engine::updateWorldItemProxy(wp.obj, e->x, e->y, e->z);
+                    // setPositionRotation is VIRTUAL: on a freed object this reads a
+                    // dangling vtable, which is the worst-behaved use of a stale
+                    // proxy we have - and the most frequent, since every snapshot
+                    // that nudges an item comes through here.
+                    RootObject* live = liveWorldProxy(wp);
+                    if (live) engine::updateWorldItemProxy(live, e->x, e->y, e->z);
                     wp.x = e->x; wp.y = e->y; wp.z = e->z;
-                    if (dumpWi) { char b2[160]; _snprintf(b2, sizeof(b2) - 1,
-                        "[wi] MOVE netId=%u pos=%.2f,%.2f,%.2f", e->netId, e->x, e->y, e->z);
+                    if (dumpWi) { char b2[176]; _snprintf(b2, sizeof(b2) - 1,
+                        "[wi] MOVE netId=%u pos=%.2f,%.2f,%.2f live=%d",
+                        e->netId, e->x, e->y, e->z, live ? 1 : 0);
                         b2[sizeof(b2) - 1] = '\0'; coop::logLine(b2); }
                 }
             }
@@ -638,10 +672,15 @@ void Replicator::applyWorldItems(GameWorld* gw, Inbound& in) {
             std::map<std::pair<u32, u32>, WorldProxy>::iterator pit =
                 worldProxies_.find(std::make_pair(b->ownerId, *id));
             if (pit == worldProxies_.end()) continue;
-            engine::removeWorldItemProxy(gw, pit->second.obj);
+            // Already gone (its block unloaded before the cull arrived): drop the
+            // mapping and leave the engine alone. Destroying it a second time is a
+            // double-destroy on freed memory, which the engine notices - it logs
+            // "alredy has destroy reason" - and does not survive reliably.
+            RootObject* live = liveWorldProxy(pit->second);
+            if (live) engine::removeWorldItemProxy(gw, live);
             worldProxies_.erase(pit);
-            if (dumpWi) { char b2[128]; _snprintf(b2, sizeof(b2) - 1,
-                "[wi] CULL owner=%u netId=%u", b->ownerId, *id);
+            if (dumpWi) { char b2[144]; _snprintf(b2, sizeof(b2) - 1,
+                "[wi] CULL owner=%u netId=%u live=%d", b->ownerId, *id, live ? 1 : 0);
                 b2[sizeof(b2) - 1] = '\0'; coop::logLine(b2); }
         }
     }

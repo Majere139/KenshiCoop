@@ -332,3 +332,36 @@ to catch — a squad *member* that walked away from its leader and anchors nothi
 of them the peer can see. An input only one side holds does not make the gate
 approximate, it makes the two sides run different gates. Publish it, or drop it
 from the predicate.
+
+## 15. The engine owns every object's lifetime; a stored pointer expires when its block unloads
+
+A `RootObject*` we minted is not ours. Kenshi destroys ground items when the zone
+block they stand in deactivates, and travelling far is exactly what deactivates
+blocks — so a map of proxy pointers is a map of pointers whose validity is a
+function of where the players have walked since. `worldProxies_` held raw
+pointers, and after a long trek every use of one was a use-after-free: the cull
+called `GameWorld::destroy` on an object the engine had already destroyed (which
+it notices — `Item <name> alredy has destroy reason ...` in `kenshi_info.log`),
+the snapshot path called the VIRTUAL `setPositionRotation` through a dangling
+vtable, and the claim path read `isInInventory` out of freed memory.
+
+The reads are the subtle half. Freed heap usually still maps, so the SEH guards
+around these calls do not fire; they return plausible garbage. A stale
+`isInInventory` reading true makes the join tell the host "I picked your item up",
+and the host destroys a real item nobody touched. A crash is the loud version of
+this bug and duplicate/vanished items are the quiet version.
+
+The fix is not a stronger guard, it is an identity: every proxy records the
+engine `hand` it was minted with, verified at mint by resolving it back to the
+same pointer, and `liveWorldProxy()` re-resolves before anything touches the
+object. A hand is serial-checked, so a destroyed object's hand stops resolving
+and a recycled table slot resolves to a *different* pointer — both read as "gone",
+and gone means drop the mapping and call nothing. `groundItemLiveness(hand)`
+already worked this way for our own tracked items; only the proxies, whose
+`Engine.h` comment openly said "we hold only as a pointer", did not.
+
+**Rule.** Never store a bare engine pointer across ticks. Store the hand, resolve
+it at the point of use, and treat an unresolvable hand as an already-destroyed
+object rather than an error. If a pointer must be cached, the question to answer
+is not "can this be null" but "what does the engine do to this object when the
+players walk away from it".

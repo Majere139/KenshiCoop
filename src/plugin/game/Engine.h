@@ -748,21 +748,33 @@ inline bool isContainerItemType(unsigned int t) { return t == 46u; }
 // in an inventory). Replaces the "vanished from the spatial scan" cull test.
 int groundItemLiveness(const unsigned int itemHand[5], float outPos[3]);
 
-// Object-level half of groundItemLiveness, for a ground item we hold only as a
-// pointer (a W1 proxy we spawned has no hand we recorded). Returns 1 while the
-// object is still a FREE ground item, filling outPos[3]; 0 once it is destroyed
-// or has entered an inventory. outPickedUp (optional) separates those two: true
-// ONLY when the object still reads but is now inside a bag, which is the single
-// case that licenses a W1 claim - claiming because a proxy was merely destroyed
-// would delete the author's real item for no reason.
+// Object-level half of groundItemLiveness, for a ground item we already know is
+// LIVE (the caller re-resolved its hand). Returns 1 while the object is still a
+// FREE ground item, filling outPos[3]; 0 once it is destroyed or has entered an
+// inventory. outPickedUp (optional) separates those two: true ONLY when the
+// object still reads but is now inside a bag, which is the single case that
+// licenses a W1 claim - claiming because a proxy was merely destroyed would
+// delete the author's item for no reason.
+// The pointer must be live: a stored RootObject* whose zone has since unloaded is
+// freed memory, and freed memory often still READS, so this would report a
+// plausible-looking isInInventory off a dead object. Validate through the hand
+// (spawnWorldItemProxy hands one back) before calling.
 int groundObjectLiveness(RootObject* obj, float outPos[3], bool* outPickedUp);
 
 // SEH-guarded (join): spawn a LOCAL proxy ground item from the template (sid, typeCat) at
 // world position (x,y,z), so the join renders a host-dropped item where the host sees it.
 // Returns the spawned object (cull/update it later) or 0. The join owns this proxy; it is
 // keyed to the host's netId by the caller (Replicator).
+// outHand (optional, 5 ints) receives the proxy's engine hand, which is how the
+// caller re-validates the pointer later: the engine destroys ground items when
+// their zone unloads, so a stored pointer goes dangling the moment a player
+// travels out of the block. The hand is only written if it ROUND-TRIPS back to
+// this exact object; otherwise it is zeroed, and the caller must fall back to
+// trusting the pointer (a hand that never resolves would read as "already
+// destroyed" and leak the proxy as a permanent duplicate item).
 RootObject* spawnWorldItemProxy(GameWorld* gw, const char* sid, unsigned int typeCat,
-                                int qty, float x, float y, float z);
+                                int qty, float x, float y, float z,
+                                unsigned int* outHand = 0);
 
 // SEH-guarded (join): move an existing proxy to (x,y,z) (a settled world item rarely
 // moves, but a re-drop/nudge must track). No-op on fault.

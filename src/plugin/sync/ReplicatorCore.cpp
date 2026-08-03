@@ -304,17 +304,21 @@ void Replicator::clearPeerReplicationState(GameWorld* gw) {
     coop::logLine(b);
     // World-item proxies (Phase 3): the world stays LIVE across a peer leave /
     // reconnect (no engine world swap), so the proxy RootObjects we minted for the
-    // departed peer's ground items are valid pointers that must be destroyed here -
-    // otherwise they linger as duplicate items and, worse, get baked into the save
-    // on the next write (becoming natives that re-stream on reload). resetSession()
-    // below only clears the map, not the bodies, so despawn first.
-    unsigned int wcleared = 0;
+    // departed peer's ground items must be destroyed here - otherwise they linger
+    // as duplicate items and, worse, get baked into the save on the next write
+    // (becoming natives that re-stream on reload). resetSession() below only clears
+    // the map, not the bodies, so despawn first. The world surviving does NOT mean
+    // the proxies did: the peer may have left after a long trek, and anything whose
+    // block unloaded on the way is already destroyed, so each one is re-resolved.
+    unsigned int wcleared = 0, wstale = 0;
     for (std::map<std::pair<u32, u32>, WorldProxy>::iterator wi = worldProxies_.begin();
          wi != worldProxies_.end(); ++wi) {
-        if (gw && wi->second.obj && engine::removeWorldItemProxy(gw, wi->second.obj))
-            ++wcleared;
+        RootObject* live = gw ? liveWorldProxy(wi->second) : 0;
+        if (!live) { ++wstale; continue; }
+        if (engine::removeWorldItemProxy(gw, live)) ++wcleared;
     }
-    _snprintf(b, sizeof(b) - 1, "[leave] cleared worldProxies=%u", wcleared);
+    _snprintf(b, sizeof(b) - 1, "[leave] cleared worldProxies=%u stale=%u",
+              wcleared, wstale);
     b[sizeof(b) - 1] = '\0';
     coop::logLine(b);
     // Now drop every map (proxyByKey_ included) back to freshly-launched state.

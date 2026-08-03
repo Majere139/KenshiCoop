@@ -1518,7 +1518,9 @@ unsigned int captureWorldItems(GameWorld* gw, WorldItemRaw* out, unsigned int ma
 }
 
 RootObject* spawnWorldItemProxy(GameWorld* gw, const char* sid, unsigned int typeCat,
-                                int qty, float x, float y, float z) {
+                                int qty, float x, float y, float z,
+                                unsigned int* outHand) {
+    if (outHand) for (int i = 0; i < 5; ++i) outHand[i] = 0;
     if (!gw || !gw->theFactory || !g_createObjFn || !sid || !sid[0]) return 0;
     __try {
         GameData* tmpl = findItemTemplateImpl(gw, sid, typeCat);
@@ -1536,6 +1538,15 @@ RootObject* spawnWorldItemProxy(GameWorld* gw, const char* sid, unsigned int typ
         RootObject* obj = reinterpret_cast<RootObject*>(ro);
         // Stacks: the factory mints a single unit; set the visible stack quantity.
         if (qty > 1) { __try { reinterpret_cast<Item*>(obj)->quantity = qty; } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+        // Round-trip the hand (both helpers carry their own SEH). Storing one that
+        // does not resolve back to this object would be worse than storing none:
+        // the caller reads an unresolvable hand as "the engine already destroyed
+        // it" and drops the mapping, stranding the proxy on the ground forever.
+        if (outHand) {
+            unsigned int h[5] = { 0, 0, 0, 0, 0 };
+            if (readObjectHand(obj, h) && resolveObjectByHand(h) == obj)
+                for (int i = 0; i < 5; ++i) outHand[i] = h[i];
+        }
         return obj;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return 0;
