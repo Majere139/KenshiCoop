@@ -878,10 +878,12 @@ void NetLink::threadLoop() {
                             inbound_->pushLoadNack(ln.ownerId, ln);
                         }
                     } else if (type == PKT_CAM_HINT) {
-                        // Camera hint (protocol 43, join -> host): latest-wins
-                        // interest anchor. Only meaningful on the host.
+                        // Camera hint (protocol 43): latest-wins interest
+                        // anchor. Accepted in BOTH directions - the attention
+                        // gate needs each side to know where the peer is
+                        // looking, not just the host.
                         CamHintPacket chp;
-                        if (isHost_ && readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &chp)
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &chp)
                             && inbound_) {
                             inbound_->pushCamHint(chp.ownerId, chp);
                         }
@@ -1494,8 +1496,8 @@ void NetLink::threadLoop() {
         }
 
         // Drain + send any queued camera hints on CH_UNRELIABLE (protocol
-        // 43, join -> host, ~1 Hz). Latest wins; a lost hint is replaced by
-        // the next one a second later.
+        // 43, both directions, ~1 Hz). Latest wins; a lost hint is replaced
+        // by the next one a second later.
         std::vector<CamHintPacket> camHints;
         EnterCriticalSection(&outCs_);
         camHints.swap(outCamHint_);

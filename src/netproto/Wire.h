@@ -1260,13 +1260,14 @@ struct NpcCensusHeader {
 // Hard cap on hands per census packet (512 * 20 B = ~10 KB, fragmented fine).
 const unsigned int NPC_CENSUS_MAX = 512;
 
-// Camera hint (protocol 43, join -> host, ~1 Hz UNRELIABLE latest-wins): the
-// join's camera world center, so the host can anchor an interest sphere where
-// the join player is LOOKING (its PC may be elsewhere). Loss is harmless -
-// the next hint lands a second later; a stale hint (> ~3 s) is dropped.
+// Camera hint (protocol 43, BOTH directions, ~1 Hz UNRELIABLE latest-wins):
+// the sender's camera world center, so the receiver can anchor an interest
+// sphere where the peer player is LOOKING (its PC may be elsewhere), and can
+// evaluate the attention gate for the peer's viewpoint. Loss is harmless - the
+// next hint lands a second later; a stale hint (> ~3 s) is dropped.
 struct CamHintPacket {
     u8  type;    // = PKT_CAM_HINT
-    u32 ownerId; // network player id of the sender (the join)
+    u32 ownerId; // network player id of the sender
     f32 x, y, z; // CameraClass::getCenter() world position
 };
 

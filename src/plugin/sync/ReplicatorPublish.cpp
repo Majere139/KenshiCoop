@@ -640,6 +640,37 @@ void Replicator::emitWnpcRow(Character* c, const EntityState& st, const char* cl
     r[sizeof(r) - 1] = '\0'; coop::logLine(r);
 }
 
+void Replicator::notePlatoons(GameWorld* gw, const EntityState* sts,
+                              unsigned int n, const char* side) {
+    if (!sts) return;
+    unsigned long now = nowMs();
+    if (platoonT0_ == 0) platoonT0_ = now;
+    float anch[12];
+    unsigned int nAnch = engine::interestAnchors(gw, anch);
+    for (unsigned int i = 0; i < n; ++i) {
+        std::pair<unsigned int, unsigned int> p(sts[i].hContainer,
+                                                sts[i].hContainerSerial);
+        if (!seenPlatoons_.insert(p).second) continue;
+        float nearest = -1.0f;
+        for (unsigned int a = 0; a < nAnch; ++a) {
+            float d = dist3(sts[i].x, sts[i].y, sts[i].z,
+                            anch[a * 3 + 0], anch[a * 3 + 1], anch[a * 3 + 2]);
+            if (nearest < 0.0f || d < nearest) nearest = d;
+        }
+        Character* c = engine::resolve(sts[i]);
+        char nm[40]; engine::charName(c, nm, sizeof(nm));
+        char b[224];
+        _snprintf(b, sizeof(b) - 1,
+                  "[platoon] first-sight side=%s id=%u,%u at=%.0f,%.0f,%.0f "
+                  "dAnchor=%.0f zone=%d elapsed=%lums name='%s'",
+                  side, sts[i].hContainer, sts[i].hContainerSerial,
+                  sts[i].x, sts[i].y, sts[i].z, nearest,
+                  engine::isZoneLoadedAt(gw, sts[i].x, sts[i].y, sts[i].z) ? 1 : 0,
+                  now - platoonT0_, nm);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
 void Replicator::emitPcRows(GameWorld* gw) {
     const unsigned int MAX_PC = 32;
     static EntityState pcs[MAX_PC]; // main-thread only
@@ -663,21 +694,60 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
     // locally simulated on BOTH sides, so its two positions legitimately
     // diverge - without the margin a real NPC wandering near the boundary
     // (inside the join's scan, outside the host's) would be false-culled.
+    bool trunc = false;
     unsigned int n = engine::listNpcsWide(gw, censusRadius_ * 1.25f, chars, states,
-                                          NPC_CENSUS_MAX);
+                                          NPC_CENSUS_MAX, &trunc);
+    // A truncated census is an ACTIVE falsehood, not just a thin one: every NPC
+    // past the cap is broadcast as "does not exist on the host", and the join
+    // culls its real local copy against that. The fill is per-anchor, so a dense
+    // region around one anchor can consume the whole budget and starve the
+    // peer's. Log the edges (and re-log slowly while it persists) rather than
+    // every beat - this runs at 1 Hz forever.
+    static unsigned long truncLogMs = 0; // main-thread only
+    bool truncEdge = (trunc != censusPubTrunc_);
+    if (truncEdge || (trunc && (now - truncLogMs) >= 30000)) {
+        censusPubTrunc_ = trunc;
+        truncLogMs = now;
+        char b[176]; _snprintf(b, sizeof(b) - 1,
+            "[census] publish %s n=%u cap=%u radius=%.0f",
+            trunc ? "TRUNCATED (cap hit; far NPCs broadcast as absent)"
+                  : "complete again",
+            n, (unsigned)NPC_CENSUS_MAX, censusRadius_ * 1.25f);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
     static u32   hands[NPC_CENSUS_MAX * 5];
     static float poss[NPC_CENSUS_MAX * 3];
+    // Attention gate: anchors once per publish, then leave DORMANT bodies out
+    // of the packet. A census row is read on the far side as "this exists",
+    // and the ABSENCE of a row as "this does not" - which is a claim the host
+    // has no business making about a place neither player is standing in nor
+    // looking at. Omitting the row is the honest answer there, and it costs
+    // nothing: the join does not suppress dormant bodies either, so nothing
+    // downstream reads the omission as a cull.
+    float rawAnch[12];
+    unsigned int nRawAnch = engine::interestAnchors(gw, rawAnch);
+    float attnAnch[12];
+    unsigned int nAttnAnch = attentionAnchors(gw, rawAnch, nRawAnch, attnAnch);
+    std::set<Key> censusKeys;
+    unsigned int m = 0;      // rows that survived the gate
     for (unsigned int i = 0; i < n; ++i) {
-        hands[i * 5 + 0] = states[i].hType;
-        hands[i * 5 + 1] = states[i].hContainer;
-        hands[i * 5 + 2] = states[i].hContainerSerial;
-        hands[i * 5 + 3] = states[i].hIndex;
-        hands[i * 5 + 4] = states[i].hSerial;
-        poss[i * 3 + 0]  = states[i].x;
-        poss[i * 3 + 1]  = states[i].y;
-        poss[i * 3 + 2]  = states[i].z;
+        Key k = keyOf(states[i]);
+        censusKeys.insert(k);
+        if (!observedAt(k, attnAnch, nAttnAnch, states[i].x, states[i].y,
+                        states[i].z)) continue;
+        hands[m * 5 + 0] = states[i].hType;
+        hands[m * 5 + 1] = states[i].hContainer;
+        hands[m * 5 + 2] = states[i].hContainerSerial;
+        hands[m * 5 + 3] = states[i].hIndex;
+        hands[m * 5 + 4] = states[i].hSerial;
+        poss[m * 3 + 0]  = states[i].x;
+        poss[m * 3 + 1]  = states[i].y;
+        poss[m * 3 + 2]  = states[i].z;
+        ++m;
     }
-    net.queueNpcCensus(ownerId, hands, poss, n);
+    pruneAttention(censusKeys);
+    unsigned int nDorm = n - m;
+    net.queueNpcCensus(ownerId, hands, poss, m);
 
     // Phase 2 mid-band tier: rebuild the round-robin list from this census
     // walk. Everything beyond the stream bubble's KEEP band belongs to the
@@ -687,8 +757,10 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
     // uses, so a camera-watched far NPC gets a mid-band drive slot too.
     {
         const float MID_NEAR_EDGE = 260.0f; // captureNpcs' NPC_CAPTURE_KEEP
-        float anchors[12];
-        unsigned int nAnchor = engine::interestAnchors(gw, anchors);
+        // RAW anchors: drive tiers are a bandwidth decision, not an authority
+        // one, so the attention gate and its zone veto do not apply here.
+        const float* anchors = rawAnch;
+        unsigned int nAnchor = nRawAnch;
         midBand_.clear();
         for (unsigned int i = 0; i < n; ++i) {
             float best = -1.0f;
@@ -720,6 +792,8 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
         if (midCursor_ >= midBand_.size()) midCursor_ = 0;
     }
 
+    if (auditRows_) notePlatoons(gw, states, n, "host");
+
     // travel_parity worldstate rows (host side): dump every census NPC on a
     // 5 s cadence so Test-TravelParity can cross-compare the two worlds'
     // populations. cls=host marks the row as the host's authoritative view.
@@ -742,9 +816,48 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
     static unsigned long logTick = 0;
     if ((now - logTick) > 10000) {
         logTick = now;
-        char b[96];
-        _snprintf(b, sizeof(b) - 1, "[census] sent n=%u radius=%.0f mid=%u",
-                  n, censusRadius_, (unsigned)midBand_.size());
+        // Per-anchor breakdown. This was written expecting to catch the host
+        // censusing an UNLOADED block at the peer's anchor and broadcasting
+        // "no NPCs here" over a town the peer was standing in. Measured false:
+        // every split_far run at ~5,200 u separation reported a1=loaded with a
+        // healthy share, because both clients hold copies of all player
+        // characters and Kenshi streams zones around the peer's squad as
+        // readily as around the local one. The breakdown stays as the standing
+        // check that this remains true (and as the input to Phase C's
+        // capability veto) - it is no longer evidence of the ghost mechanism.
+        const float* anch = rawAnch;    // pre-veto: the veto reads off a?=
+        unsigned int na = nRawAnch;
+        char det[192]; det[0] = '\0';
+        for (unsigned int a = 0; a < na; ++a) {
+            unsigned int share = 0;
+            for (unsigned int i = 0; i < n; ++i) {
+                float best = -1.0f; unsigned int bi = 0;
+                for (unsigned int s = 0; s < na; ++s) {
+                    float d = dist3(states[i].x, states[i].y, states[i].z,
+                                    anch[s * 3 + 0], anch[s * 3 + 1],
+                                    anch[s * 3 + 2]);
+                    if (best < 0.0f || d < best) { best = d; bi = s; }
+                }
+                if (bi == a) ++share;
+            }
+            bool ld = engine::isZoneLoadedAt(gw, anch[a * 3 + 0],
+                                             anch[a * 3 + 1], anch[a * 3 + 2]);
+            char one[40];
+            _snprintf(one, sizeof(one) - 1, " a%u=%s:%u",
+                      a, ld ? "loaded" : "UNLOADED", share);
+            one[sizeof(one) - 1] = '\0';
+            unsigned int used = (unsigned int)strlen(det);
+            if (used + strlen(one) + 1 < sizeof(det)) strcat(det, one);
+        }
+        // n = rows actually published, enum = what the walk found; the
+        // per-anchor shares below are shares of enum, so they sum to enum
+        // rather than to n whenever the gate held rows back.
+        char b[320];
+        _snprintf(b, sizeof(b) - 1,
+                  "[census] sent n=%u radius=%.0f mid=%u anchors=%u%s"
+                  " enum=%u dorm=%u attnR=%.0f",
+                  m, censusRadius_, (unsigned)midBand_.size(), na, det,
+                  n, nDorm, attentionRadius_);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         // KENSHICOOP_DEBUG_CENSUS=1: dump every census row (hand + name) at the
         // same 10 s cadence, so a join-side cull can be classified against the
@@ -769,8 +882,7 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
     }
 }
 
-void Replicator::syncCamHint(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId,
-                             bool isHost) {
+void Replicator::syncCamHint(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId) {
     if (!gw) return;
     unsigned long now = nowMs();
 
@@ -780,24 +892,30 @@ void Replicator::syncCamHint(GameWorld* gw, Inbound& in, NetLink& net, u32 owner
     bool haveLocal = engine::cameraCenter(gw, local);
     engine::setLocalCamAnchor(haveLocal, local[0], local[1], local[2]);
 
-    if (!isHost) {
-        // JOIN: ship the camera center to the host at ~1 Hz (unreliable,
-        // latest wins - a lost hint is replaced a second later).
-        if (haveLocal && (camHintSendMs_ == 0 || (now - camHintSendMs_) >= 1000)) {
-            camHintSendMs_ = now;
-            CamHintPacket p;
-            p.type = (u8)PKT_CAM_HINT;
-            p.ownerId = ownerId;
-            p.x = local[0]; p.y = local[1]; p.z = local[2];
-            net.queueCamHint(p);
-        }
-        return;
+    // Ship the camera center to the peer at ~1 Hz (unreliable, latest wins -
+    // a lost hint is replaced a second later).
+    //
+    // BIDIRECTIONAL as of the attention gate. It used to be join -> host only,
+    // which was enough while the hint's only job was widening the host's
+    // interest spheres. Dormancy needs more than that: it is a predicate BOTH
+    // clients must evaluate the same way, and a client cannot tell whether the
+    // peer is watching a region unless the peer publishes where it is looking.
+    // With the host's camera private, the join would have to assume the host
+    // is always watching - which is exactly the assumption that keeps the
+    // ghost churn alive.
+    if (haveLocal && (camHintSendMs_ == 0 || (now - camHintSendMs_) >= 1000)) {
+        camHintSendMs_ = now;
+        CamHintPacket p;
+        p.type = (u8)PKT_CAM_HINT;
+        p.ownerId = ownerId;
+        p.x = local[0]; p.y = local[1]; p.z = local[2];
+        net.queueCamHint(p);
     }
 
-    // HOST: drain received hints (latest wins) into peerCam_ + staleness
-    // stamp, and publish a FRESH hint to the engine's interest layer. A
-    // stale hint (silent join > 3 s: alt-tabbed, loading, disconnecting)
-    // drops out of the anchor set rather than pinning interest forever.
+    // Drain received hints (latest wins) into peerCam_ + staleness stamp, and
+    // publish a FRESH hint to the engine's interest layer. A stale hint
+    // (silent peer > 3 s: alt-tabbed, loading, disconnecting) drops out of the
+    // anchor set rather than pinning interest forever.
     std::deque<InboundCamHint> got;
     in.drainCamHints(got);
     if (!got.empty()) {

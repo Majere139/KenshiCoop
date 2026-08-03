@@ -869,6 +869,35 @@ void tickSetupScene(GameWorld* gw) {
             bool ok = coop::engine::setupSquadScene(gw);
             coopLog(ok ? "SETUP(squad): second squad tab built - SAVE your two-tab save now"
                        : "SETUP(squad): squad-tab build FAILED");
+        } else if (g_cfg.setupScene == "splitfar") {
+            // Far-apart desync fixture BAKE ('splitfar1'): park the non-leader
+            // squad tab at a MEASURED remote point and save, so split_far opens
+            // with the two tabs already in two different regions instead of
+            // spiralling to whatever it happens to find.
+            //
+            // The target must be somewhere BOTH clients see population, which
+            // means BAKED population. The spot where the bug was first caught
+            // (-42161,1555,-2655: join enumerated 8, host 0) is exactly the
+            // wrong choice - those 8 bodies existed only in the join's process,
+            // so a bake, which writes the HOST's world, records an empty field
+            // and the scenario has nothing to judge. Verified: baking there
+            // yielded sep=9839 with popMover=0 on both sides.
+            // This target held 17 NPCs on BOTH clients for a full window
+            // (run 20260802_105738, hop 2), so the crowd is in the save.
+            // Override with KENSHICOOP_SPLITFAR_AT="x,y,z".
+            float sx = -50446.0f, sy = 841.0f, sz = -2652.0f;
+            const char* at = getenv("KENSHICOOP_SPLITFAR_AT");
+            if (at && *at) sscanf(at, "%f,%f,%f", &sx, &sy, &sz);
+            unsigned int nm = coop::engine::setupSplitFarScene(gw, sx, sy, sz);
+            char sb[176];
+            _snprintf(sb, sizeof(sb) - 1,
+                      "SETUP(splitfar): relocated %u member(s) to %.0f,%.0f,%.0f - SAVE 'splitfar1' now",
+                      nm, sx, sy, sz);
+            sb[sizeof(sb) - 1] = '\0'; coopLog(sb);
+            // Longer than the other bakes: the destination zone has to stream in
+            // and the relocated bodies have to ground before the save is written.
+            if (nm > 0 && !g_cfg.bakeSave.empty())
+                g_bakeSaveTick = GetTickCount() + 20000;
         } else if (g_cfg.setupScene == "bedcage") {
             // Bed+cage occupancy (protocol 19) BAKE: spawn a bed and a prison
             // cage near the leader so both clients load save-stable furniture
@@ -1293,12 +1322,12 @@ void tickReplicateApply(GameWorld* gw, bool worldLive) {
             g_repl.publishNpcCensus(gw, g_net, g_net.localId());
         }
         // Camera-anchored interest (protocol 43): both sides publish their
-        // LOCAL camera to the engine's anchor store; the join additionally
-        // ships its center to the host at ~1 Hz, and the host folds a fresh
-        // peer hint into interestCenters. Runs even with CAM_INTEREST off
-        // (the engine-side knob makes interestCenters ignore the anchors)
-        // so an A/B toggle needs no session restart logic.
-        g_repl.syncCamHint(gw, g_inbound, g_net, g_net.localId(), g_cfg.isHost);
+        // LOCAL camera to the engine's anchor store, ship its center to the
+        // peer at ~1 Hz, and fold a fresh peer hint into interestCenters.
+        // Runs even with CAM_INTEREST off (the engine-side knob makes
+        // interestCenters ignore the anchors) so an A/B toggle needs no
+        // session restart logic.
+        g_repl.syncCamHint(gw, g_inbound, g_net, g_net.localId());
     }
 }
 
@@ -1826,6 +1855,7 @@ void configureReplicator() {
         g_repl.setSpawnMintRadius(g_cfg.spawnMintRadius);
         g_repl.setCensusParkDist(g_cfg.censusParkDist);
         g_repl.setCensusFreezeAi(g_cfg.censusFreezeAi);
+        g_repl.setAttentionRadius(g_cfg.attentionRadius);
         g_repl.setStarveHold(g_cfg.starveHoldMs);
         // Camera-anchored interest (protocol 43): engine-side master enable
         // for the camera anchors in interestCenters.
@@ -1836,6 +1866,7 @@ void configureReplicator() {
         // NPCs, which the hop corridor mostly lacks). Every other scenario
         // stays quiet (log volume).
         g_repl.setAuditRows(g_cfg.scenario == "travel_parity" ||
+                            g_cfg.scenario == "split_far" ||
                             g_cfg.scenario == "npc_sync" ||
                             g_cfg.scenario == "world_parity" ||
                             g_cfg.scenario == "jail_probe" ||

@@ -120,7 +120,8 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
     const unsigned int MAX_NPCS = 256;
     static Character*  chars[MAX_NPCS]; // main-thread only
     static EntityState states[MAX_NPCS];
-    unsigned int n = engine::listNpcs(gw, chars, states, MAX_NPCS);
+    bool nearTrunc = false;
+    unsigned int n = engine::listNpcs(gw, chars, states, MAX_NPCS, &nearTrunc);
 
     // Protocol 36 wide-radius existence pass: enumerate out to the census
     // radius so local-only ghosts get culled at render range instead of at the
@@ -130,10 +131,57 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
     static Character*  wChars[NPC_CENSUS_MAX]; // main-thread only
     static EntityState wStates[NPC_CENSUS_MAX];
     unsigned int wn = 0;
+    bool wideTrunc = false;
     bool censusFresh = censusRadius_ > 0.0f && censusRecvMs_ != 0 &&
                        (nowMs() - censusRecvMs_) <= 5000;
     if (censusFresh)
-        wn = engine::listNpcsWide(gw, censusRadius_, wChars, wStates, NPC_CENSUS_MAX);
+        wn = engine::listNpcsWide(gw, censusRadius_, wChars, wStates, NPC_CENSUS_MAX,
+                                  &wideTrunc);
+
+    // Phase 0.5: account the time wide culling spends DISABLED. Staleness is a
+    // deliberate fail-open (a silent host must not mass-suppress a loaded area),
+    // but it is also unbounded ghost accumulation: nothing is judged while it
+    // lasts, and a body that drifts outside censusRadius_ before the census
+    // returns is never judged again. Host-side zone streaming stalls the main
+    // thread, and travel is a continuous zone stream - so the window opens
+    // exactly when it does the most damage.
+    {
+        unsigned long nowF = nowMs();
+        if (censusFreshChkMs_ != 0 && !censusFresh)
+            censusStaleMs_ += (nowF - censusFreshChkMs_);
+        if (censusFreshChkMs_ != 0 && censusFreshPrev_ && !censusFresh) {
+            ++censusStaleEdges_;
+            char b[144]; _snprintf(b, sizeof(b) - 1,
+                "[census] STALE (wide culling disabled; last recv %lums ago, edges=%lu)",
+                censusRecvMs_ ? (nowF - censusRecvMs_) : 0ul, censusStaleEdges_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        } else if (censusFreshChkMs_ != 0 && !censusFreshPrev_ && censusFresh) {
+            char b[144]; _snprintf(b, sizeof(b) - 1,
+                "[census] fresh again (wide culling re-enabled; staleMs=%lu edges=%lu)",
+                censusStaleMs_, censusStaleEdges_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        censusFreshPrev_  = censusFresh;
+        censusFreshChkMs_ = nowF;
+    }
+
+    if (auditRows_) {
+        notePlatoons(gw, states, n, "join");
+        notePlatoons(gw, wStates, wn, "join");
+    }
+
+    // Attention gate anchors, resolved once for both passes and the audit. A
+    // body that no anchor is within attentionRadius_ of is DORMANT: nobody is
+    // standing near it and nobody is looking at it, so the host deliberately
+    // leaves it out of the census - and census silence over a region the host
+    // is not speaking for must not be read as "this body does not exist".
+    // That misreading is the whole ghost mechanism: a legitimate local NPC in
+    // a place only this client cares about, hidden because the other client
+    // never mentioned it.
+    float rawAnch[12];
+    unsigned int nRawAnch = engine::interestAnchors(gw, rawAnch);
+    float attnAnch[12];
+    unsigned int nAttnAnch = attentionAnchors(gw, rawAnch, nRawAnch, attnAnch);
 
     // Prune counters for hands the enumeration no longer sees (left interest),
     // preserving suppressed entries (a hidden body may drop out of the query but
@@ -146,6 +194,7 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
             suppressed_.find(it->first) == suppressed_.end()) authCount_.erase(it++);
         else ++it;
     }
+    pruneAttention(seen);
 
     for (unsigned int i = 0; i < n; ++i) {
         // Proxy bodies answer to their streamed key's census entry, not their
@@ -173,6 +222,16 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
                       (censusFresh && censusHands_.find(k) != censusHands_.end());
         std::map<Key, Character*>::iterator s = suppressed_.find(k);
         AuthCount& ac = authCount_[k];
+        // Dormant and census-absent: neither client is speaking for this
+        // region, so there is nothing to judge. Hold the debounce at zero
+        // rather than letting it climb silently - when attention does arrive,
+        // the body gets a full SUPPRESS_AFTER_FRAMES to be corroborated
+        // instead of being hidden on the first frame someone looks at it.
+        if (!exists && !observedAt(k, attnAnch, nAttnAnch,
+                                   states[i].x, states[i].y, states[i].z)) {
+            ac.unstreamed = 0;
+            continue;
+        }
         if (exists) { ac.unstreamed = 0; if (ac.streamed < 1000000u) ++ac.streamed; }
         else        { ac.streamed = 0;   if (ac.unstreamed < 1000000u) ++ac.unstreamed; }
         if (exists) {
@@ -288,6 +347,15 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
                           keep.find(k) != keep.end() || driven;
             std::map<Key, Character*>::iterator s = suppressed_.find(k);
             AuthCount& ac = authCount_[k];
+            // Dormancy, same as the near pass - and this is where it matters
+            // most. The wide pass reaches out to censusRadius_ (2000 u), far
+            // past anywhere either player is looking, so most of what it used
+            // to cull sat in regions nobody was watching at all.
+            if (!exists && !observedAt(k, attnAnch, nAttnAnch,
+                                       wStates[i].x, wStates[i].y, wStates[i].z)) {
+                ac.unstreamed = 0;
+                continue;
+            }
             if (exists) { ac.unstreamed = 0; if (ac.streamed < 1000000u) ++ac.streamed; }
             else        { ac.streamed = 0;   if (ac.unstreamed < 1000000u) ++ac.unstreamed; }
             if (exists) {
@@ -440,16 +508,34 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
     //   drv   - streamed/driven this tick (host actively drives it)
     //   cen   - census-present, unstreamed (legit local-sim copy, host has it)
     //   hid   - booked suppressed (we hid it)
-    //   ghost - census-absent, NOT suppressed (the visible-on-join-only class:
-    //           either inside the suppress debounce, judged only while the
-    //           census was stale, or escaping judgment entirely)
+    //   dorm  - census-absent and unobserved (attention gate): no anchor is
+    //           within attentionRadius_, so the host is not speaking for this
+    //           region and we are not judging it. Deliberately NOT a ghost -
+    //           these are the bodies the gate exists to leave alone.
+    //   ghost - census-absent, observed, NOT suppressed (the visible-on-join-
+    //           only class: either inside the suppress debounce, judged only
+    //           while the census was stale, or escaping judgment entirely)
     // ghost is the bucket the field reports live in - it should only ever be
     // transient (one debounce, ~1 s). Test-ExistenceParity gates on it.
     // KENSHICOOP_DEBUG_CENSUS=1 additionally dumps a row per ghost.
     static unsigned long auditMs = 0; // main-thread only
     if ((now - auditMs) >= 5000) {
         auditMs = now;
-        unsigned int cDrv = 0, cCen = 0, cHid = 0, cGhost = 0;
+        unsigned int cDrv = 0, cCen = 0, cHid = 0, cGhost = 0, cDorm = 0;
+        // Safety check on the attention gate. The design rests on a squad
+        // never going dormant just because no camera is on it: every squad-tab
+        // LEADER is an interest anchor, so bodies beside a leader are observed
+        // by construction. What is NOT covered by construction is a squad
+        // member that walked away from its leader - nothing anchors it.
+        // dormPc counts dormant bodies within attentionRadius_ of ANY player
+        // character, i.e. bodies standing next to somebody's squad that we
+        // stopped judging anyway. It must read 0.
+        const unsigned int MAX_PC = 32;
+        static EntityState pcStates[MAX_PC];  // main-thread only
+        unsigned int nPc = 0;
+        if (attentionRadius_ > 0.0f)
+            nPc = engine::captureSquad(gw, /*leaderOnly*/ false, pcStates, MAX_PC);
+        unsigned int cDormPc = 0;
         static int dumpGhost = -1;
         if (dumpGhost < 0) {
             const char* e = getenv("KENSHICOOP_DEBUG_CENSUS");
@@ -458,6 +544,21 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
         std::set<Character*> counted;
         std::set<Key> emittedKeys; // world_parity: hands already dumped
         unsigned int ghostRows = 0;
+        // Phase 0.5 horizon probe: how far out do ghosts actually sit? Anything
+        // past censusRadius_ is never enumerated at all, so it cannot appear in
+        // ANY bucket here - the ghost count silently stops at the horizon while
+        // the player keeps seeing bodies past it. If ghostMax rides up against
+        // the radius (and ghostEdge is non-zero), the cull horizon is the
+        // binding constraint and KENSHICOOP_CENSUS_RADIUS is the lever; if
+        // ghosts cluster close in, the cause is debounce/staleness/caps instead.
+        // Distances are measured against the RAW anchors - how far out ghosts
+        // sit, regardless of who can speak for the region - while the
+        // classification below re-uses the vetoed set the passes judged with.
+        const float* anch = rawAnch;
+        unsigned int nAnch = nRawAnch;
+        float ghostMaxD = -1.0f;
+        unsigned int ghostEdge = 0;
+        const float EDGE_BAND = censusRadius_ * 0.8f;
         for (int pass = 0; pass < 2; ++pass) {
             unsigned int cnt = (pass == 0) ? n : wn;
             Character**  cs  = (pass == 0) ? chars : wChars;
@@ -475,8 +576,27 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
                 } else if (censusFresh &&
                            censusHands_.find(k) != censusHands_.end()) {
                     cls = "cen"; ++cCen;
+                } else if (!observedAt(k, attnAnch, nAttnAnch,
+                                       sts[i].x, sts[i].y, sts[i].z)) {
+                    cls = "dorm"; ++cDorm;
+                    for (unsigned int p = 0; p < nPc; ++p) {
+                        if (dist3(sts[i].x, sts[i].y, sts[i].z, pcStates[p].x,
+                                  pcStates[p].y, pcStates[p].z)
+                                <= attentionRadius_) {
+                            ++cDormPc; break;
+                        }
+                    }
                 } else {
                     cls = "ghost"; ++cGhost;
+                    float nearest = -1.0f;
+                    for (unsigned int a = 0; a < nAnch; ++a) {
+                        float d = dist3(sts[i].x, sts[i].y, sts[i].z,
+                                        anch[a * 3 + 0], anch[a * 3 + 1],
+                                        anch[a * 3 + 2]);
+                        if (nearest < 0.0f || d < nearest) nearest = d;
+                    }
+                    if (nearest > ghostMaxD) ghostMaxD = nearest;
+                    if (EDGE_BAND > 0.0f && nearest >= EDGE_BAND) ++ghostEdge;
                     if (dumpGhost == 1 && ghostRows < 10) {
                         ++ghostRows;
                         char nm[48]; engine::charName(cs[i], nm, sizeof(nm));
@@ -551,24 +671,177 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
             // world_parity: PC rows on the join too (the peer-driven copies) -
             // the host/join cls=pc pairs are what the PC position gate judges.
             emitPcRows(gw);
-            char w[112]; _snprintf(w, sizeof(w) - 1,
-                "SCENARIO WORLD n=%u cls=join drv=%u cen=%u hid=%u ghost=%u fresh=%d",
+            // Phase 0.5 fields are APPENDED: Get-WorldRows' regex stops at
+            // ghost= and tolerates any trailing text (fresh= already rides
+            // past it), so the oracle contract is unchanged.
+            char w[224]; _snprintf(w, sizeof(w) - 1,
+                "SCENARIO WORLD n=%u cls=join drv=%u cen=%u hid=%u ghost=%u fresh=%d "
+                "cap=%d ghostMax=%.0f ghostEdge=%u dorm=%u",
                 (unsigned)counted.size(), cDrv, cCen, cHid, cGhost,
-                censusFresh ? 1 : 0);
+                censusFresh ? 1 : 0, (nearTrunc || wideTrunc) ? 1 : 0,
+                ghostMaxD, ghostEdge, cDorm);
             w[sizeof(w) - 1] = '\0'; coop::logLine(w);
         }
-        char b[192]; _snprintf(b, sizeof(b) - 1,
+        // Phase 0.5 fields appended after parks= (existing prefix untouched):
+        //   nearCap/wideCap - the enumeration hit its buffer and judged an
+        //                     INCOMPLETE world; absence stopped meaning absent
+        //   staleMs/edges   - how long wide culling has been disabled, and how
+        //                     often it dropped out (each edge leaks ghosts)
+        //   ghostMax/Edge   - how far ghosts reach, and how many sit in the
+        //                     outer 20% band next to the un-enumerable horizon
+        //   dorm/attnR      - bodies the attention gate left alone, and the
+        //                     radius it used (0 = gate off, so dorm is always
+        //                     0 and every bucket reads as it did before)
+        //   dormPc/pcs      - gate safety violation count: dormant bodies
+        //                     within attnR of a player character (must be 0),
+        //                     over the pcs squad members it was measured
+        //                     against - pcs=0 makes the zero vacuous
+        char b[352]; _snprintf(b, sizeof(b) - 1,
             "[audit] exist near=%u wide=%u drv=%u cen=%u hid=%u ghost=%u "
-            "supp=%u census=%u fresh=%d parks=%lu",
+            "supp=%u census=%u fresh=%d parks=%lu "
+            "nearCap=%d wideCap=%d staleMs=%lu edges=%lu ghostMax=%.0f ghostEdge=%u "
+            "dorm=%u attnR=%.0f dormPc=%u pcs=%u",
             n, wn, cDrv, cCen, cHid, cGhost,
             (unsigned)suppressed_.size(), (unsigned)censusHands_.size(),
-            censusFresh ? 1 : 0, censusParks_);
+            censusFresh ? 1 : 0, censusParks_,
+            nearTrunc ? 1 : 0, wideTrunc ? 1 : 0,
+            censusStaleMs_, censusStaleEdges_, ghostMaxD, ghostEdge,
+            cDorm, attentionRadius_, cDormPc, nPc);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
     // Phase 3 lifecycle upkeep: prune left-interest records + self-audit
     // mintable hands stuck in DISCOVERED (the invisible-raid failure).
     lifeSweep(gw, now);
+    measureAttach(now);
+}
+
+// Phase C capability veto: drop any anchor whose zone this engine has not
+// loaded, so we never claim existence-authority over ground we cannot see.
+//
+// The first two raw anchors are the squad-tab LEADERS (interestCenters fills
+// them before the camera anchors and only ever drops camera ones), which is the
+// safety property the gate rests on - an unwatched squad still anchors its own
+// surroundings. The veto can in principle remove a leader too, but only when
+// its zone is unloaded here, and an unloaded zone holds no enumerable bodies to
+// go dormant. Measured: hostZoneUnloaded=0 at 5,200 u separation, and dormPc=0
+// (dormant bodies next to a player character) across every gated run.
+//
+// THROTTLED, and not for CPU cost. `isZoneLoadedAt` reaches into ZoneManager,
+// whose members are boost shared_mutex-protected and written by the engine's own
+// zone-loader thread. Before this veto the query ran ~1 Hz from the census
+// diagnostics; the authority pass runs every tick, so calling it here put
+// hundreds of acquisitions per second of main-thread traffic onto a lock the
+// loader thread holds while streaming. Nothing measured proves that stalls the
+// game loop - the stall signature in the logs predates this code by six weeks -
+// but the trade is one-sided: the answer only changes as zones stream, on a
+// multi-second scale, so a cached verdict costs nothing and a permanently
+// wedged main thread costs the session. Re-query on the interval, or at once if
+// an anchor jumped (a camera cut or teleport can cross a zone edge instantly).
+unsigned int Replicator::attentionAnchors(GameWorld* gw, const float* raw,
+                                          unsigned int nRaw, float* out) {
+    if (!raw || !out) return 0;
+    const unsigned long ATTN_VETO_MS  = 500;
+    const float         ATTN_VETO_JUMP = 100.0f;
+    unsigned long nowV = nowMs();
+    bool reuse = (attnVetoMs_ != 0) && ((nowV - attnVetoMs_) < ATTN_VETO_MS)
+                 && (attnVetoRawN_ == nRaw);
+    for (unsigned int a = 0; reuse && a < nRaw; ++a)
+        if (dist3(raw[a * 3 + 0], raw[a * 3 + 1], raw[a * 3 + 2],
+                  attnVetoRaw_[a * 3 + 0], attnVetoRaw_[a * 3 + 1],
+                  attnVetoRaw_[a * 3 + 2]) > ATTN_VETO_JUMP) reuse = false;
+    if (reuse) {
+        for (unsigned int i = 0; i < attnVetoOutN_ * 3; ++i) out[i] = attnVetoOut_[i];
+        return attnVetoOutN_;
+    }
+    unsigned int nOut = 0;
+    for (unsigned int a = 0; a < nRaw && nOut < 4; ++a) {
+        const float* p = raw + a * 3;
+        if (attentionRadius_ > 0.0f && !engine::isZoneLoadedAt(gw, p[0], p[1], p[2]))
+            continue;
+        out[nOut * 3 + 0] = p[0];
+        out[nOut * 3 + 1] = p[1];
+        out[nOut * 3 + 2] = p[2];
+        ++nOut;
+    }
+    attnVetoMs_   = nowV;
+    attnVetoRawN_ = nRaw;
+    for (unsigned int i = 0; i < nRaw * 3 && i < 12; ++i) attnVetoRaw_[i] = raw[i];
+    attnVetoOutN_ = nOut;
+    for (unsigned int i = 0; i < nOut * 3; ++i) attnVetoOut_[i] = out[i];
+    if (nOut < nRaw) {
+        static unsigned long vetoLogMs = 0; // main-thread only
+        if (vetoLogMs == 0 || (nowV - vetoLogMs) >= 10000) {
+            vetoLogMs = nowV;
+            char b[112]; _snprintf(b, sizeof(b) - 1,
+                "[attn] anchor veto %u/%u (zone not loaded here)",
+                nRaw - nOut, nRaw);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+    return nOut;
+}
+
+bool Replicator::observedAt(const Key& k, const float* anchors,
+                            unsigned int nAnchor, float x, float y, float z) {
+    if (attentionRadius_ <= 0.0f) return true;   // gate off
+    // No anchors at all means no players in gameplay (interestCenters returns
+    // 0 before the squads exist). Fail OPEN - a startup tick must not declare
+    // the whole world dormant.
+    if (!anchors || nAnchor == 0) return true;
+    // Leaving costs 25% more reach than entering. Both clients run this over
+    // anchor sets that agree only approximately, so a body parked on the
+    // threshold would flip out of phase between them without the deadband.
+    const float ATTN_LEAVE_SCALE = 1.25f;
+    std::map<Key, bool>::iterator it = attnObs_.find(k);
+    bool was = (it != attnObs_.end()) && it->second;
+    float r = was ? attentionRadius_ * ATTN_LEAVE_SCALE : attentionRadius_;
+    bool now = false;
+    for (unsigned int a = 0; a < nAnchor && !now; ++a) {
+        float d = dist3(x, y, z, anchors[a * 3 + 0], anchors[a * 3 + 1],
+                        anchors[a * 3 + 2]);
+        now = (d <= r);
+    }
+    if (now && !was) ++attnFlips_;   // Phase B: an attach to be paid for
+    if (it != attnObs_.end()) it->second = now;
+    else                      attnObs_[k] = now;
+    return now;
+}
+
+void Replicator::measureAttach(unsigned long now) {
+    // Phase B, measurement only: what does an attach actually cost? Open a
+    // window on the first one and report the suppressions, culls and proxy
+    // mints that landed inside it. A window with nothing to show for it stays
+    // silent - bodies drift across the threshold constantly as squads walk,
+    // and one line per quiet crossing would bury the bursts this exists to
+    // find.
+    const unsigned long ATTN_WIN_MS = 3000;
+    if (attnFlips_ > 0 && attnWinMs_ == 0) {
+        attnWinMs_     = now;
+        attnBaseSupp_  = authSuppresses_;
+        attnBaseCull_  = censusCulls_;
+        attnBaseProxy_ = (unsigned int)proxyByKey_.size();
+    }
+    if (attnWinMs_ == 0 || (now - attnWinMs_) < ATTN_WIN_MS) return;
+    unsigned long dSupp = authSuppresses_ - attnBaseSupp_;
+    unsigned long dCull = censusCulls_ - attnBaseCull_;
+    int dProxy = (int)proxyByKey_.size() - (int)attnBaseProxy_;
+    if (attnFlips_ >= 4 || dSupp || dCull || dProxy) {
+        char b[176]; _snprintf(b, sizeof(b) - 1,
+            "[attn] attach bodies=%lu hid=+%lu culled=+%lu minted=%+d winMs=%lu",
+            attnFlips_, dSupp, dCull, dProxy, (unsigned long)ATTN_WIN_MS);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    attnFlips_ = 0;
+    attnWinMs_ = 0;
+}
+
+void Replicator::pruneAttention(const std::set<Key>& seen) {
+    for (std::map<Key, bool>::iterator it = attnObs_.begin();
+         it != attnObs_.end(); ) {
+        if (seen.find(it->first) == seen.end()) attnObs_.erase(it++);
+        else ++it;
+    }
 }
 
 float Replicator::parkDivergedCopy(Character* c, const EntityState& st, const Key& k) {

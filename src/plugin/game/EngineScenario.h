@@ -96,6 +96,16 @@ int  rearmDownScene(GameWorld* gw);
 // to split (host owns tab 0, join owns tab 1). Host-only; user SAVEs the result.
 bool setupSquadScene(GameWorld* gw);
 
+// split_far fixture bake: relocate every player-squad member that is NOT in the
+// LEADER's squad tab to (x,y,z) and halt it there, so the baked save opens with
+// the two tabs in two different regions. Host-only, single client - doing this
+// in a co-op run and capturing afterwards does NOT work, because armConnectPush
+// bakes the live world before the squads are positioned.
+// The default target is a measured one: the join enumerates ~8 world NPCs there
+// while the host enumerates 0 with the zone LOADED, which is the far-apart
+// desync this fixture exists to hold still. Returns the number relocated.
+unsigned int setupSplitFarScene(GameWorld* gw, float x, float y, float z);
+
 // down_order LIVE-transition helpers (Stage 2). pickDownSubject pins the non-squad
 // NPC nearest the leader (its hand, readObjectHand layout); holdSubjectUpright keeps
 // it idle/in-range during the baseline; orderDownSubject knocks THAT subject out at

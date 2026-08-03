@@ -185,3 +185,150 @@ stayed green across three reported-bug sessions.
 **Rule.** Ask how the feature is actually driven, and make at least one gate drive
 it that way. `inv_dump_all` exists for this; `inv_dump_all_transient` is its
 fault-injected twin (§8).
+
+## 11. Put the camera where the player's camera would be
+
+§10 is about the *action* a gate drives. This is about the *viewpoint* it drives
+it from, which turns out to be load-bearing in its own right.
+
+`park()` teleports bodies and does not touch the camera, and nothing else in the
+harness moved it either — `cameraCenter()` could only read. So every automated
+run watched wherever the save happened to leave the camera. In `split_far`, which
+separates the two squads by ~5,200 u, that meant **both** clients stared at the
+host's squad for the whole window while the join's characters stood 5,200 u
+off-screen. No player has ever played that way, and the anchor count said so:
+`anchors=3`, being the two tab leaders plus one camera hovering 167 u above the
+host's leader (just outside the 100 u dedupe). There was never an anchor at the
+far end.
+
+Adding `cameraFocusOn` and pointing each side at its own tab leader changed the
+run substantially. NPC population at the join's own squad, previously 5, ranged
+**5–22** across five runs, and two of those runs failed existence-parity with
+ghost runs of 7 consecutive samples — the reported "join sees NPCs the host
+doesn't" symptom, which the parked-camera configuration never produced:
+
+| popMover | 5 | 5 | 10 | 12 | 22 |
+|---|---|---|---|---|---|
+| existence-parity | PASS | PASS | PASS | FAIL | FAIL |
+
+The failure tracks **population**, not the camera directly; the camera matters
+because it is one of the things that drives population up. Smoothness went from
+PASS to FAIL in 5/5 follow-camera runs (`zeroFrac ≈ 0.95`).
+
+Two cautions on reading this:
+
+- Only the **join's** camera was ever varied. The host's sat on the host's squad
+  in every run including the parked one, so nothing here isolates the effect of
+  the host looking away from its own people.
+- One parked-camera sample is not a baseline. "The camera raises population" is
+  consistent with the data but not established by it — two follow-camera runs
+  also came in at 5.
+
+**Rule.** State the viewpoint a scenario runs from as deliberately as it states
+the positions, and re-point the camera after any teleport. A gate that never
+renders the region it is making claims about is measuring enumeration only,
+while the symptom it is chasing is something a player *sees*.
+
+## 12. A symmetric swap is still a disjoint view
+
+The first phased version of `split_far` ran `own → cross → back`: each side on
+its own squad, then **both** cameras swapped to the peer's squad, then back.
+That looks like it covers the space, and it does not. Swapping both at once
+mirrors the arrangement without ever overlapping it — in all three phases the
+two clients are drawing *different* characters.
+
+That matters because a disagreement measured under disjoint views is
+unattributable. If the join counts bodies at a spot and the host does not, the
+host might have failed to replicate them, or the host might simply not be
+looking. Nothing in the run separates those.
+
+For two clients and two squads there are four arrangements, and the swap covers
+neither of the interesting ones:
+
+| | host → stay | host → mover |
+|---|---|---|
+| **join → mover** | `own` (disjoint) | `cross` (disjoint) |
+| **join → stay** | **`both_stay`** (overlap) | **`both_mover`** (overlap) |
+
+The scenario now runs `own → both_stay → both_mover → back`. `cross` is dropped:
+it is disjoint like `own`, and `both_mover` already answers the question it was
+there for (does the host's count rise when the host looks at the mover?) while
+also giving overlap. Verified from the `[cam]` telemetry rather than assumed —
+under `both_mover` the two cameras report identical centres
+(`-50476.1,868.4,-2699.8` on both sides).
+
+**Rule.** When a test compares two observers, check that its phases put them on
+the same subject at least once. Otherwise every difference it reports has a
+second explanation, and the reassuring result — the counts matching — is the
+one most likely to be an artefact of neither side looking.
+
+**Caveat carried forward.** The per-phase table compares *counts*
+(`countNpcsNear`), not identities: two clients can hold five bodies each and
+disagree about which five. `existence_parity` is the identity check, and it
+stays advisory here precisely because this scenario exists to expose ghosts.
+
+## 13. Both harness clients share one save folder, and the host writes to it
+
+The two worlds disagree at PLATOON granularity, not per body. Diff the
+`[platoon] first-sight` container ids from the two logs and the sets differ by
+7–13 squads; at a settlement that reads as duplicated *roles* — two `Barman`
+bodies where there is one bar, six `Ninja Guard` against four. The extra copies
+go `drv → ghost → hid` and then run their AI invisibly, and the seconds before
+suppression are what players report as "the join sees NPCs the host doesn't".
+That much is solid, and it is worth knowing that census truncation, staleness,
+zone loading and the mint path were all clean in every run that showed it.
+
+What the harness **cannot** currently tell you is why. Both installs auto-load
+from the same `%LOCALAPPDATA%\kenshi\save` folder, and the host's connect-push
+bakes its live world *into that same folder* while the join is reading it —
+`sync_save.cmd` says in its own header "close both Kenshi instances first so
+save files aren't mid-write", which is exactly what the runner then does not
+do. So what the join loads is decided by a race against the host's write.
+
+This is easy to mistake for a causal result. Varying `-JoinDelaySec` produces a
+clean monotone table — host solo before bake 15s / 68s / 128s giving 7–12 / 2 /
+0 join-only platoons — which reads as "bake earlier, diverge more". It is not.
+Deferring the bake by 120s *in the plugin*, so the host settles exactly as long
+but the join launches at the usual moment, gave **13** join-only platoons, the
+worst result measured. The stagger was moving the join's load relative to the
+host's write, not changing what a settled world looks like.
+
+**Rule.** Before drawing any conclusion about what the join loaded, establish
+*which bytes* it loaded. On one machine with a shared save folder and a host
+that writes mid-session, that is a race, and no amount of timing variation
+turns it into evidence. Give the two installs separate save folders — or drive
+the join's load entirely from `LOAD_GO` after the write has quiesced — before
+re-running any experiment of this shape.
+
+## 14. A predicate two clients must agree on has to be published, not derived
+
+The attention gate stops both clients reconciling a region neither is watching:
+if no attention centre is within `KENSHICOOP_ATTENTION_RADIUS`, the host omits
+those bodies from its census and the join stops counting suppression frames
+against them. That only works if the two sides reach the *same* verdict about
+the same body. Wherever an input to the predicate is private, they cannot.
+
+Three of the four centres were already common — both clients load the same save,
+so both hold both squad tabs, and a tab leader's position is the same number on
+each machine. The camera was the exception. `PKT_CAM_HINT` shipped join → host
+only, because its original job was widening the host's interest spheres, and for
+that one direction is enough. As a *gate* input it is not: with the host's camera
+private, the join has to assume the host is always watching, which is the
+assumption that keeps the ghost churn alive. The hint is now bidirectional.
+
+The safety property the design rests on is that a squad is never dormant just
+because no camera is on it — every tab leader is an interest centre, so bodies
+beside a leader are observed whether or not anybody is looking. That is true by
+construction in `interestCenters` (leaders fill the first slots; the four-slot
+cap can only drop *camera* anchors), and it is measured rather than assumed:
+`dormPc` on the `[audit] exist` line counts dormant bodies within the radius of
+any player character, `existence_parity` FAILs on a non-zero, and `pcs` reports
+the squad size it was measured against so a vacuous zero is visible. Note that
+every harness save carries one character per tab, so the case the metric exists
+to catch — a squad *member* that walked away from its leader and anchors nothing
+— cannot be staged here yet.
+
+**Rule.** Before gating behaviour on a predicate, list its inputs and ask which
+of them the peer can see. An input only one side holds does not make the gate
+approximate, it makes the two sides run different gates. Publish it, or drop it
+from the predicate.

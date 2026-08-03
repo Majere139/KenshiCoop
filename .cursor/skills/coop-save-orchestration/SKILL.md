@@ -89,6 +89,7 @@ VALIDATION saves are referenced by `scripts/scenarios.psd1` and must stay stable
 | `bedcage1` | validation (fixture) | Baked Camp Bed + Prisoner Cage: bed_*, cage_*, chain_put. |
 | `pole1` | validation (fixture) | Baked standing Prisoner Pole: pole_put. |
 | `camp` | validation | Dense prison save (many NPCs): camp_approach, world_parity, shackle_*. |
+| `splitfar1` | validation (fixture) | The pair SPLIT ~5200 u apart with NPCs at BOTH ends: split_far. Baked with `bake_scene.ps1 -Setup splitfar -BaseSave separate`, which parks the non-leader tab at a measured populated point. Re-make it that way, never via `capture_save.ps1` - see the capture-after-a-run warning below. |
 | `jailed` | validation | Join PC caged: jail_probe / jail_soak. |
 | `coopresume` | validation (auto-written) | Coordinated save/load transfer target (protocol 31/32). Written by the tests — never hand-edit. |
 | `zoom` | debug | Outside town, camera far out — long-run pop/snap inspection. |
@@ -103,7 +104,8 @@ etc.) are ad-hoc testbeds; confirm intent before reusing them.
 Validation fixtures live under `fixtures/saves/<name>\` (full save folder:
 `quick.save`, `platoon/`, `zone/`, `portraits_texture.png`) - the pristine source
 of truth. The tracked set matches the saves in `scripts/scenarios.psd1`:
-`sync, squad1, squad2, c, duel1, down1, craft1, bedcage1, pole1, camp, jailed, coopresume`.
+`sync, squad1, squad2, c, duel1, down1, craft1, bedcage1, pole1, camp, jailed, coopresume,
+splitfar1`.
 Debug saves (`together`, `separate`, `zoom`) are NOT tracked; drift there is fine.
 
 - **Restore (automatic):** `run_test.ps1` restores the scenario's save from the
@@ -133,6 +135,12 @@ Rules:
   the next `run_test.ps1` restores it - but keep manual play off fixtures anyway.)
 - NEVER hand-edit `fixtures/saves/*` directly. Change a fixture only via
   `bake_scene.ps1 -Promote` or `capture_save.ps1`, then commit the reviewed diff.
+- Do NOT `capture_save.ps1` a save that a CO-OP run just used to record the scene
+  that run set up. `armConnectPush` bakes the live world early, before scenario
+  positioning, so the captured folder holds the pre-scenario layout rather than
+  the one you watched. This produced a `splitfar1` with the squads together when
+  the whole point was to have them 9800 u apart. Positioned scenes must be built
+  by a `bake_scene.ps1` SETUP (single host, no connect-push, explicit write).
 - To (re)create a baked fixture, use `bake_scene.ps1` deliberately - that is the
   ONLY sanctioned way to write a fixture folder. After baking, spot-check that the
   scenario it feeds still passes, then `-Promote` / capture it.

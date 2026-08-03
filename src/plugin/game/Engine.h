@@ -183,6 +183,17 @@ unsigned int listPlayerChars(GameWorld* gw, Character** out, unsigned int maxOut
 // forwards its value to the host at ~1Hz via PKT_CAM_HINT.
 bool cameraCenter(GameWorld* gw, float out[3]);
 
+// SEH-guarded: point the LOCAL camera at a character (the engine's own
+// focusCameraOnObject - select-and-look-at, and it keeps following).
+// Automated scenarios teleport bodies with park(), which does NOT move the
+// camera, so before this existed a split-squad run left BOTH clients watching
+// whichever squad the save started on - measured in run 20260802_112449, where
+// the host and join cameras sat on the same point ~5200 u from the join's own
+// characters for the entire window. That is not a configuration anyone plays
+// in, and it matters: what a player SEES is camera-driven, and the camera also
+// contributes an interest anchor. Returns false if the lever is unresolved.
+bool cameraFocusOn(GameWorld* gw, Character* c);
+
 // Camera-anchored interest anchor stores (protocol 43). The sync layer
 // publishes the LOCAL camera center and the peer's (fresh) camera hint each
 // tick; interestCenters folds them in as extra anchors, deduped against the
@@ -250,8 +261,13 @@ bool isPlayerSquad(GameWorld* gw, RootObject* obj);
 // writing each live Character* into outChars and its hand-bearing snapshot into
 // outStates. Returns the count. Used by the join to find NPCs the host is NOT
 // streaming so it can suppress them (host-authoritative world).
+// *outTruncated (optional) is set when the enumeration hit maxOut with candidates
+// still pending - the result is then an INCOMPLETE view of the local world, and a
+// caller that treats absence as authority (suppress/cull) would judge bodies it
+// never saw. A bare count cannot express this: n == maxOut is indistinguishable
+// from a list that happened to fit exactly.
 unsigned int listNpcs(GameWorld* gw, Character** outChars, EntityState* outStates,
-                      unsigned int maxOut);
+                      unsigned int maxOut, bool* outTruncated = 0);
 
 // SEH-guarded: WIDE-radius world-NPC enumeration (protocol 36 census). Same
 // exclusions as listNpcs (never the local player squad) but the query reaches
@@ -259,8 +275,21 @@ unsigned int listNpcs(GameWorld* gw, Character** outChars, EntityState* outState
 // bubble - the host builds its 1 Hz existence census from this, and the join
 // scans the same radius to find local-only ghosts to cull. States are hand +
 // position only in spirit (captureOne fills everything; callers use the hand).
+// *outTruncated: see listNpcs. It matters more here - a truncated HOST census
+// silently reports "these NPCs do not exist" for everything past the cap, and
+// the join culls real bodies against it.
 unsigned int listNpcsWide(GameWorld* gw, float radius, Character** outChars,
-                          EntityState* outStates, unsigned int maxOut);
+                          EntityState* outStates, unsigned int maxOut,
+                          bool* outTruncated = 0);
+
+// SEH-guarded: how many world NPCs (never the local player squad) sit within
+// 'radius' of ONE point. Deliberately NOT anchor-driven: listNpcs/listNpcsWide
+// sweep every interest center under a shared output budget, so a scenario that
+// used them to measure the population at a specific place would inherit the
+// very budgeting and horizon behaviour it is trying to characterise. Counts
+// only - no capture, no dedupe (one sphere cannot repeat a body). 0 on fault.
+unsigned int countNpcsNear(GameWorld* gw, float x, float y, float z,
+                           float radius);
 
 // SEH-guarded: copy a character's display name into 'out' (always NUL-
 // terminated; empty string on any fault). Diagnostics only - cull/suppress

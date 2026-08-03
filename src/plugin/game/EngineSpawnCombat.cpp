@@ -1105,6 +1105,63 @@ bool setupSquadScene(GameWorld* gw) {
     return ra || rb;
 }
 
+// 'splitfar' setup scene (far-apart desync fixture bake): move every player-squad
+// member that is NOT in the leader's tab to a fixed remote point and halt it
+// there, so the baked save OPENS with the two tabs in two different regions.
+// Tab identity is the hand CONTAINER (see setupSquadScene), so "the leader's tab"
+// is just playerCharacters[0]'s container - no rank sort needed, and the member
+// dump below makes the split verifiable from the host log.
+//
+// This has to be a BAKE rather than a capture after a co-op run: armConnectPush
+// writes the live world early, before scenario positioning, so a captured folder
+// records the squads together (that is how the first splitfar1 came out wrong).
+unsigned int setupSplitFarScene(GameWorld* gw, float x, float y, float z) {
+    if (!gw || !gw->player) {
+        coop::logLine("SETUP(splitfar): no player interface");
+        return 0;
+    }
+    PlayerInterface* pl = gw->player;
+    unsigned int moved = 0;
+    __try {
+        unsigned int n = pl->playerCharacters.size();
+        if (n == 0) { coop::logLine("SETUP(splitfar): empty player squad"); return 0; }
+        Character* ld = pl->playerCharacters[0];
+        unsigned int lh[5];
+        if (!ld || !readObjectHand(static_cast<RootObject*>(ld), lh)) {
+            coop::logLine("SETUP(splitfar): leader hand unreadable");
+            return 0;
+        }
+        char hdr[176];
+        _snprintf(hdr, sizeof(hdr) - 1,
+                  "SETUP(splitfar): playerChars=%u leaderTab=%u,%u target=%.0f,%.0f,%.0f",
+                  n, lh[1], lh[2], x, y, z);
+        hdr[sizeof(hdr) - 1] = '\0'; coop::logLine(hdr);
+
+        for (unsigned int i = 0; i < n; ++i) {
+            Character* c = pl->playerCharacters[i];
+            if (!c) continue;
+            unsigned int h[5];
+            if (!readObjectHand(static_cast<RootObject*>(c), h)) continue;
+            bool leaderTab = (h[1] == lh[1] && h[2] == lh[2]);
+            if (!leaderTab) {
+                // Spread them slightly so they do not stack on one point.
+                park(c, x + (float)moved * 3.0f, y, z, 0.0f);
+                ++moved;
+            }
+            char b2[192];
+            _snprintf(b2, sizeof(b2) - 1,
+                      "SETUP(splitfar): member[%u] idx=%u,%u tab=%u,%u %s",
+                      i, h[3], h[4], h[1], h[2],
+                      leaderTab ? "STAYS" : "MOVED");
+            b2[sizeof(b2) - 1] = '\0'; coop::logLine(b2);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("SETUP(splitfar): FAULTED");
+        return moved;
+    }
+    return moved;
+}
+
 // Keep down bodies down. A healthy ragdolled body recovers and stands back up, and
 // ragdoll state does not survive save/load, so the host re-applies ragdoll on an
 // interval. Rather than guess WHICH nearby NPC is "the subject" (the pin is empty

@@ -181,6 +181,17 @@ typedef void (__fastcall* AttackTargetFn)(Character* self, Character* who);
 typedef Ogre::Vector3* (__fastcall* CamGetCenterFn)(const CameraClass* self,
                                                     Ogre::Vector3* ret);
 typedef bool           (__fastcall* CamIsInitFn)(const CameraClass* self);
+// Camera PLACEMENT (split_far realism): the harness could only ever READ the
+// camera, so an automated run left it wherever the save put it while park()
+// teleported the bodies away - both clients ended up watching the host's squad
+// from thousands of units off. focusCameraOnObject is the engine's own
+// select-and-look-at, so a scenario can put each side's camera on its own
+// squad the way a player would. The Vector3 offset is a const reference, i.e.
+// a pointer in R8.
+typedef void           (__fastcall* CamFocusFn)(CameraClass* self,
+                                                RootObject* object,
+                                                const Ogre::Vector3* offset,
+                                                bool nearZoom);
 
 // game speed / clock
 typedef void (__fastcall* SetGameSpeedFn)(GameWorld* self, float speed, bool click);
@@ -372,6 +383,7 @@ extern SetStealthModeFn  g_setStealthModeFn;
 extern NotifySeeSneakFn  g_notifySeeSneakFn;
 extern CamGetCenterFn    g_camGetCenterFn;
 extern CamIsInitFn       g_camIsInitFn;
+extern CamFocusFn        g_camFocusFn;
 extern AttackTargetFn    g_attackTargetFn;
 
 // game speed / clock (+ intent hooks state)

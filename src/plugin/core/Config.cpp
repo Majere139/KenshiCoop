@@ -302,6 +302,12 @@ void loadConfig(Config& c) {
         std::string cp = envOr("KENSHICOOP_CENSUS_PARK", "");
         c.censusParkDist = cp.empty() ? 120.0f : (float)std::atof(cp.c_str());
         if (c.censusParkDist < 0.0f) c.censusParkDist = 0.0f;
+        // Attention gate: "0" (explicit) disables - every body counts as
+        // observed and reconciliation behaves exactly as it did before the
+        // gate existed. Absent = 1000 u default.
+        std::string ar = envOr("KENSHICOOP_ATTENTION_RADIUS", "");
+        c.attentionRadius = ar.empty() ? 1000.0f : (float)std::atof(ar.c_str());
+        if (c.attentionRadius < 0.0f) c.attentionRadius = 0.0f;
         // Census-band AI freeze: quiesce a diverging census-band body's local
         // AI so it can't flee/aggro the join's guards. DEFAULT ON; the A/B
         // escape hatch restores the position-park-only behavior.
@@ -389,11 +395,13 @@ std::string describeConfig(const Config& c) {
         first = false;
     }
     s += "]";
-    char b[160];
+    char b[192];
     _snprintf(b, sizeof(b) - 1,
-              " censusR=%.0f mintR=%.0f park=%.0f snap=%.1f/%.2fs armMs=%lu",
+              " censusR=%.0f mintR=%.0f park=%.0f snap=%.1f/%.2fs armMs=%lu"
+              " attnR=%.0f",
               c.censusRadius, c.spawnMintRadius, c.censusParkDist,
-              c.snapDist, c.snapSeconds, c.scenarioArmTimeoutMs);
+              c.snapDist, c.snapSeconds, c.scenarioArmTimeoutMs,
+              c.attentionRadius);
     b[sizeof(b) - 1] = '\0';
     s += b;
     return s;

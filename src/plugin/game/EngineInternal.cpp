@@ -373,6 +373,7 @@ SetStealthModeFn  g_setStealthModeFn  = 0;
 NotifySeeSneakFn  g_notifySeeSneakFn  = 0;
 CamGetCenterFn    g_camGetCenterFn    = 0;
 CamIsInitFn       g_camIsInitFn       = 0;
+CamFocusFn        g_camFocusFn        = 0;
 
 // Limb state with the engine's null policy: robotLimbs is lazily allocated, and
 // a null robotLimbs means "no limb ever lost/replaced" == ORIGINAL on all four.
@@ -1558,6 +1559,10 @@ void resolve() {
     // anchor off, interest falls back to squad-tab leaders only).
     g_camGetCenterFn = (CamGetCenterFn)KenshiLib::GetRealAddress(&CameraClass::getCenter);
     g_camIsInitFn    = (CamIsInitFn)KenshiLib::GetRealAddress(&CameraClass::isInitialised);
+    // Camera placement (non-fatal: unresolved -> cameraFocusOn no-ops and a
+    // scenario simply runs with the camera wherever the save left it).
+    g_camFocusFn =
+        (CamFocusFn)KenshiLib::GetRealAddress(&CameraClass::focusCameraOnObject);
     // Consensus game-speed sync (non-fatal: unresolved -> speed sync off).
     g_setGameSpeedFn = (SetGameSpeedFn)KenshiLib::GetRealAddress(&GameWorld::setGameSpeed);
     g_userPauseFn    = (UserPauseFn)KenshiLib::GetRealAddress(&GameWorld::userPause);    g_togglePauseFn = (UserPauseFn)KenshiLib::GetRealAddress(&GameWorld::togglePause);

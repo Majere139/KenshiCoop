@@ -48,9 +48,14 @@ Replicator::Replicator()
       trustGrants_(0), trustRevokes_(0),
       authSuppresses_(0), authRestores_(0), authReassertMs_(0), authPruned_(0),
       censusRadius_(0.0f), censusSendMs_(0), censusRecvMs_(0), censusCulls_(0),
+      censusPubTrunc_(false), censusFreshPrev_(false), censusFreshChkMs_(0),
+      censusStaleMs_(0), censusStaleEdges_(0),
       camHintSendMs_(0), peerCamMs_(0),
       midCursor_(0), midSliceMs_(0),
       censusParkDist_(0.0f), censusParks_(0), censusFreezeAi_(true),
+      attentionRadius_(0.0f),
+      attnFlips_(0), attnWinMs_(0), attnBaseSupp_(0), attnBaseCull_(0),
+      attnBaseProxy_(0), attnVetoMs_(0), attnVetoRawN_(0), attnVetoOutN_(0),
       auditRows_(false), jailProbe_(false), jailObserve_(false),
       speedLastApplied_(-1.0f), speedMyReq_(-1.0f), speedPeerReq_(-1.0f),
       speedMyCombat_(false), speedPeerCombat_(false), speedLastSet_(-1.0f),
@@ -70,6 +75,7 @@ Replicator::Replicator()
       storeSync_(false), contCensusMs_(0),
       timeSync_(true), timeSlew_(1.0f), timeSeqOut_(1), timeSeqSeen_(0),
       timeLastSendMs_(0), timeLastLogMs_(0), timeSlewApplied_(-1.0f),
+      platoonT0_(0),
       lifeSweepMs_(0) {
     peerCam_[0] = peerCam_[1] = peerCam_[2] = 0.0f;
 }
@@ -190,6 +196,14 @@ void Replicator::resetSession() {
     // Protocol 43: the camera hint describes the OLD world's coordinates.
     camHintSendMs_ = 0;
     peerCamMs_ = 0;
+    // Attention latches are per-hand state about the OLD world's geometry.
+    attnObs_.clear();
+    attnFlips_ = 0;
+    attnWinMs_ = 0;
+    // The zone verdict describes the OLD world's streaming state.
+    attnVetoMs_ = 0;
+    attnVetoRawN_ = 0;
+    attnVetoOutN_ = 0;
     furnPeerPend_.clear();
     ownFurnExit_.clear();
     // Session maps + change-gate baselines (they describe the OLD world; the

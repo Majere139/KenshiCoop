@@ -604,14 +604,14 @@ public:
     // (censusHands_) consumed by enforceHostAuthority's wide-radius pass.
     void applyNpcCensus(Inbound& in);
 
-    // Camera hint channel (protocol 43, camera-anchored interest):
-    //  * join: read the local camera center (engine::cameraCenter) and send
-    //    it to the host at ~1 Hz (PKT_CAM_HINT, unreliable latest-wins);
-    //  * host: drain received hints into peerCam_/peerCamMs_ and publish the
-    //    fresh hint to the engine layer (engine::setPeerCamHint) so
-    //    interestCenters can anchor an extra sphere on it. Both sides also
-    //    publish their LOCAL camera as an anchor (never crosses the wire).
-    void syncCamHint(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId, bool isHost);
+    // Camera hint channel (protocol 43, camera-anchored interest). SYMMETRIC:
+    // each side reads its local camera center (engine::cameraCenter), publishes
+    // it as a local anchor, ships it to the peer at ~1 Hz (PKT_CAM_HINT,
+    // unreliable latest-wins), and drains the peer's into peerCam_/peerCamMs_
+    // for engine::setPeerCamHint. Was join -> host only until the attention
+    // gate: dormancy is a predicate both clients must agree on, so neither
+    // camera can stay private.
+    void syncCamHint(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId);
 
     // KENSHICOOP_CENSUS_RADIUS: wide-radius existence culling reach (units);
     // <= 0 disables the census channel on both sides.
@@ -640,6 +640,12 @@ public:
     // aggroed the join's guards while the host had it working. Divergence-
     // gated: well-tracking census NPCs never trip it and keep their local AI.
     void setCensusFreezeAi(bool v) { censusFreezeAi_ = v; }
+
+    // KENSHICOOP_ATTENTION_RADIUS (attention-gated reconciliation): how close
+    // an interest anchor must be to a body before the two worlds are
+    // reconciled there. <= 0 disables the gate - everything counts as
+    // observed, which is exactly the pre-gate behaviour.
+    void setAttentionRadius(float r) { attentionRadius_ = r; }
 
     // travel_parity worldstate rows: when enabled, both sides dump one
     // "SCENARIO WNPC hand=.. pos=.. cls=.. name=.." row per enumerated world
@@ -942,6 +948,18 @@ private:
     unsigned long             peerCamMs_;     // host: its arrival time (0 = none)
     std::set<Key>             censusHands_;   // join: latest existence set
     unsigned long             censusCulls_;   // join: wide-radius suppress count
+    // Phase 0.5 census diagnostics (2026-08-02 field report: "join sees local
+    // NPCs the host does not, worsening over long travel"). Four mechanisms in
+    // this file can produce that symptom and the logs could not tell them
+    // apart: the enumerations truncate silently at their caps, the wide pass
+    // switches OFF entirely on a stale census, and anything past censusRadius_
+    // is never enumerated so it cannot even be counted as a ghost. These feed
+    // the appended fields on the 5 s [audit] exist line.
+    bool                      censusPubTrunc_;   // host: last publish hit NPC_CENSUS_MAX
+    bool                      censusFreshPrev_;  // join: freshness at the last sample
+    unsigned long             censusFreshChkMs_; // join: when we last sampled it
+    unsigned long             censusStaleMs_;    // join: cumulative stale time
+    unsigned long             censusStaleEdges_; // join: fresh -> stale transitions
     // Phase 2 mid-band streaming tier (HOST): census-walk NPCs OUTSIDE the
     // ~200/260 u stream bubble, nearest-first, refreshed at the 1 Hz census
     // cadence. publishOwned round-robins a small slice of them through the
@@ -977,6 +995,36 @@ private:
     // settled, re-freeze if it diverges again).
     bool                      censusFreezeAi_;
     std::map<Key, unsigned long> censusFrozen_; // join: per-key freeze-hold tick
+    // Attention gate (KENSHICOOP_ATTENTION_RADIUS). Reconciliation follows
+    // attention: a body no interest anchor is within attentionRadius_ of is
+    // DORMANT, and neither side speaks for it - the host omits it from the
+    // census, the join never suppresses it for being census-absent. Anchors
+    // are the same four interestCenters both clients compute (both tab
+    // leaders, own camera, peer camera hint), so the two sides evaluate the
+    // predicate on near-identical inputs. attnObs_ carries the per-hand
+    // hysteresis bit; both roles use it, pruned against each tick's
+    // enumeration.
+    float                     attentionRadius_; // 0 = gate off (all observed)
+    std::map<Key, bool>       attnObs_;         // per-hand observed latch
+    // Phase B attach measurement. A dormant -> observed transition forces a
+    // reconciliation burst: everything the gate had been leaving alone gets
+    // judged in one frame, and the mints deferred past mintR fire together as
+    // the camera closes. Size that burst from real runs before deciding
+    // whether it needs a pre-warm band or a rate limit. The window opens on
+    // the first attach and reports what the attaches cost.
+    unsigned long             attnFlips_;      // hands attached this window
+    unsigned long             attnWinMs_;      // window open stamp (0 = closed)
+    unsigned long             attnBaseSupp_;   // authSuppresses_ at open
+    unsigned long             attnBaseCull_;   // censusCulls_ at open
+    unsigned int              attnBaseProxy_;  // proxyByKey_.size() at open
+    // Cached zone-loaded verdict for the anchor set (Phase C veto). The query
+    // takes an engine lock the zone-loader thread writes, so the authority pass
+    // reuses a verdict for ATTN_VETO_MS unless an anchor jumped.
+    unsigned long             attnVetoMs_;     // last query stamp (0 = never)
+    float                     attnVetoRaw_[12];// anchors the verdict was for
+    unsigned int              attnVetoRawN_;
+    float                     attnVetoOut_[12];// the surviving anchors
+    unsigned int              attnVetoOutN_;
     bool                      auditRows_;     // travel_parity worldstate rows
     bool                      jailProbe_;     // KENSHICOOP_JAIL_PROBE [jail] STATE
     bool                      jailObserve_;   // KENSHICOOP_JAIL_OBSERVE [jail] OBSERVE
@@ -1724,6 +1772,22 @@ private:
     // invisible to every automated gate. Shared by the host (Publish) and
     // join (Authority) dump sites.
     void emitWnpcRow(Character* c, const EntityState& st, const char* cls);
+    // PLATOON FIRST-SIGHT probe (2026-08-02 split_far root cause). The two
+    // clients diverge at platoon granularity, not per body: the join's set of
+    // hand containers is a strict SUPERSET of the host's (runs 123408/124423:
+    // +12 and +7 platoons, none the other way), which at a settlement reads as
+    // a duplicate of every role - two Barmen where there is one bar. What that
+    // evidence cannot say is WHEN a platoon arrives, and the two explanations
+    // need opposite fixes: a platoon present from t=0 on the join alone means
+    // the HOST never instantiated it, while one appearing mid-run means the
+    // JOIN spawned it live. Logs one line per (container, containerSerial) the
+    // first time this client enumerates it, with the elapsed time, the place,
+    // and the distance to the nearest interest anchor. Called from both sides'
+    // enumeration so the two logs can be diffed directly.
+    void notePlatoons(GameWorld* gw, const EntityState* sts, unsigned int n,
+                      const char* side);
+    std::set<std::pair<unsigned int, unsigned int> > seenPlatoons_;
+    unsigned long platoonT0_;   // first notePlatoons call - the elapsed base
     // world_parity PC rows: capture every playerCharacter (both tabs) and
     // emit each as a cls=pc WNPC row. Called inside the auditRows_ dumps on
     // both sides.
@@ -1735,6 +1799,46 @@ private:
     // census position, or -1 if unknown (no census row / parking disabled) -
     // the census-band AI-freeze uses it to decide when a body is diverging.
     float parkDivergedCopy(Character* c, const EntityState& st, const Key& k);
+    // Phase C capability veto: filter an interest-anchor set down to the
+    // anchors this client can actually speak for. An anchor whose zone the
+    // LOCAL engine has not loaded (or is still streaming in) is dropped, so
+    // the region around it reads as dormant here - the host publishes no
+    // census over it and the join suppresses nothing in it. Existence
+    // authority over a block your own engine has not materialised is a claim
+    // made out of ignorance, and the census carries it as fact.
+    //
+    // Both clients apply this to the SAME anchor set, so like the attention
+    // radius it is evaluated near-identically on each side. If every anchor
+    // is vetoed the result is empty and observedAt falls open, which is
+    // today's behaviour - the degradation is toward doing what we did before,
+    // not toward silence.
+    //
+    // Writes up to four centers into out[12]; returns the count.
+    unsigned int attentionAnchors(GameWorld* gw, const float* raw,
+                                  unsigned int nRaw, float* out);
+    // Attention gate predicate: is anyone watching (x,y,z)? True if any
+    // interest anchor is within attentionRadius_. Anchors come from the
+    // caller because they are computed once per tick (engine::interestAnchors
+    // writes up to four centers into a float[12]).
+    //
+    // Hysteresis is asymmetric and latched per hand in attnObs_: a body
+    // becomes observed at attentionRadius_ but stays observed out to
+    // ATTN_LEAVE_SCALE times that. The two clients evaluate this from anchor
+    // sets that are only near-identical (squads move between ticks, camera
+    // hints arrive up to a second apart and expire after three), and a body
+    // sitting on the threshold would otherwise flip dormant/observed out of
+    // phase between them - which is the one state this design cannot hold,
+    // since it leaves the join waiting on a census the host stopped writing.
+    //
+    // attentionRadius_ <= 0 returns true for everything: gate off.
+    bool observedAt(const Key& k, const float* anchors, unsigned int nAnchor,
+                    float x, float y, float z);
+    // Drop attnObs_ latches for hands this tick's enumeration no longer sees,
+    // so a long session's map cannot grow without bound.
+    void pruneAttention(const std::set<Key>& seen);
+    // Phase B: close the attach window if it is due and log what the burst
+    // cost. Called once per authority tick.
+    void measureAttach(unsigned long now);
     // Census-band AI freeze (KENSHICOOP_CENSUS_FREEZE_AI): suspend the local AI
     // of a census-band body whose drift crossed censusParkDist_, held ~5 s past
     // the last over-threshold tick so the position park can't oscillate it back

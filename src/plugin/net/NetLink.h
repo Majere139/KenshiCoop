@@ -135,8 +135,8 @@ public:
     // the caller, so loss just delays an arrow update one snapshot.
     void queueStealth(const StealthPacket& pkt);
 
-    // MAIN thread: queue an UNRELIABLE camera hint (protocol 43, join -> host,
-    // ~1 Hz). Latest wins; loss just delays the anchor one hint.
+    // MAIN thread: queue an UNRELIABLE camera hint (protocol 43, either
+    // direction, ~1 Hz). Latest wins; loss just delays the anchor one hint.
     void queueCamHint(const CamHintPacket& pkt);
 
     // MAIN thread: queue a reliable runtime-spawn query (protocol 21, join ->

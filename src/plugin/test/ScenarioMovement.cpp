@@ -1,6 +1,6 @@
 // ScenarioMovement.cpp - squad movement + presence scenarios (monolith split
 // from Scenario.cpp, 2026-07-12): leader_move, fast_march, coop_presence,
-// travel_parity, split_interest. Classes are TU-private (anonymous
+// travel_parity, split_interest, split_far. Classes are TU-private (anonymous
 // namespace); only makeMovementScenario (ScenarioSupport.h) is exported.
 // Must NOT: change any SCENARIO log string (oracle API, resources/CODE_MAP.md).
 
@@ -566,6 +566,340 @@ private:
 
 const float SplitInterestScenario::SPLIT_DIST = 260.0f;
 
+// split_far (2026-08-02 field report, "long sessions with far travel go out of
+// sync - the join sees local NPCs the host does not"): the two squads separate
+// BEYOND the census radius and BOTH HOLD there, each in a populated region.
+//
+// No existing scenario creates that condition, which is why none of them ever
+// reproduced the symptom:
+//   - split_interest separates by SPLIT_DIST (260 u). That clears the ~200 u
+//     stream bubble but sits far INSIDE the 2000 u census sphere, so there is
+//     still only one interest cluster and the census covers both tabs.
+//   - travel_parity moves the join ~60,000 u, but the HOST FOLLOWS it (measured
+//     median gap ~14 u), so again one cluster - and its straight-ray hop
+//     corridor is mostly wilderness, so there are no NPCs to disagree about.
+//
+// The mechanism under test is that Kenshi streams zones around the LOCAL
+// camera. The host's census walks every interest anchor including the peer's,
+// but a sphere query at the peer's anchor runs against whatever the HOST's
+// engine has loaded. Once the pair separates by more than the loaded-zone
+// footprint, the host finds nothing there and publishes "no NPCs here" for a
+// place the join may be standing in the middle of a town - and the join's real
+// local bodies fall into the ghost bucket.
+//
+// Script (join): hop the rank-1 tab leader outward on a golden-angle spiral,
+//   MIN_SEP u out and widening. Mid-dwell (after the zone has had time to
+//   stream) probe the local population with engine::countNpcsNear - a single
+//   sphere around the stop, deliberately independent of the interest anchors
+//   whose budgeting is itself under test. SETTLE at the first genuinely
+//   inhabited stop and hold there; an empty stop teaches nothing.
+// Script (host): HOLD the rank-0 tab at its start (the 'sync' bar - the
+//   populated host anchor). Explicitly no follow: the pair must not reunite.
+// Both sides log SCENARIO SPLITFAR rows carrying the separation, the population
+// each side can see at BOTH tab leaders, and whether the mover's zone is loaded
+// locally. The host's popMover/moverZone pair is the direct measurement: host
+// popMover=0 moverZone=0 while the join reports a crowd is the failure, in one
+// line. Both sides also dump the 5 s worldstate rows (setAuditRows).
+class SplitFarScenario : public TimedScenario {
+public:
+    SplitFarScenario()
+        : TimedScenario("split_far", 1000), recvCount_(0), hopsDone_(0),
+          settled_(false), settlePop_(0), bestPop_(0), emptyProbes_(0),
+          exhausted_(false), camMs_(0), camPhase_(0), hopMs_(0),
+          haveAnchor_(false), ax_(0), ay_(0), az_(0),
+          hx_(0), hy_(0), hz_(0), sx_(0), sz_(0) {}
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        int mv = tabLeaderIdx(sq, n, 1); // the tab that LEAVES (join-owned)
+        int st = tabLeaderIdx(sq, n, 0); // the tab that STAYS (host-owned)
+        if (mv >= 0 && st >= 0) {
+            haveAnchor_ = true;
+            ax_ = sq[mv].x; ay_ = sq[mv].y; az_ = sq[mv].z;
+            hx_ = sq[st].x; hy_ = sq[st].y; hz_ = sq[st].z;
+            sx_ = ax_; sz_ = az_;
+        }
+        unsigned int popStay0 = 0, popMove0 = 0;
+        float sep0 = 0.0f;
+        if (haveAnchor_) {
+            popStay0 = engine::countNpcsNear(ctx.gw, hx_, hy_, hz_, PROBE_R);
+            popMove0 = engine::countNpcsNear(ctx.gw, ax_, ay_, az_, PROBE_R);
+            float dx = ax_ - hx_, dz = az_ - hz_;
+            sep0 = (float)sqrt((double)(dx * dx + dz * dz));
+            // A save that ALREADY starts the pair apart is authoritative about
+            // where they belong: hold, and spend the whole window measuring.
+            // Deliberately keyed on separation ALONE. Gating it on the starting
+            // population too made the scenario spiral away from a good fixture,
+            // because at t=0 the remote zone has not finished streaming and the
+            // probe reads a fraction of the eventual crowd. Whether the region
+            // turned out populated enough to judge is the oracle's call, made
+            // over the whole window rather than one cold sample.
+            if (sep0 >= MIN_SEP) {
+                settled_ = true; exhausted_ = true;
+                sx_ = ax_; sz_ = az_;
+            }
+        }
+        char b[240];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO SPLITFAR start have=%d stay=%.0f,%.0f,%.0f "
+                  "popStay=%u popMover=%u sep=%.0f preSplit=%d "
+                  "probeR=%.0f popMin=%u hops=%u minSep=%.0f",
+                  haveAnchor_ ? 1 : 0, hx_, hy_, hz_, popStay0, popMove0, sep0,
+                  settled_ ? 1 : 0, PROBE_R, (unsigned)POP_MIN, (unsigned)HOPS,
+                  MIN_SEP);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (!haveAnchor_)
+            coop::logLine("SCENARIO SPLITFAR needs a 2-tab save (rank-0/rank-1 member missing)");
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+
+        if (haveAnchor_ && evidenceDue(ctx.elapsedMs)) {
+            EntityState sq[MAX_SQUAD];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+            int mv = tabLeaderIdx(sq, n, 1);
+            int st = tabLeaderIdx(sq, n, 0);
+
+            // Camera placement, in three phases. park() teleports bodies but
+            // never the camera, so before this the pair simply watched whatever
+            // the save started on - run 20260802_112449 had BOTH cameras on one
+            // point for the whole window, thousands of units from the join's
+            // characters. That is not a configuration anyone plays in, and it
+            // suppresses the very thing under test: the camera contributes an
+            // interest anchor, and rendering is camera-driven, so a parked run
+            // measures enumeration in a region neither client is drawing.
+            //
+            //   own        host->stay,  join->mover  (normal play)
+            //   both_stay  host->stay,  join->stay   (OVERLAP on the host's)
+            //   both_mover host->mover, join->mover  (OVERLAP on the join's)
+            //   back       host->stay,  join->mover  (normal play again)
+            //
+            // The overlap phases are the point. Swapping BOTH cameras at once
+            // only mirrors the disjointness - the two clients still never draw
+            // the same character, so a disagreement there is unattributable:
+            // it could be a replication miss or simply the other side not
+            // looking. Pointing both at ONE squad removes the confound, and it
+            // is the only configuration in which "these two clients disagree
+            // about what is here" means only one thing.
+            //
+            // both_mover doubles as the causal probe: if the HOST's count at
+            // the mover rises when the host looks there, camera presence is
+            // what materialises the bodies. 'back' then asks whether they
+            // SURVIVE the camera leaving - if they do, each client accumulates
+            // its own population over a session, which is the reported
+            // "drifts out of sync over a long session".
+            unsigned int ph = phaseOf(ctx.elapsedMs);
+            int tgt;
+            if      (ph == 1) tgt = st;                  // both on the stayer
+            else if (ph == 2) tgt = mv;                  // both on the mover
+            else              tgt = ctx.isHost ? st : mv; // own / back
+            if (tgt >= 0 && (camMs_ == 0 || ph != camPhase_ ||
+                             (ctx.elapsedMs - camMs_) >= CAM_REFOCUS_MS)) {
+                if (ph != camPhase_) {
+                    char pb[128];
+                    _snprintf(pb, sizeof(pb) - 1,
+                              "SCENARIO SPLITFAR phase side=%s phase=%s watching=%s",
+                              ctx.isHost ? "host" : "join", phaseName(ph),
+                              (tgt == st) ? "stay" : "mover");
+                    pb[sizeof(pb) - 1] = '\0'; coop::logLine(pb);
+                }
+                camMs_ = ctx.elapsedMs; camPhase_ = ph;
+                Character* tc = engine::resolve(sq[tgt]);
+                if (tc) engine::cameraFocusOn(ctx.gw, tc);
+            }
+
+            if (!ctx.isHost) {
+                if (mv >= 0) { driveMover(ctx, sq[mv]); logScenarioEntity("MEMBER", sq[mv]); }
+                if (st >= 0) { logScenarioEntity("RECV", sq[st]); ++recvCount_; }
+            } else {
+                // HOST: hold every rank-0 member at the start. Park only on
+                // real drift so a settled body is not re-teleported every tick.
+                for (unsigned int i = 0; i < n; ++i) {
+                    if (tabRankOf(sq, n, i) != 0) continue;
+                    Character* c = engine::resolve(sq[i]);
+                    if (!c) continue;
+                    float dx = sq[i].x - hx_, dz = sq[i].z - hz_;
+                    if (dx * dx + dz * dz > HOLD_R * HOLD_R)
+                        engine::park(c, hx_, hy_, hz_, 0.0f);
+                }
+                if (st >= 0) logScenarioEntity("MEMBER", sq[st]);
+                if (mv >= 0) { logScenarioEntity("RECV", sq[mv]); ++recvCount_; }
+            }
+
+            if (mv >= 0 && st >= 0) {
+                float dx = sq[mv].x - sq[st].x, dz = sq[mv].z - sq[st].z;
+                float sep = (float)sqrt((double)(dx * dx + dz * dz));
+                unsigned int popMover = engine::countNpcsNear(
+                    ctx.gw, sq[mv].x, sq[mv].y, sq[mv].z, PROBE_R);
+                unsigned int popStay = engine::countNpcsNear(
+                    ctx.gw, sq[st].x, sq[st].y, sq[st].z, PROBE_R);
+                int zMover = engine::isZoneLoadedAt(ctx.gw, sq[mv].x, sq[mv].y,
+                                                    sq[mv].z) ? 1 : 0;
+                int zStay = engine::isZoneLoadedAt(ctx.gw, sq[st].x, sq[st].y,
+                                                   sq[st].z) ? 1 : 0;
+                char b[240];
+                _snprintf(b, sizeof(b) - 1,
+                          "SCENARIO SPLITFAR side=%s hop=%u sep=%.0f "
+                          "popMover=%u popStay=%u zMover=%d zStay=%d settled=%d "
+                          "phase=%s",
+                          ctx.isHost ? "host" : "join", hopsDone_, sep,
+                          popMover, popStay, zMover, zStay, settled_ ? 1 : 0,
+                          phaseName(phaseOf(ctx.elapsedMs)));
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+
+        if (ctx.elapsedMs >= dur) {
+            passed_ = haveAnchor_ && recvCount_ >= 1;
+            return true;
+        }
+        return false;
+    }
+
+private:
+    // JOIN mover: hop outward until a stop is inhabited, then hold there.
+    void driveMover(const ScenarioContext& ctx, const EntityState& mvSt) {
+        Character* c = engine::resolve(mvSt);
+        if (!c) return;
+
+        if (settled_) {
+            // Short alternating leg so the held body stays a live, moving
+            // subject instead of a statue (the travel_parity precedent).
+            bool legB = ((ctx.elapsedMs / 3000) % 2) != 0;
+            engine::orderMoveTo(c, sx_ + (legB ? 15.0f : 0.0f), mvSt.y, sz_);
+            // A settle point can EMPTY under us - the first run parked next to
+            // a wandering squad that was gone ~20 s later, and the scenario
+            // then held a deserted spot for two minutes and had nothing to
+            // judge. Re-probe while settled and resume the spiral if the place
+            // stays empty, so the window is spent somewhere inhabited.
+            if (exhausted_) return; // nowhere left to go - hold and report
+            unsigned int pop = engine::countNpcsNear(ctx.gw, mvSt.x, mvSt.y,
+                                                     mvSt.z, PROBE_R);
+            if (pop >= POP_MIN) { emptyProbes_ = 0; return; }
+            if (++emptyProbes_ < EMPTY_TOLERANCE) return;
+            settled_ = false; emptyProbes_ = 0;
+            hopMs_ = ctx.elapsedMs - HOP_DWELL_MS; // hop again next tick
+            char b[144];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO SPLITFAR unsettle hop=%u pop=%u (settle point emptied)",
+                      hopsDone_, pop);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            return;
+        }
+
+        unsigned long inHop = ctx.elapsedMs - hopMs_;
+        if (hopsDone_ == 0 || inHop >= HOP_DWELL_MS) {
+            if (hopsDone_ >= HOPS) {
+                // Out of hops without finding anyone: settle anyway so the run
+                // still holds the pair apart, and report pop=0 - the oracle
+                // SKIPs rather than passing on a vacuous empty-corridor run.
+                // Terminal, so the empty re-probe above cannot thrash us
+                // between settle and unsettle for the rest of the window.
+                exhausted_ = true;
+                settleHere(mvSt, 0);
+                return;
+            }
+            ++hopsDone_;
+            hopMs_ = ctx.elapsedMs;
+            hopTarget(hopsDone_, &sx_, &sz_);
+            engine::park(c, sx_, mvSt.y, sz_, 0.0f);
+            char b[128];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO SPLITFAR hop n=%u to=%.0f,%.0f", hopsDone_, sx_, sz_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            return;
+        }
+
+        // Probe only once the destination zone has had time to stream in; a
+        // probe on the arrival frame reads an unloaded block and always says 0.
+        if (inHop >= PROBE_AT_MS) {
+            unsigned int pop = engine::countNpcsNear(ctx.gw, mvSt.x, mvSt.y,
+                                                     mvSt.z, PROBE_R);
+            if (pop > bestPop_) bestPop_ = pop;
+            if (pop >= POP_MIN) settleHere(mvSt, pop);
+        }
+    }
+
+    void settleHere(const EntityState& mvSt, unsigned int pop) {
+        settled_ = true; settlePop_ = pop;
+        sx_ = mvSt.x; sz_ = mvSt.z;
+        char b[192];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO SPLITFAR settle hop=%u at=%.0f,%.0f,%.0f pop=%u best=%u",
+                  hopsDone_, mvSt.x, mvSt.y, mvSt.z, pop, bestPop_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // Viewpoint phase from the elapsed clock. Both sides derive it from the
+    // same elapsed ms so the swap happens together; the host's extra window
+    // (HOST_DURATION_MS) simply extends 'back'.
+    static unsigned int phaseOf(unsigned long ms) {
+        unsigned int p = (unsigned int)(ms / PHASE_MS);
+        return (p > 3) ? 3 : p;
+    }
+    static const char* phaseName(unsigned int p) {
+        return (p == 0) ? "own"        : (p == 1) ? "both_stay"
+             : (p == 2) ? "both_mover" : "back";
+    }
+
+    // Golden-angle spiral out from the mover's start. A straight ray (the
+    // travel_parity pattern) samples a single corridor and can spend every hop
+    // in wilderness; turning ~137.5 degrees per stop spreads them around the
+    // surrounding map, so an inhabited place is far likelier to be hit.
+    void hopTarget(unsigned int k, float* ox, float* oz) const {
+        float ang = (float)k * 2.39996f;
+        float r   = MIN_SEP + (float)(k - 1) * STEP_R;
+        *ox = ax_ + r * (float)cos((double)ang);
+        *oz = az_ + r * (float)sin((double)ang);
+    }
+
+    // The manifest raises the runner's self-exit backstop and kill grace for
+    // this scenario, as travel_parity does, so the long host window survives.
+    static const unsigned long JOIN_DURATION_MS = 180000;
+    static const unsigned long HOST_DURATION_MS = 190000; // outlive the join
+    static const unsigned long HOP_DWELL_MS     = 8000;   // per-stop window
+    static const unsigned long PROBE_AT_MS      = 5500;   // probe late in the dwell
+    static const unsigned int  HOPS             = 14;
+    static const unsigned int  POP_MIN          = 8;      // "inhabited"
+    static const unsigned int  EMPTY_TOLERANCE  = 3;      // ticks before re-hopping
+    static const unsigned long CAM_REFOCUS_MS   = 5000;   // re-assert camera follow
+    // Viewpoint phase length: four even quarters of the join window. The
+    // oracle drops each phase's opening seconds, so what has to fit here is
+    // the settling transient (camera move, zone stream, a census round) plus
+    // enough steady-state samples to take a median from - not the whole phase.
+    static const unsigned long PHASE_MS         = 45000;
+    static const unsigned int  MAX_SQUAD        = 32;
+    static const float         MIN_SEP;  // first hop: 2x the census radius
+    static const float         STEP_R;   // spiral widening per hop
+    static const float         PROBE_R;  // population probe sphere
+    static const float         HOLD_R;   // host drift before re-parking
+
+    unsigned int  recvCount_;
+    unsigned int  hopsDone_;
+    bool          settled_;
+    unsigned int  settlePop_;
+    unsigned int  bestPop_;
+    unsigned int  emptyProbes_;
+    bool          exhausted_;   // hop budget spent - settle is now terminal
+    unsigned long camMs_;       // last camera re-focus
+    unsigned int  camPhase_;    // viewpoint phase the camera was aimed for
+    unsigned long hopMs_;
+    bool          haveAnchor_;
+    float         ax_, ay_, az_; // mover start (spiral origin)
+    float         hx_, hy_, hz_; // stayer hold point
+    float         sx_, sz_;      // current mover destination
+};
+const float SplitFarScenario::MIN_SEP = 4000.0f;
+const float SplitFarScenario::STEP_R  = 1600.0f;
+// 1800 u, not render range: what governs whether the two clients can disagree
+// about a body is the 2000 u census/enumeration reach, so the probe measures
+// the population inside that shell. The first run probed 900 u and settled next
+// to a squad that walked out of it.
+const float SplitFarScenario::PROBE_R = 1800.0f;
+const float SplitFarScenario::HOLD_R  = 40.0f;
+
 // camp_approach (Phase 2 crash hardening SOAK): reproduce the town/bandit-camp
 // approach crash conditions - mint/zone churn on approach plus a real peer drop
 // - and prove the survivor cleans up without a fault. Run on the 'camp' save
@@ -693,6 +1027,7 @@ Scenario* makeMovementScenario(const std::string& name) {
     if (name == "coop_presence") return new CoopPresenceScenario();
     if (name == "travel_parity") return new TravelParityScenario();
     if (name == "split_interest") return new SplitInterestScenario();
+    if (name == "split_far")     return new SplitFarScenario();
     if (name == "camp_approach") return new CampApproachScenario();
     return 0;
 }

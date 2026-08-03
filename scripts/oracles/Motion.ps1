@@ -365,12 +365,24 @@ function Test-RestFlap {
 # Existence parity (pack-hidden investigation, 2026-07-11). The join emits an
 # "[audit] exist ..." line every 5 s classifying every enumerated NPC:
 #   drv (streamed/driven) / cen (census-present local copy) / hid (suppressed)
-#   / ghost (census-absent, NOT suppressed - the visible-on-join-only class).
+#   / dorm (attention gate: census-absent but nobody watching, left alone)
+#   / ghost (census-absent, WATCHED, NOT suppressed - the visible-on-join-only
+#     class).
 # A ghost is legitimate only transiently (the ~1 s suppress debounce), so with
 # a FRESH census the fraction of samples showing ghosts must stay low, and no
 # ghost population may PERSIST (a wildlife pack the authority never judges
 # would show as sustained ghost>0). Samples with fresh=0 are excluded (wide
 # culling is deliberately disabled on a stale census).
+#
+# The gate makes this test view-conditional by construction: a body only both
+# sides can see is only compared while somebody is looking at it. dorm is
+# reported, never judged - a large dorm count is the gate working, not a
+# failure. Runs from builds without the gate omit the field and report dorm=0.
+#
+# dormPc IS judged, and it is the gate's safety property: a body next to a
+# player character (within attnR of any squad member, camera or not) must never
+# be dormant, because every tab leader anchors attention. Non-zero means the
+# gate stopped reconciling somebody's own surroundings - a hard fail.
 function Test-ExistenceParity {
     param([string]$File, [string]$Label = "join",
           [double]$MaxGhostFrac = 0.35, [int]$MaxGhostRun = 4,
@@ -378,12 +390,19 @@ function Test-ExistenceParity {
     if (-not (Test-Path $File)) {
         return (Add-GateResult -Name "existence_parity" -Status SKIP -Detail "no log")
     }
-    $pat = "\[audit\] exist near=(\d+) wide=(\d+) drv=(\d+) cen=(\d+) hid=(\d+) ghost=(\d+) supp=(\d+) census=(\d+) fresh=(\d)"
+    $pat = "\[audit\] exist near=(\d+) wide=(\d+) drv=(\d+) cen=(\d+) hid=(\d+) ghost=(\d+) supp=(\d+) census=(\d+) fresh=(\d)(?:.* dorm=(\d+))?(?:.* dormPc=(\d+))?(?:.* pcs=(\d+))?"
     $lines = @(Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)
     $samples = @(foreach ($m in $lines) {
         $g = $m.Matches[0].Groups
         if ($g[9].Value -eq "1") {
-            [pscustomobject]@{ ghost = [int]$g[6].Value; wide = [int]$g[2].Value }
+            $dorm = 0
+            if ($g[10].Success) { $dorm = [int]$g[10].Value }
+            $dormPc = 0
+            if ($g[11].Success) { $dormPc = [int]$g[11].Value }
+            $pcs = 0
+            if ($g[12].Success) { $pcs = [int]$g[12].Value }
+            [pscustomobject]@{ ghost = [int]$g[6].Value; wide = [int]$g[2].Value
+                               dorm = $dorm; dormPc = $dormPc; pcs = $pcs }
         }
     })
     if ($samples.Count -lt $MinSamples) {
@@ -401,12 +420,20 @@ function Test-ExistenceParity {
         if ($s.ghost -gt 0) { $run++; if ($run -gt $maxRun) { $maxRun = $run } }
         else { $run = 0 }
     }
-    $ok = ($frac -le $MaxGhostFrac) -and ($maxRun -le $MaxGhostRun)
+    $peakDorm = ($samples | Measure-Object -Property dorm -Maximum).Maximum
+    $peakDormPc = ($samples | Measure-Object -Property dormPc -Maximum).Maximum
+    # pcs is the squad size dormPc was measured against; 0 everywhere means the
+    # safety zero is vacuous (gate off, or the squad never captured).
+    $peakPcs = ($samples | Measure-Object -Property pcs -Maximum).Maximum
+    $ok = ($frac -le $MaxGhostFrac) -and ($maxRun -le $MaxGhostRun) `
+          -and ($peakDormPc -eq 0)
     $v = if ($ok) { "PASS" } else { "FAIL" }
-    Write-Host "  [$Label] existence-parity $v - ghosts in $withGhost/$($samples.Count) samples (frac=$frac <= $MaxGhostFrac), longest run $maxRun (<= $MaxGhostRun), peak ghost=$maxGhost"
+    Write-Host "  [$Label] existence-parity $v - ghosts in $withGhost/$($samples.Count) samples (frac=$frac <= $MaxGhostFrac), longest run $maxRun (<= $MaxGhostRun), peak ghost=$maxGhost, peak dorm=$peakDorm, peak dormPc=$peakDormPc of $peakPcs squad member(s) (must be 0)"
     return (Add-GateResult -Name "existence_parity" -Status $v `
                 -Metrics @{ samples = $samples.Count; ghostFrac = $frac
-                            maxRun = $maxRun; peakGhost = $maxGhost })
+                            maxRun = $maxRun; peakGhost = $maxGhost
+                            peakDorm = $peakDorm; peakDormPc = $peakDormPc
+                            peakPcs = $peakPcs })
 }
 
 # ---- travel_parity oracles ------------------------------------------------------
@@ -643,6 +670,166 @@ function Test-TravelParity {
                             peakGhost = $peakGhost; trueGhosts = $trueGhosts
                             laggards = $laggards; diverged = $diverged
                             hostOnly = $hostOnly })
+}
+
+# split_far gate: the two squads held apart in two POPULATED regions, past the
+# census radius. Parses the SPLITFAR rows both sides emit:
+#   SCENARIO SPLITFAR side=.. hop=.. sep=.. popMover=.. popStay=.. zMover=..
+#                     zStay=.. settled=..
+#
+# What is judged is host/join AGREEMENT about the mover's neighbourhood while
+# the pair is settled and apart. The join is standing there, so its popMover is
+# ground truth; the host's popMover is the most its census could ever publish
+# about that place. A host that sees far fewer bodies than the join is
+# broadcasting "nobody there" for an inhabited region, and that is precisely how
+# the join's real local NPCs end up in the ghost bucket.
+#
+# zMover from the HOST separates the two explanations: zMover=0 means the host's
+# engine has not streamed that zone at all (the far-apart root cause - authority
+# over a region the authority cannot see), while zMover=1 with a low popMover
+# points at the census caps or anchor budgeting instead.
+#
+# SKIPs rather than passes when the precondition was not met - the pair never
+# separated, or the join never found an inhabited stop. An empty corridor cannot
+# judge the mechanism, and silently passing on one is how travel_parity kept
+# reporting green for a bug it never exercised.
+#
+# MinPop is deliberately low. The signal this gate reads is a RATIO, and the
+# observed failure is host=0 against join>0 - decisive at any join population.
+# A high bar only buys vacuous SKIPs on a fixture whose far end is a hamlet.
+function Test-SplitFar {
+    param([string]$HostFile, [string]$JoinFile,
+          [double]$MinSep = 4000.0, [int]$MinPop = 3,
+          [double]$MinSeeFrac = 0.5, [int]$MinSamples = 5)
+
+    function Get-SplitFarRows([string]$File) {
+        $rows = New-Object System.Collections.ArrayList
+        if (-not (Test-Path $File)) { return $rows }
+        $off = Get-LogClockOffsetMs -File $File
+        # phase= is optional so pre-viewpoint-phase logs still parse (they are
+        # all one continuous 'own' window by construction).
+        $pat = "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO SPLITFAR side=(\w+) " +
+               "hop=(\d+) sep=([\d\.]+) popMover=(\d+) popStay=(\d+) " +
+               "zMover=(\d+) zStay=(\d+) settled=(\d+)( phase=(\w+))?"
+        foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
+            $g = $m.Matches[0].Groups
+            $ph = if ($g[14].Success) { $g[14].Value } else { "own" }
+            [void]$rows.Add(@{
+                t = (Convert-StampToMs -Groups $g -OffsetMs $off)
+                side = $g[5].Value; hop = [int]$g[6].Value
+                sep = [double]$g[7].Value
+                popMover = [int]$g[8].Value; popStay = [int]$g[9].Value
+                zMover = [int]$g[10].Value; zStay = [int]$g[11].Value
+                settled = [int]$g[12].Value; phase = $ph })
+        }
+        return $rows
+    }
+    function Get-Med($values) {
+        $s = @($values | Sort-Object)
+        if ($s.Count -eq 0) { return 0.0 }
+        return [double]$s[[int]([Math]::Floor($s.Count / 2))]
+    }
+
+    $jrows = @(Get-SplitFarRows -File $JoinFile)
+    $hrows = @(Get-SplitFarRows -File $HostFile)
+    if ($jrows.Count -eq 0) {
+        Write-Host "  SPLIT-FAR SKIP - no join SPLITFAR rows (scenario never armed)"
+        return (Add-GateResult -Name "split_far" -Status SKIP -Detail "no join rows")
+    }
+
+    # The settle window: the host never hops, so 'settled' is only meaningful on
+    # the join side. Take its first settled row and judge both sides from there.
+    $settleRow = @($jrows | Where-Object { $_.settled -eq 1 } | Sort-Object { $_.t })
+    if ($settleRow.Count -eq 0) {
+        Write-Host "  SPLIT-FAR SKIP - join never settled (spiral found no inhabited stop in the window)"
+        return (Add-GateResult -Name "split_far" -Status SKIP `
+                    -Metrics @{ joinRows = $jrows.Count } -Detail "never settled")
+    }
+    $t0 = $settleRow[0].t
+    $jAll = @($jrows | Where-Object { $_.t -ge $t0 -and $_.sep -ge $MinSep })
+    $hAll = @($hrows | Where-Object { $_.t -ge $t0 -and $_.sep -ge $MinSep })
+
+    # VIEWPOINT PHASES (see the split_far camera comment). Judge the gate on
+    # 'own' alone - that is the configuration players are actually in, and it is
+    # the one the reported symptom comes from. Folding 'cross' in would let the
+    # host's count at the mover be inflated by the host looking straight at it,
+    # which is the effect being measured rather than a property of replication.
+    $jw = @($jAll | Where-Object { $_.phase -eq "own" })
+    $hw = @($hAll | Where-Object { $_.phase -eq "own" })
+    if ($jw.Count -eq 0) { $jw = $jAll; $hw = $hAll }
+    if ($jw.Count -lt $MinSamples -or $hw.Count -lt $MinSamples) {
+        Write-Host "  SPLIT-FAR SKIP - only join=$($jw.Count) host=$($hw.Count) settled samples past sep>=$MinSep (< $MinSamples)"
+        return (Add-GateResult -Name "split_far" -Status SKIP `
+                    -Metrics @{ joinSamples = $jw.Count; hostSamples = $hw.Count } `
+                    -Detail "too few settled+apart samples")
+    }
+
+    $joinPop = Get-Med @($jw | ForEach-Object { $_.popMover })
+    $sepMed  = [Math]::Round((Get-Med @($jw | ForEach-Object { $_.sep })), 0)
+    if ($joinPop -lt $MinPop) {
+        Write-Host "  SPLIT-FAR SKIP - settle point not inhabited (join popMover median=$joinPop < $MinPop); sep=$sepMed"
+        return (Add-GateResult -Name "split_far" -Status SKIP `
+                    -Metrics @{ joinPop = $joinPop; sep = $sepMed } `
+                    -Detail "settle point empty - cannot judge")
+    }
+
+    $hostPop   = Get-Med @($hw | ForEach-Object { $_.popMover })
+    $hostStay  = Get-Med @($hw | ForEach-Object { $_.popStay })
+    $blind     = @($hw | Where-Object { $_.zMover -eq 0 }).Count
+    $blindFrac = [Math]::Round($blind / $hw.Count, 3)
+    $seeFrac   = if ($joinPop -gt 0) { [Math]::Round($hostPop / $joinPop, 3) } else { 0.0 }
+
+    $ok = ($seeFrac -ge $MinSeeFrac)
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    $why = if ($blindFrac -ge 0.5) { "host zone UNLOADED at the mover in $blindFrac of samples" }
+           elseif (-not $ok) { "host zone loaded but census-blind (caps/anchor budget)" }
+           else { "host sees the mover's region" }
+    Write-Host "  SPLIT-FAR $v - sep=$sepMed, join sees $joinPop at the mover, host sees $hostPop (seeFrac=$seeFrac >= $MinSeeFrac); hostZoneUnloaded=$blindFrac, hostStayPop=$hostStay, samples join=$($jw.Count)/host=$($hw.Count) - $why"
+
+    # Per-phase observation. Not a gate yet (a gate nobody has calibrated is a
+    # gate that cannot fail - see pitfalls S7); this exists to characterise the
+    # swap first. Read it as: does the HOST's count at the mover rise when the
+    # host looks there ('cross'), and does it stay up after it looks away
+    # ('back')? A rise says camera presence is what materialises the bodies; a
+    # rise that persists says each client accumulates its own population over a
+    # session, which is the long-session drift.
+    $metrics = @{ sep = $sepMed; joinPop = $joinPop; hostPop = $hostPop
+                  seeFrac = $seeFrac; zoneUnloadedFrac = $blindFrac
+                  hostStayPop = $hostStay
+                  joinSamples = $jw.Count; hostSamples = $hw.Count }
+    # Drop each phase's opening seconds: a camera swap is followed by a zone
+    # stream and a census round, so the first samples of a phase describe the
+    # transition rather than the configuration.
+    $PhaseSkipMs = 15000
+    $phases = @("own", "both_stay", "both_mover", "back")
+    if (@($jAll | Where-Object { $_.phase -ne "own" }).Count -gt 0) {
+        foreach ($p in $phases) {
+            $jp = @($jAll | Where-Object { $_.phase -eq $p })
+            $hp = @($hAll | Where-Object { $_.phase -eq $p })
+            if ($jp.Count -eq 0 -and $hp.Count -eq 0) { continue }
+            # Rows are hashtables; Measure-Object -Property reads real
+            # properties and finds nothing on one, so take the min by hand.
+            $jp0 = @(@($jp | ForEach-Object { $_.t }) | Sort-Object)[0]
+            $jp = @($jp | Where-Object { $_.t -ge ($jp0 + $PhaseSkipMs) })
+            $hp = @($hp | Where-Object { $_.t -ge ($jp0 + $PhaseSkipMs) })
+            if ($jp.Count -eq 0 -or $hp.Count -eq 0) { continue }
+            $jm = Get-Med @($jp | ForEach-Object { $_.popMover })
+            $hm = Get-Med @($hp | ForEach-Object { $_.popMover })
+            $js = Get-Med @($jp | ForEach-Object { $_.popStay })
+            $hs = Get-Med @($hp | ForEach-Object { $_.popStay })
+            # In the overlap phases both clients are drawing the SAME squad, so
+            # the gap between their counts at that squad is the one measurement
+            # here with no viewpoint confound in it.
+            $mark = ""
+            if ($p -eq "both_stay")  { $mark = "  <- both drawing stay,  gap=" + [Math]::Abs($js - $hs) }
+            if ($p -eq "both_mover") { $mark = "  <- both drawing mover, gap=" + [Math]::Abs($jm - $hm) }
+            Write-Host ("    phase={0,-10} mover: join={1,-4} host={2,-4} | stay: join={3,-4} host={4,-4} (n={5}/{6}){7}" -f `
+                        $p, $jm, $hm, $js, $hs, $jp.Count, $hp.Count, $mark)
+            $metrics["${p}_joinMover"] = $jm; $metrics["${p}_hostMover"] = $hm
+            $metrics["${p}_joinStay"]  = $js; $metrics["${p}_hostStay"]  = $hs
+        }
+    }
+    return (Add-GateResult -Name "split_far" -Status $v -Metrics $metrics -Detail $why)
 }
 
 # world_parity gate: full-roster tiered cross-comparison on a dense save.

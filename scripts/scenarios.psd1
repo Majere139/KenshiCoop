@@ -130,6 +130,94 @@
             WanTolerance = 18.0
         }
 
+        # split_far (2026-08-02 far-travel desync report): the condition
+        # split_interest and travel_parity both miss. split_interest separates by
+        # 260 u - inside the 2000 u census sphere, so one interest cluster;
+        # travel_parity separates far but the HOST FOLLOWS, so also one cluster,
+        # through empty wilderness. Here the two tabs are ~9800 u apart and BOTH
+        # HOLD, each with its own population, for the whole window.
+        #
+        # Save 'splitfar1' is BAKED (bake_scene.ps1 -Setup splitfar -BaseSave
+        # separate): tab 0 holds the bar, tab 1 sits ~5200 u away in a second
+        # populated place. It must be baked, never captured after a co-op run -
+        # armConnectPush writes the live world early, before the squads are
+        # positioned, so a capture records them together (the first attempt came
+        # out 580 u apart that way).
+        #
+        # The measurement is the host's view of the mover's region (SPLITFAR
+        # popMover/zMover, side=host) against the join's. Currently PASSES: both
+        # sides enumerate the same 5 NPCs over 180/191 samples.
+        #
+        # WHAT THE DIVERGENCE ACTUALLY IS, AND WHAT CAUSES IT. The two clients
+        # disagree at PLATOON granularity, not per body: compare the sets of
+        # hand-container ids ([platoon] first-sight lines, both logs) and the
+        # join's is a strict superset of the host's. At a settlement ~1600 u
+        # from the mover - inside the host's 2500 u census reach, so not an
+        # enumeration horizon - that reads as host 12 bodies vs join 18,
+        # duplicated by ROLE: 2 Barmen where there is one bar, 6 Ninja Guards
+        # vs 4, 8 Hungry bandits vs 5. The join's second Barman goes
+        # drv -> ghost -> hid over ~15-30 s and then runs its own AI invisibly.
+        # That pre-suppression window is what the field report ("join sees NPCs
+        # the host doesn't") describes.
+        #
+        # The CAUSE is still open, and this harness cannot settle it: both
+        # installs auto-load the same %LOCALAPPDATA%\kenshi\save folder and the
+        # host's connect-push bakes into that folder WHILE the join reads it,
+        # so what the join loads is a race. Varying -JoinDelaySec looks causal
+        # (host solo before bake 15/68/128 s -> 7-12/2/0 join-only platoons)
+        # but deferring the bake in the plugin instead, holding the settle time
+        # at 120 s while the join launched normally, gave 13 - the worst
+        # measured. The stagger was moving the join's load relative to the
+        # host's WRITE, nothing more. See REPLICATION_PITFALLS.md section 13.
+        #
+        # Ruled out as causes: census truncation (n=43-51, none), staleness
+        # (staleMs=0), zone loading (hostZoneUnloaded=0), and the mod's own
+        # mint path (1 proxy bound all run, the rest deferred past mintR=600).
+        #
+        # Two harness traps this uncovered, both fixed in run_test.ps1: a
+        # stagger longer than KENSHICOOP_ARM_TIMEOUT_MS makes the host arm
+        # ALONE and finish before the join starts (use -ArmTimeoutMs), and
+        # -Seconds/-KillGraceSec must grow with the stagger or the games die
+        # before RESULT.
+        #
+        # Do not trust the per-phase popMover/popStay medians to show any of
+        # this - suppression drops the extras out of the spatial query, so the
+        # counts agree while the identities do not. Diff the platoon sets.
+        #
+        # VIEWPOINT PHASES (45 s each, logged as phase= on the SPLITFAR row):
+        #   own        host->stay,  join->mover  - normal play
+        #   both_stay  both -> the host's squad  - OVERLAP
+        #   both_mover both -> the join's squad  - OVERLAP
+        #   back       host->stay,  join->mover  - persistence check
+        # The gate is judged on 'own' alone (folding the overlap phases in would
+        # let the host's count be inflated by the host looking straight at it -
+        # the effect under measurement, not a property of replication). The
+        # overlap phases are the confound-free comparison: both clients drawing
+        # one squad, so a gap there cannot be explained by nobody looking. See
+        # docs/REPLICATION_PITFALLS.md S11-S12 for why the parked-camera and
+        # symmetric-swap versions of this scenario both measured the wrong thing.
+        #
+        # It self-SKIPs when the pair never separates or the mover's region is
+        # empty, so a bad save reports honestly instead of passing vacuously.
+        # That is not hypothetical - the spot where this bug was FIRST caught
+        # (join enumerated 8, host 0, sep=9841) turned out to be unbakeable: the
+        # 8 bodies existed only in the join's process, so a bake writes an empty
+        # field there. The divergence is emergent, not a property of the save,
+        # so the fixture can only set up the CONDITIONS (two populated regions,
+        # held apart) and let a long enough window expose it.
+        # existence_parity stays ADVISORY here on purpose: this scenario exists
+        # to EXPOSE ghosts, so gating on their absence would be backwards.
+        # Seconds/KillGraceSec outlive the 190 s host window, as travel_parity.
+        split_far = @{
+            Save = 'splitfar1'; Setup = ''; Tolerance = 18.0
+            Seconds = 250; KillGraceSec = 220
+            PrimaryGate = 'split_far'
+            Gating   = @('split_far', 'clock_sync')
+            Advisory = @('existence_parity', 'lifecycle', 'suppress_churn',
+                         'anti_zombie', 'mint_dist', 'smoothness')
+            Tier = 'probe'; WanVariant = $false
+        }
+
         # ---- interest-managed NPCs + pose ----------------------------------------
         npc_sync = @{
             Save = 'sync'; Setup = ''; Tolerance = 3.0

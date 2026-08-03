@@ -44,6 +44,18 @@ param(
     [switch]$Sync,
     [switch]$NoKill,
     [int]$JoinDelaySec = 8,
+    # Peer-ready arming fallback override (-1 = take the profile/manifest value).
+    # Raise this when running a deliberately large -JoinDelaySec: the host arms
+    # on peer-ready OR this timeout, whichever comes first, so a stagger longer
+    # than the timeout makes the host arm ALONE and its scenario window closes
+    # before the join's even opens (run 143805: 116 s stagger, 45 s timeout ->
+    # host armed 69 s early and the oracle had zero overlapping samples).
+    [int]$ArmTimeoutMs = -1,
+    # Hard-kill grace override (-1 = take the profile/manifest value). Raise it
+    # alongside -JoinDelaySec: the grace is measured from the early screenshot
+    # anchors, so a stagger pushes the join's window past a manifest grace sized
+    # for the un-staggered run and the games die before RESULT.
+    [int]$KillGraceSec = -1,
     [int]$ShotLeadSec = 5,
     [int]$StartTimeoutSec = 90,
     [int]$Frames = 5,
@@ -102,18 +114,23 @@ if ($Tolerance -eq 0) { $Tolerance = 3.0 }
 if ($Save -eq "") { throw "No -Save given and scenario '$Scenario' has no manifest default." }
 
 # Timeout profile (explicit parameters win over the profile).
-$armTimeoutMs = 45000
+# NOT named $armTimeoutMs: PowerShell variable names are case-insensitive, so
+# that spelling IS the -ArmTimeoutMs parameter and assigning to it here silently
+# discards whatever the caller passed (run 144835 armed at 45000 despite
+# -ArmTimeoutMs 300000, and the oracle skipped for want of overlap).
+$effArmTimeoutMs = 45000
 if ($manifest.Profiles.ContainsKey($Profile)) {
     $prof = $manifest.Profiles[$Profile]
     if (-not $PSBoundParameters.ContainsKey("JoinDelaySec"))         { $JoinDelaySec         = $prof.JoinDelaySec }
     if (-not $PSBoundParameters.ContainsKey("StartTimeoutSec"))      { $StartTimeoutSec      = $prof.StartTimeoutSec }
     if (-not $PSBoundParameters.ContainsKey("ScenarioWaitSec"))      { $ScenarioWaitSec      = $prof.ScenarioWaitSec }
     if (-not $PSBoundParameters.ContainsKey("JoinAnchorTimeoutSec")) { $JoinAnchorTimeoutSec = $prof.JoinAnchorTimeoutSec }
-    if ($prof.ContainsKey("ArmTimeoutMs"))                           { $armTimeoutMs         = $prof.ArmTimeoutMs }
+    if ($prof.ContainsKey("ArmTimeoutMs"))                           { $effArmTimeoutMs      = $prof.ArmTimeoutMs }
 }
 # Spike captures keep the legacy immediate arming (many are host-only probes
 # that must not idle out their capture window waiting for a peer).
-if ($Scenario -eq "spike") { $armTimeoutMs = 0 }
+if ($Scenario -eq "spike") { $effArmTimeoutMs = 0 }
+if ($ArmTimeoutMs -ge 0)   { $effArmTimeoutMs = $ArmTimeoutMs }
 
 # Scenario clocks now start at PEER-READY (~a join-load after host gameplay), so
 # the self-exit backstop measured from gameplay start needs headroom for the
@@ -310,7 +327,7 @@ function Set-CoopEnv {
     # Fake wall-clock skew: JOIN only (the host is the reference clock).
     $env:KENSHICOOP_FAKE_CLOCK_SKEW_MS = if ($Mode -eq "join") { "$FakeClockSkewMs" } else { "0" }
     # Peer-ready arming fallback (0 = legacy immediate arming; spike runs).
-    $env:KENSHICOOP_ARM_TIMEOUT_MS = "$armTimeoutMs"
+    $env:KENSHICOOP_ARM_TIMEOUT_MS = "$effArmTimeoutMs"
 }
 
 # Wait until a regex appears in a (growing) file, or timeout. Returns $true/$false.
@@ -456,6 +473,7 @@ if ($manifest.Profiles.ContainsKey($Profile)) { $killGrace = [Math]::Max($killGr
 if ($null -ne $manifestEntry -and $manifestEntry.ContainsKey("KillGraceSec")) {
     $killGrace = [Math]::Max($killGrace, $manifestEntry.KillGraceSec)
 }
+if ($KillGraceSec -ge 0) { $killGrace = $KillGraceSec }
 $killDeadline = (Get-Date).AddSeconds($killGrace)
 foreach ($p in @($hostPid, $joinPid)) {
     if ($p -eq 0) { continue }
