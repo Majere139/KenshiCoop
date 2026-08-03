@@ -84,6 +84,11 @@
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <ProgramDatabaseFile>$(OutDir)KenshiCoop.pdb</ProgramDatabaseFile>
+      <!-- Linker MAP alongside the PDB: no debugger is installed on the dev box, so
+           a crash address can only be turned into a function name by looking up its
+           RVA in a text map. The PDB is useless without a tool that reads it. -->
+      <GenerateMapFile>true</GenerateMapFile>
+      <MapFileName>$(OutDir)KenshiCoop.map</MapFileName>
       <AdditionalDependencies>kenshilib.lib;OgreMain_x64.lib;MyGUIEngine_x64.lib;ws2_32.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
@@ -102,6 +107,8 @@
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <ProgramDatabaseFile>$(OutDir)KenshiCoop.pdb</ProgramDatabaseFile>
+      <GenerateMapFile>true</GenerateMapFile>
+      <MapFileName>$(OutDir)KenshiCoop.map</MapFileName>
       <AdditionalDependencies>kenshilib.lib;OgreMain_x64.lib;MyGUIEngine_x64.lib;ws2_32.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
