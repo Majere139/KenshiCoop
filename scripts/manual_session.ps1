@@ -416,37 +416,52 @@ if ($doTile -and $hostPid -ne 0) {
     ) | Out-Null
 }
 
-# Jail long-play (spike 58): auto-collect BOTH logs when the session ends. The
-# launcher returns immediately (manual play), so a hidden background waiter
-# blocks on the two game PIDs and copies host+join logs into a stamped dir the
-# moment you close the windows - no manual copy step, no clobbered evidence.
-if ($JailProbe -and $hostPid -ne 0) {
+# Auto-collect the evidence when the session ends. The launcher returns
+# immediately (manual play), so a hidden background waiter blocks on the two game
+# PIDs and copies the logs into a stamped dir the moment you close the windows -
+# no manual copy step, no clobbered evidence.
+#
+# This used to run only under -JailProbe, which meant an ordinary session - the
+# kind that reproduces travel bugs - kept nothing. Both installs OVERWRITE their
+# logs on next launch, so the evidence for a crash survived only until whichever
+# run came next. kenshi_info.log comes along too: it is where the ENGINE reports
+# damage to its own bookkeeping ("was not removed from any zones", "alredy has
+# destroy reason <ours>"), which is how the 2026-08-03 stale-proxy crash was
+# eventually identified - from a copy that happened to still be sitting there.
+if ($hostPid -ne 0) {
     $repoRoot   = Split-Path -Parent $scriptDir
     $stamp      = Get-Date -Format "yyyyMMdd_HHmmss"
-    $dest       = Join-Path $repoRoot ("tools\manual-sessions\jail_{0}_{1}" -f $Save.Replace(' ', '_'), $stamp)
+    $prefix     = if ($JailProbe) { "jail_" } else { "" }
+    $dest       = Join-Path $repoRoot ("tools\manual-sessions\{0}{1}_{2}" -f $prefix, $Save.Replace(' ', '_'), $stamp)
     $hostLogSrc = Join-Path $HostDir "KenshiCoop_host.log"
     $joinLogSrc = Join-Path $JoinDir "KenshiCoop_join.log"
+    $hostEngSrc = Join-Path $HostDir "kenshi_info.log"
+    $joinEngSrc = Join-Path $JoinDir "kenshi_info.log"
     $pidCsv     = if ($joinPid -ne 0) { "$hostPid,$joinPid" } else { "$hostPid" }
-    $waiterPs   = Join-Path $env:TEMP ("kc_jail_waiter_{0}.ps1" -f $stamp)
+    $waiterPs   = Join-Path $env:TEMP ("kc_session_waiter_{0}.ps1" -f $stamp)
     @"
 `$ErrorActionPreference = 'SilentlyContinue'
 Wait-Process -Id $pidCsv
 New-Item -ItemType Directory -Force -Path '$dest' | Out-Null
 Copy-Item '$hostLogSrc' (Join-Path '$dest' 'KenshiCoop_host.log')
 Copy-Item '$joinLogSrc' (Join-Path '$dest' 'KenshiCoop_join.log')
+Copy-Item '$hostEngSrc' (Join-Path '$dest' 'host_engine.log')
+Copy-Item '$joinEngSrc' (Join-Path '$dest' 'join_engine.log')
 "@ | Set-Content -Path $waiterPs -Encoding UTF8
     Start-Process -WindowStyle Hidden -FilePath "powershell" -ArgumentList @(
         "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$waiterPs`""
     ) | Out-Null
     Write-Host ""
-    if ($JailObserve) {
-        Write-Host "  [jail] probes ARMED on both clients: STATE/SNAP + [spike] SELECT + auditRows + OBSERVE."
-        Write-Host "  [jail] WARNING: -JailObserve disables the captive self-heal - captives WILL exit"
-        Write-Host "  [jail]          furniture + walk off on the observing side (diagnostic, NOT a real desync)."
-    } else {
-        Write-Host "  [jail] probes ARMED on both clients: STATE/SNAP + [spike] SELECT + auditRows (self-heal ON)."
+    Write-Host "  on exit: plugin + engine logs (both clients) -> $dest"
+    if ($JailProbe) {
+        if ($JailObserve) {
+            Write-Host "  [jail] probes ARMED on both clients: STATE/SNAP + [spike] SELECT + auditRows + OBSERVE."
+            Write-Host "  [jail] WARNING: -JailObserve disables the captive self-heal - captives WILL exit"
+            Write-Host "  [jail]          furniture + walk off on the observing side (diagnostic, NOT a real desync)."
+        } else {
+            Write-Host "  [jail] probes ARMED on both clients: STATE/SNAP + [spike] SELECT + auditRows (self-heal ON)."
+        }
     }
-    Write-Host "  [jail] on exit both logs -> $dest"
 }
 
 # Build-freshness guard: confirm the running plugin is the one we expect. In

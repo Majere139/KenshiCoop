@@ -30,6 +30,11 @@ tools/_*.log
 # Ad-hoc debug scratch scripts and captured screenshots
 tools/_*.ps1
 tools/_*.png
+# Scratch dirs follow the same underscore convention as the scratch scripts
+# (extracted crash dumps, one-off captures).
+tools/_*/
+# Kenshi's own emergency save after a crash lands here.
+tools/save-backups/
 tools/_wip_*.dll
 tools/float_fix*/
 tools/p*_validate/
