@@ -1721,12 +1721,15 @@
         # to 2 so five drops reach it). The overflow used to be booked as sent without being
         # sent, so the tail of the burst was invisible until the 5 s safety resend - the
         # "dropped it here, never showed up there" report.
-        # The join's proxy is destroyed by the ENGINE mid-run (what a zone unload does when
-        # players travel out of a block), then the host culls the real item. Locks the
-        # 2026-08-03 join crash: the mod used to cull, move and READ that freed object.
-        # Gates engine_integrity too - a coop-attributed double destroy IS the bug.
+        # The join's proxy is freed by the ENGINE (what a zone unload does when players
+        # travel out of a block) at the exact moment the cull for it runs - injected,
+        # because the publish sweep clears dead proxies every tick and the real window
+        # is one frame wide. Locks the 2026-08-03 join crash: the mod used to destroy
+        # that freed object a second time. Gates engine_integrity too, since Kenshi's
+        # own "alredy has destroy reason" line is the other half of the same evidence.
         world_item_stale = @{
-            DiagEnv = @{ KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1' }
+            DiagEnv = @{ KENSHICOOP_WORLD_SYNC = '1'; KENSHICOOP_INV_DUMP = '1'
+                         KENSHICOOP_WI_TEST_STALE = '1' }
             Save = 'squad1'; Setup = ''; Tolerance = 3.0
             PrimaryGate = 'world_item_stale'
             Gating   = @('world_item_stale', 'engine_integrity', 'clock_sync')

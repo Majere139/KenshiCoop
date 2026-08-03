@@ -73,6 +73,11 @@ $script:CoopDiagEnvKeys = @(
     # is what made an author conclude an item had left the ground while its copy was still there.
     # NOT a 0/1 gate: it carries the count.
     'KENSHICOOP_WD_TRANSIENT_DEAD'
+    # Frees a world-item proxy through the engine immediately before the cull that is
+    # about to run on it - the state a zone teardown leaves when players travel out of
+    # a block. The real window is one frame wide (the publish sweep clears dead proxies
+    # every tick), so it cannot be reached by scheduling a scenario into it.
+    'KENSHICOOP_WI_TEST_STALE'
 )
 
 function Get-CoopDiagEnvKeys {

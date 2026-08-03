@@ -830,68 +830,76 @@ function Test-WorldPickupMirror {
                             claimed = $claimed; applied = $applied })
 }
 
-# world_item_stale: the join's proxy is destroyed by the ENGINE (as a zone unload does)
-# and the mod must notice by re-resolving the proxy's hand rather than by touching the
-# object. What it must NOT do is the point, so the gate is mostly negative:
-#   no [wi] CLAIM        - the scenario contains no pickup, so any claim came from reading
-#                          isInInventory out of freed heap; the host answers a claim by
-#                          destroying its REAL item, which is this bug's quiet form
+# world_item_stale: the join's proxy is freed by the ENGINE (KENSHICOOP_WI_TEST_STALE
+# injects it at the exact moment a zone teardown would) and the cull about to run on
+# it must notice through the proxy's HAND rather than by touching the object.
+#   staleCull>=1   - the injection actually met the cull. Without it the run proves
+#                    nothing: the publish sweep clears dead proxies every tick, so a
+#                    scenario that frees one seconds earlier finds nothing left to
+#                    mishandle - which is exactly how an earlier version of this test
+#                    passed on the PRE-FIX build.
+#   live=1 absent  - a cull reporting the freed object as live means the hand check
+#                    did not happen, and GameWorld::destroy ran on it a second time
+#   no [wi] CLAIM  - a claim here came from reading isInInventory out of freed heap;
+#                    the host answers one by destroying its REAL item, which is this
+#                    bug's quiet form (the item disappears from both worlds)
 #   no CLAIM-APPLY destroyed=1 - the host end of that same phantom
-#   [wi] PROXY-GONE      - positive proof the mod DETECTED the loss (an unresolvable hand),
-#                          rather than the run passing because nothing happened to look
-# SKIPs unless the staging held (host dropped + culled, join saw a proxy + evicted it):
-# a vacuous "no phantom claim" is trivially true when no proxy ever existed.
-# staleCull counts culls that arrived after the object was already gone; it is normally 0
-# because the publish sweep drops the mapping first, and it is reported, not required.
+# Pair this with engine_integrity: a second destroy that DOES reach the engine shows
+# up there as Kenshi's own "alredy has destroy reason" line naming our coop-* reason.
 function Test-WorldItemStale {
     param([string]$HostFile, [string]$JoinFile)
-    $rx = 'SCENARIO WIS verdict role=(\w+) pass=(\d+) peak=(-?\d+) dropped=(-?\d+) evicted=(-?\d+) despawned=(-?\d+)'
+    $rx = 'SCENARIO WIS verdict role=(\w+) pass=(\d+) peak=(-?\d+) dropped=(-?\d+) despawned=(-?\d+)'
     $read = {
         param($file)
-        $r = [pscustomobject]@{ found = $false; peak = 0; dropped = 0; evicted = 0; despawned = 0 }
+        $r = [pscustomobject]@{ found = $false; peak = 0; dropped = 0; despawned = 0 }
         if (-not (Test-Path $file)) { return $r }
         $ln = Select-String -Path $file -Pattern $rx -ErrorAction SilentlyContinue | Select-Object -Last 1
         if ($null -eq $ln) { return $r }
         $g = $ln.Matches[0].Groups
         $r.found = $true; $r.peak = [int]$g[3].Value; $r.dropped = [int]$g[4].Value
-        $r.evicted = [int]$g[5].Value; $r.despawned = [int]$g[6].Value
+        $r.despawned = [int]$g[5].Value
         return $r
     }
     $h = & $read $HostFile
     $j = & $read $JoinFile
+    $inject = 0; $stale = 0; $live = 0
+    if (Test-Path $JoinFile) {
+        $inject = @(Select-String -Path $JoinFile -Pattern '\[wi\] TEST-STALE ' -ErrorAction SilentlyContinue).Count
+        $stale  = @(Select-String -Path $JoinFile -Pattern '\[wi\] CULL .* live=0' -ErrorAction SilentlyContinue).Count
+        $live   = @(Select-String -Path $JoinFile -Pattern '\[wi\] CULL .* live=1' -ErrorAction SilentlyContinue).Count
+    }
     $staged = $h.found -and $j.found -and ($h.dropped -ge 1) -and ($h.despawned -ge 1) `
-              -and ($j.peak -ge 1) -and ($j.evicted -ge 1)
+              -and ($j.peak -ge 1) -and ($inject -ge 1)
     if (-not $staged) {
-        Write-Host "  WI-STALE SKIP - staging incomplete (host dropped=$($h.dropped) despawned=$($h.despawned); join proxyPeak=$($j.peak) evicted=$($j.evicted))"
-        Write-Host "    Nothing was made stale, so the negative assertions would pass vacuously."
+        Write-Host "  WI-STALE SKIP - staging incomplete (host dropped=$($h.dropped) despawned=$($h.despawned); join proxyPeak=$($j.peak) injected=$inject)"
+        Write-Host "    No proxy was freed under a cull, so the assertions would pass vacuously."
         return (Add-GateResult -Name "world_item_stale" -Status SKIP `
                     -Metrics @{ hostDropped = $h.dropped; hostDespawned = $h.despawned
-                                joinPeak = $j.peak; joinEvicted = $j.evicted } `
+                                joinPeak = $j.peak; injected = $inject } `
                     -Detail "staging incomplete")
     }
     $claim   = (Test-Path $JoinFile) -and (Select-String -Path $JoinFile -Pattern '\[wi\] CLAIM author=' -Quiet)
     $applied = (Test-Path $HostFile) -and (Select-String -Path $HostFile -Pattern '\[wi\] CLAIM-APPLY netId=\d+ .* destroyed=1' -Quiet)
-    $gone    = (Test-Path $JoinFile) -and (Select-String -Path $JoinFile -Pattern '\[wi\] PROXY-GONE' -Quiet)
-    $stale   = 0
-    if (Test-Path $JoinFile) {
-        $stale = @(Select-String -Path $JoinFile -Pattern '\[wi\] (CULL|MOVE) .* live=0' -ErrorAction SilentlyContinue).Count
-    }
-    $ok = (-not $claim) -and (-not $applied) -and $gone
+    $ok = ($stale -ge 1) -and ($live -eq 0) -and (-not $claim) -and (-not $applied)
     Write-Host ("  WI-STALE " + $(if ($ok) { "PASS" } else { "FAIL" }) +
-                " - detected=$gone phantomClaim=$claim hostDestroyedReal=$applied staleCull=$stale")
+                " - injected=$inject staleCull=$stale liveCull=$live phantomClaim=$claim hostDestroyedReal=$applied")
+    if ($stale -lt 1) {
+        Write-Host "    NOTE: the injection fired but no cull reported live=0 - the cull never re-resolved the hand"
+    }
+    if ($live -gt 0) {
+        Write-Host "    NOTE: a cull called the freed proxy live - it destroyed an object the engine had already destroyed"
+    }
     if ($claim) {
-        Write-Host "    NOTE: the join claimed a pickup for a proxy the engine had already destroyed - a read off freed memory"
+        Write-Host "    NOTE: the join claimed a pickup for a freed proxy - a read off freed memory"
     }
     if ($applied) {
         Write-Host "    NOTE: the host destroyed its REAL item answering that claim - the item is gone from both worlds"
     }
-    if (-not $gone) {
-        Write-Host "    NOTE: no PROXY-GONE line - the mod never noticed the proxy died, so this run proves nothing"
-    }
     return (Add-GateResult -Name "world_item_stale" -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
-                -Metrics @{ detected = $gone; phantomClaim = $claim; hostDestroyedReal = $applied
-                            staleCull = $stale; joinPeak = $j.peak; joinEvicted = $j.evicted
-                            hostDropped = $h.dropped; hostDespawned = $h.despawned })
+                -Metrics @{ injected = $inject; staleCull = $stale; liveCull = $live
+                            phantomClaim = $claim; hostDestroyedReal = $applied
+                            joinPeak = $j.peak; hostDropped = $h.dropped
+                            hostDespawned = $h.despawned })
 }
 
 # inv_regear (protocol 47): the ONE-INSTANCE invariant across a full W2 round trip. Both

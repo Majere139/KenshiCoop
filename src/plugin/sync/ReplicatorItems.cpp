@@ -666,12 +666,33 @@ void Replicator::applyWorldItems(GameWorld* gw, Inbound& in) {
             }
         }
     }
+    // TEST-ONLY fault injection (KENSHICOOP_WI_TEST_STALE): free the proxy through the
+    // engine immediately before culling it, so the cull runs against an object the
+    // engine has ALREADY destroyed. That is the state a zone teardown leaves behind when
+    // players travel out of a block, but the window is one frame wide - the publish
+    // sweep re-resolves every proxy each tick and drops the dead ones - so a scenario
+    // cannot schedule itself into it. Injecting here makes it certain: without the hand
+    // check the cull below is a second GameWorld::destroy on freed memory, which Kenshi
+    // reports as "alredy has destroy reason coop-worlditem-cull" (world_item_stale).
+    static int testStale = -1;
+    if (testStale < 0) {
+        const char* e = getenv("KENSHICOOP_WI_TEST_STALE");
+        testStale = (e && e[0] == '1') ? 1 : 0;
+    }
+
     // Culls: destroy the proxy and drop the mapping (scoped to the authoring owner).
     for (std::deque<InboundWorldRemove>::iterator b = rems.begin(); b != rems.end(); ++b) {
         for (std::vector<u32>::iterator id = b->netIds.begin(); id != b->netIds.end(); ++id) {
             std::map<std::pair<u32, u32>, WorldProxy>::iterator pit =
                 worldProxies_.find(std::make_pair(b->ownerId, *id));
             if (pit == worldProxies_.end()) continue;
+            if (testStale && pit->second.obj) {
+                engine::removeWorldItemProxy(gw, pit->second.obj);
+                char tb[144]; _snprintf(tb, sizeof(tb) - 1,
+                    "[wi] TEST-STALE owner=%u netId=%u (proxy freed under the cull)",
+                    b->ownerId, *id);
+                tb[sizeof(tb) - 1] = '\0'; coop::logLine(tb);
+            }
             // Already gone (its block unloaded before the cull arrived): drop the
             // mapping and leave the engine alone. Destroying it a second time is a
             // double-destroy on freed memory, which the engine notices - it logs
