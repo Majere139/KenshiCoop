@@ -1955,8 +1955,15 @@ void configureReplicator() {
         // (Phase 2 mid-band tier: a populated town run has moving census-band
         // NPCs, which the hop corridor mostly lacks). Every other scenario
         // stays quiet (log volume).
+        // run_apart joins them because the population question it exists to ask
+        // - who holds a body while the two squads are 146,000 u apart and one
+        // camera is on the other's town - can only be answered by cross-matching
+        // the two sides' enumerated sets, hand by hand, with the authority class
+        // each side assigned. The aggregate counters cannot: a creature visible
+        // on one client and absent on the other leaves every bucket balanced.
         g_repl.setAuditRows(g_cfg.scenario == "travel_parity" ||
                             g_cfg.scenario == "split_far" ||
+                            g_cfg.scenario == "run_apart" ||
                             g_cfg.scenario == "npc_sync" ||
                             g_cfg.scenario == "world_parity" ||
                             g_cfg.scenario == "jail_probe" ||
