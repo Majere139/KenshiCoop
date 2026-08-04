@@ -223,10 +223,24 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
     // it actually owns or the two of us drive the same bodies.
     if (streamNpcs_ && n < MAX_PUBLISH) {
         unsigned int got = engine::captureNpcs(gw, buf + n, MAX_PUBLISH - n);
+        // The attention gate lives HERE, not on the census. Streaming is the
+        // expensive half - a transform per body per tick - and it is the half
+        // that is genuinely pointless when the peer has no camera or squad near
+        // the body: nobody can see the difference between a driven body and a
+        // still one they are not looking at. Note this gates only the NPC
+        // capture; our own squad (already in buf[0..n)) streams unconditionally,
+        // because those are the peer's window into what we are DOING and it must
+        // never depend on where their camera happens to point.
         if (cellAuth_) {
+            float peerAnch[12];
+            unsigned int nPeerAnch = peerAnchors(gw, peerAnch);
             unsigned int kept = 0;
             for (unsigned int i = 0; i < got; ++i) {
                 if (!weAuthor(gw, ownerId, buf[n + i].x, buf[n + i].z)) continue;
+                if (nPeerAnch > 0 &&
+                    !observedByPeer(keyOf(buf[n + i]), peerAnch, nPeerAnch,
+                                    buf[n + i].x, buf[n + i].y, buf[n + i].z))
+                    continue;
                 if (kept != i) buf[n + kept] = buf[n + i];
                 ++kept;
             }
@@ -737,38 +751,43 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
     }
     static u32   hands[NPC_CENSUS_MAX * 5];
     static float poss[NPC_CENSUS_MAX * 3];
-    // Attention gate: anchors once per publish, then leave bodies the PEER is
-    // not attending out of the packet. A census row is read on the far side as
-    // "this exists", and the ABSENCE of a row as "this does not" - a claim
-    // worth making only about a place they are actually looking at.
-    //
-    // The gate used to ask about OUR attention, which is the wrong question and
-    // the destructive one. Our anchor set is zone-vetoed, so a region the peer
-    // was standing in could read dormant here while reading fully attended over
-    // there: we stopped writing rows, and they culled real local bodies against
-    // the silence. That is the mismatch that survived a save reload and cleared
-    // only on reconnect. Note we have already ENUMERATED these bodies, so the
-    // zone veto - "can I see this region" - has been answered by construction.
-    //
-    // No peer anchors at all means we know nothing about them; publish
-    // everything, which is the pre-gate behaviour.
+    // A census row is read on the far side as "this exists", and the ABSENCE of a
+    // row as "this does not". That makes this list an existence claim, and the
+    // only thing entitled to narrow it is whether the body is OURS to speak for -
+    // handled by the authority gate in the loop. Attention has no business here
+    // and now lives on the stream instead (see the captureNpcs gate); the history
+    // of trying to put it here is in the loop comment, along with the measurement
+    // that settled it.
     float rawAnch[12];
     unsigned int nRawAnch = engine::interestAnchors(gw, rawAnch);
-    float peerAnch[12];
-    unsigned int nPeerAnch = peerAnchors(gw, peerAnch);
     std::set<Key> censusKeys;
-    unsigned int m = 0;      // rows that survived the gate
+    unsigned int m = 0;          // rows that survived the gate
+    unsigned int nNotMine = 0;   // omitted because another client authors them
     for (unsigned int i = 0; i < n; ++i) {
         Key k = keyOf(states[i]);
         censusKeys.insert(k);
-        if (nPeerAnch > 0 &&
-            !observedByPeer(k, peerAnch, nPeerAnch, states[i].x, states[i].y,
-                            states[i].z)) continue;
+        // The attention gate USED to sit here, and it was the wrong channel for
+        // it. A census row is a statement that a body EXISTS, and existence
+        // cannot depend on who happens to be looking - but the entity stream was
+        // never gated the same way, so we streamed bodies to the peer while this
+        // list told the peer they did not exist. Measured 2026-08-03: the join
+        // published n=5 of 258 enumerated bodies while streaming enough for the
+        // host to drive 134, and the host duly hid 108 of its own real bodies
+        // against that 5-row census ("[census] recv n=5 culls=108") while showing
+        // the 134 driven ones, which proxies are exempt from judging. Attention
+        // now gates the STREAM, where the per-tick cost actually is; the census
+        // stays a complete claim over what we author. That ordering also keeps
+        // census a superset of stream, so we can never again stream a body we
+        // refuse to vouch for.
+        //
         // Presence authority: a census row is an existence CLAIM, and we only
         // get to make it about cells we own. Without this the two clients would
         // each broadcast the whole overlapping walk and each cull the other's
         // bodies against it.
-        if (cellAuth_ && !weAuthor(gw, ownerId, states[i].x, states[i].z)) continue;
+        if (cellAuth_ && !weAuthor(gw, ownerId, states[i].x, states[i].z)) {
+            ++nNotMine;
+            continue;
+        }
         hands[m * 5 + 0] = states[i].hType;
         hands[m * 5 + 1] = states[i].hContainer;
         hands[m * 5 + 2] = states[i].hContainerSerial;
@@ -780,7 +799,6 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
         ++m;
     }
     pruneAttention(censusKeys);
-    unsigned int nDorm = n - m;
     net.queueNpcCensus(ownerId, hands, poss, m);
 
     // Phase 2 mid-band tier: rebuild the round-robin list from this census
@@ -795,6 +813,11 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
         // one, so the attention gate and its zone veto do not apply here.
         const float* anchors = rawAnch;
         unsigned int nAnchor = nRawAnch;
+        // Attention, for MEMBERSHIP (not for the distance tiering above): the
+        // mid band exists purely to spend bandwidth driving far bodies, so it is
+        // the clearest case of work worth skipping when the peer is not watching.
+        float peerAnch[12];
+        unsigned int nPeerAnch = peerAnchors(gw, peerAnch);
         midBand_.clear();
         for (unsigned int i = 0; i < n; ++i) {
             float best = -1.0f;
@@ -807,6 +830,9 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
             if (best < 0.0f || best <= MID_NEAR_EDGE) continue; // near tier
             // Same ownership rule as the near band: we drive what we author.
             if (cellAuth_ && !weAuthor(gw, ownerId, states[i].x, states[i].z)) continue;
+            if (cellAuth_ && nPeerAnch > 0 &&
+                !observedByPeer(keyOf(states[i]), peerAnch, nPeerAnch,
+                                states[i].x, states[i].y, states[i].z)) continue;
             MidBandEntry e;
             e.k.t  = states[i].hType;
             e.k.c  = states[i].hContainer;
@@ -888,12 +914,17 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
         // n = rows actually published, enum = what the walk found; the
         // per-anchor shares below are shares of enum, so they sum to enum
         // rather than to n whenever the gate held rows back.
+        // notmine replaces the old dorm= field, which counted BOTH omission
+        // reasons behind one name (attention and authority) and so could not say
+        // why anything was left out - it read as "the peer is not watching these"
+        // when it mostly meant "another client authors these". Now there is only
+        // one reason a row is dropped here, and this names it.
         char b[320];
         _snprintf(b, sizeof(b) - 1,
                   "[census] sent n=%u radius=%.0f mid=%u anchors=%u%s"
-                  " enum=%u dorm=%u attnR=%.0f pAnch=%u",
+                  " enum=%u notmine=%u attnR=%.0f",
                   m, censusRadius_, (unsigned)midBand_.size(), na, det,
-                  n, nDorm, attentionRadius_, nPeerAnch);
+                  n, nNotMine, attentionRadius_);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         // KENSHICOOP_DEBUG_CENSUS=1: dump every census row (hand + name) at the
         // same 10 s cadence, so a join-side cull can be classified against the
