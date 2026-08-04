@@ -1068,6 +1068,11 @@ private:
     // consecutive samples before we claim it, so a body walking the boundary
     // does not hand authority back and forth once a second.
     struct CellDwell { int cx, cz; unsigned int n; };
+    // Bodies we are DECLINING to author because the peer's stream already drives
+    // them (incumbent holds - see authorHoldsBody). Membership only exists to log
+    // the yield once per body instead of once per tick; the decision itself is
+    // recomputed from the drive state every pass, so a stale entry costs a line.
+    std::set<Key>            cellYield_;
     std::map<u32, CellDwell> claimDwell_;   // our tabRank -> pending cell
     std::map<u32, u32>       claimSeqOut_;  // our tabRank -> last seq sent
     unsigned long            claimSendMs_;  // 1 Hz sample throttle

@@ -882,32 +882,42 @@ bool Replicator::authorHoldsBody(GameWorld* gw, u32 localId, const Key& k,
     // whose owner has sent no census is unspoken-for, not empty, and treating
     // silence as absence is the whole ghost mechanism.
     if (owner != localId && owner == censusOwner_) return false;
-    // A body the peer's stream is still writing is not ours to author YET, even
-    // though the cell now says it is. Both at once is two writers on one
-    // Character: we publish it as ours while applyTargets keeps teleporting it
-    // to the peer's transform, and authorHoldsBody restores it out from under
-    // the drive. That is the same contradiction as the death/exit/drive one,
-    // and it is what a handover looks like without an ordering rule. So order
-    // it: drop the drive now, author from the next tick. The peer stops
-    // publishing the body as soon as its own claim moves, so the release is
-    // permanent rather than a fight - and one tick of neither side authoring
-    // costs nothing, where one tick of both costs a crash.
-    if (c) {
-        std::set<Character*>::iterator dc = drivenChars_.find(c);
-        bool driving = dc != drivenChars_.end();
-        if (driving) drivenChars_.erase(dc);
-        std::map<Character*, unsigned long>::iterator ds = drivenSeen_.find(c);
-        if (ds != drivenSeen_.end()) { drivenSeen_.erase(ds); driving = true; }
-        if (driving) {
-            char b[144]; _snprintf(b, sizeof(b) - 1,
-                "[cell] handover hand=%u,%u owner=%u - released the drive, authoring next tick",
-                (unsigned)k.i, (unsigned)k.s, owner);
-            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
-            return false;
-        }
+    // INCUMBENT HOLDS. A body the peer's stream is already writing is the peer's,
+    // whatever this cell verdict says, because the verdict is not a shared fact:
+    // each side evaluates it against ITS OWN copy's position, and the two copies
+    // of a fighting NPC drift apart. Measured 2026-08-03 on a 'Hungry bandit'
+    // whose copies sat 163 u apart (gap=163.4, task agreement 58%) astride the
+    // z=0 boundary between cells 21,31 and 21,32: the host's copy was in the
+    // host's cell and the join's copy in the join's, so BOTH sides concluded the
+    // body was theirs - each correctly, by its own premise.
+    //
+    // This used to release the drive and author from the next tick, to avoid two
+    // writers on one Character. But releasing is what created the fight: the peer
+    // has no idea we did it and keeps streaming, so we release again, 531 times
+    // for that one bandit, and each release dropped the body out of the streamed
+    // set long enough for the ordinary pass to suppress it (151 suppress/restore
+    // pairs, which is what turned up as suppress_churn).
+    //
+    // Yielding instead is what converges. A stream is an assertion of authorship,
+    // so the receiver defers to it and handover happens only when the author
+    // STOPS streaming - a decision one side makes alone, needing no agreement
+    // about whose cell a drifting body is standing in.
+    bool peerDrives = false;
+    if (c) peerDrives = drivenChars_.find(c) != drivenChars_.end() ||
+                        drivenSeen_.find(c)  != drivenSeen_.end();
+    // Say so once per body rather than per tick: the old line was 30% of this
+    // scenario's log and said the same thing every frame.
+    if (peerDrives && cellYield_.insert(k).second) {
+        char b[176]; _snprintf(b, sizeof(b) - 1,
+            "[cell] yield hand=%u,%u owner=%u - the peer's stream holds this body; "
+            "not authoring it while they drive it",
+            (unsigned)k.i, (unsigned)k.s, owner);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
-    // Authority just moved to us (or away from a census we no longer read):
-    // anything we hid on the old author's word has to come back, or a handover
+    if (!peerDrives) cellYield_.erase(k);
+    // Either way the body is not the ordinary pass's business, so it must be
+    // VISIBLE: authority moving to us, or a drive starting over something we hid
+    // on the old author's word, both have to undo that suppression or a handover
     // leaves a town permanently invisible.
     std::map<Key, Character*>::iterator sp = suppressed_.find(k);
     if (sp != suppressed_.end()) {
@@ -915,9 +925,11 @@ bool Replicator::authorHoldsBody(GameWorld* gw, u32 localId, const Key& k,
         suppressed_.erase(sp);
         ++authRestores_;
         lifeSet(k, LIFE_RESOLVED, "author-restore");
-        char b[144]; _snprintf(b, sizeof(b) - 1,
-            "[cell] restore NPC hand=%u,%u owner=%u (we author here; supp=%u)",
-            (unsigned)k.i, (unsigned)k.s, owner, (unsigned)suppressed_.size());
+        char b[160]; _snprintf(b, sizeof(b) - 1,
+            "[cell] restore NPC hand=%u,%u owner=%u (%s; supp=%u)",
+            (unsigned)k.i, (unsigned)k.s, owner,
+            peerDrives ? "the peer drives this body" : "we author here",
+            (unsigned)suppressed_.size());
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
     return true;

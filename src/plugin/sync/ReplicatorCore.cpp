@@ -205,6 +205,7 @@ void Replicator::resetSession() {
     claimedCells_.clear();
     cellLastOwner_.clear();
     claimDwell_.clear();
+    cellYield_.clear();
     claimSendMs_   = 0;
     claimAssertMs_ = 0;
     claimMapMs_    = 0;

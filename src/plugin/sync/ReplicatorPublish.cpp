@@ -234,9 +234,27 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
         if (cellAuth_) {
             float peerAnch[12];
             unsigned int nPeerAnch = peerAnchors(gw, peerAnch);
+            unsigned long cNow = nowMs();
             unsigned int kept = 0;
             for (unsigned int i = 0; i < got; ++i) {
                 if (!weAuthor(gw, ownerId, buf[n + i].x, buf[n + i].z)) continue;
+                // The peer's census is the other half of incumbent-holds. weAuthor
+                // asks a question about OUR copy's position, and two copies of one
+                // fighting NPC drift apart far enough to answer it differently on
+                // each side (163 u across a cell boundary, measured), so a cell
+                // verdict alone cannot keep us to one writer. A census row is the
+                // peer stating they author that body - and since the census now
+                // covers everything they author, its silence is meaningful too.
+                // Believing them costs nothing if they are wrong (the body simply
+                // goes unpublished for a beat) where disbelieving them costs two
+                // writers on one Character.
+                // Only while it is current, and only its PRESENCE is trusted: a
+                // census we have stopped receiving says nothing about who authors
+                // what now, and reading its silence as "they gave this up" would
+                // have us start writing bodies they are still driving.
+                if (censusRecvMs_ != 0 && (cNow - censusRecvMs_) <= 5000 &&
+                    censusHands_.find(keyOf(buf[n + i])) != censusHands_.end())
+                    continue;
                 if (nPeerAnch > 0 &&
                     !observedByPeer(keyOf(buf[n + i]), peerAnch, nPeerAnch,
                                     buf[n + i].x, buf[n + i].y, buf[n + i].z))
