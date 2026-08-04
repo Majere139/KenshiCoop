@@ -123,6 +123,13 @@ param(
     # default (fail-open to host authority); this is the switch that arms it.
     # Pair with -DebugMarkers to see the handover on screen.
     [switch]$CellAuth,
+    # Record where you walk (KENSHICOOP_TRACK_MOVE=1): one [track] line per squad
+    # tab per second, with position, cell and whether it is moving. Log-only.
+    # Use it to capture a route for a scenario to follow: the cell claims a session
+    # already logs fire once per 4608 u cell, so a cross-map walk leaves under
+    # thirty points, and run_apart wedged trying to walk straight between two of
+    # them. A 1 Hz track over the same walk is ~500 points, which is a real path.
+    [switch]$TrackMove,
     # Phase 6 shackle diagnostic (KENSHICOOP_DEBUG_SHACKLE=1 on both clients):
     # emits the ~1 Hz [shackledbg] per-body chained/lock trace so a manual camp
     # session captures the exact tick a peer's driven copy diverges from the
@@ -340,6 +347,9 @@ function Set-CoopEnv {
     # reads the peer's, so one side alone would author its cells while the other
     # went on enforcing host authority over the same bodies.
     $env:KENSHICOOP_CELL_AUTH    = if ($CellAuth) { "1" } else { "" }
+    # Track on BOTH: each client can only see its own tabs' true positions, and
+    # the interesting comparison is what the two logs say about the same walk.
+    $env:KENSHICOOP_TRACK_MOVE   = if ($TrackMove) { "1" } else { "" }
     # Phase 6 shackle trace on both clients (see -DebugShackle).
     $env:KENSHICOOP_DEBUG_SHACKLE = if ($DebugShackle) { "1" } else { "" }
     # Jail long-play probes on BOTH clients (spike 58, see -JailProbe): STATE/SNAP

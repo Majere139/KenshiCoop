@@ -2028,6 +2028,11 @@ public:
     // feature is armed.
     void syncCellClaims(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId);
     void setCellAuth(bool on) { cellAuth_ = on; }
+    // Defeat the 1x-during-combat leg of speed arbitration. See Config::
+    // speedCombatCap: run_apart's subject is distance, and the cap turned its
+    // crossing of bandit country into a five-fold slower run for no benefit,
+    // since the squad is fleeing the fight rather than resolving it.
+    void setSpeedCombatCap(bool on) { speedCombatCap_ = on; }
     // Who authors the region containing (x,z)? The claimant, or the HOST when
     // the feature is off, the cell is unclaimed, or the mapping is unavailable.
     // Never returns "nobody" - an unowned region is the case this exists to
@@ -2072,6 +2077,7 @@ private:
     float         speedLastApplied_;   // what WE last wrote (own-write vs user-click detector)
     float         speedMyReq_;         // this client's current request
     float         speedPeerReq_;       // host only: the join's latest request (-1 = none yet)
+    bool          speedCombatCap_;     // false = do NOT pin to 1x while fighting
     bool          speedMyCombat_;      // own-squad in-combat flag (~1 Hz sample)
     bool          speedPeerCombat_;    // host only: the join's reported combat bit
     float         speedLastSet_;       // host: last broadcast effective; join: last received

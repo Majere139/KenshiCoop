@@ -58,6 +58,7 @@ Replicator::Replicator()
       attnBaseProxy_(0), attnVetoMs_(0), attnVetoRawN_(0), attnVetoOutN_(0),
       auditRows_(false), jailProbe_(false), jailObserve_(false),
       speedLastApplied_(-1.0f), speedMyReq_(-1.0f), speedPeerReq_(-1.0f),
+      speedCombatCap_(true),
       speedMyCombat_(false), speedPeerCombat_(false), speedLastSet_(-1.0f),
       speedSeqOut_(1), speedSeqSeen_(0),
       speedLastSendMs_(0), speedCombatSampleMs_(0), speedCombatHoldMs_(0),

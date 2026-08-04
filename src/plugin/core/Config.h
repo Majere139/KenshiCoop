@@ -272,6 +272,23 @@ struct Config {
     // fights). Pause travels as speed 0. "0" is the A/B escape hatch.
     bool          speedSync;
 
+    // The combat leg of that arbitration, separately defeatable
+    // (KENSHICOOP_SPEED_COMBAT_CAP != "0"; DEFAULT ON = capped, i.e. the shipped
+    // behaviour). Pinning the sim to 1x during a fight is right for players -
+    // nobody wants a battle resolved at 5x - but it is wrong for a scenario whose
+    // subject is DISTANCE. run_apart crosses ~121 k u of bandit country, and every
+    // encounter along the way stretched a 3-minute crossing toward 15 while the
+    // squad walked away from the fight anyway. Only run_apart clears this; a
+    // scenario that measures combat must leave it set, because the cap is what
+    // lets a fight resolve at a watchable rate.
+    bool          speedCombatCap;
+
+    // KENSHICOOP_TRACK_MOVE=1 (DEFAULT OFF): log-only 1 Hz position track, one
+    // line per player squad tab. Gates nothing. Used to RECORD a walked route at
+    // usable resolution - cell claims fire once per 4608 u cell, which proved far
+    // too sparse to reconstruct a path (see Plugin::trackMove).
+    bool          trackMove;
+
     // Character stats sync (KENSHICOOP_STATS_SYNC != "0"; DEFAULT ON;
     // protocol 17): owner-authoritative CharStats stream for player-squad
     // members (attributes/skills/xp onto the peer's driven copies, change-

@@ -194,6 +194,8 @@ void loadConfig(Config& c) {
     // speed_probe spike (which drives the quiet/loud writers directly) and
     // time_probe force it OFF via their manifest DiagEnv (KENSHICOOP_SPEED_SYNC=0).
     c.speedSync = envOr("KENSHICOOP_SPEED_SYNC", "1") != "0";
+    c.speedCombatCap = envOr("KENSHICOOP_SPEED_COMBAT_CAP", "1") != "0";
+    c.trackMove = envOr("KENSHICOOP_TRACK_MOVE", "0") == "1";
 
     // Character stats sync (protocol 17): DEFAULT ON - owner-authoritative
     // CharStats stream for player-squad members. Without it a driven copy
@@ -366,6 +368,7 @@ std::string describeConfig(const Config& c) {
         { "inv",     c.invSync },      { "xfer",    c.xferSync },
         { "blockXfer", c.blockXfer },  { "world",   c.worldSync },
         { "med",     c.medSync },      { "speed",   c.speedSync },
+        { "speedCombatCap", c.speedCombatCap },
         { "stats",   c.statsSync },    { "carry",   c.carrySync },
         { "furn",    c.furnSync },     { "chain",   c.chainSync },
         { "stealth", c.stealthSync },  { "money",   c.moneySync },

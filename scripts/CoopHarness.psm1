@@ -79,9 +79,20 @@ $script:CoopDiagEnvKeys = @(
     # every tick), so it cannot be reached by scheduling a scenario into it.
     'KENSHICOOP_WI_TEST_STALE'
     # --- presence authority (Config.cpp) ----------------------------------------
-    # Off everywhere except split_far2. Every other scenario runs with it clear,
-    # which is what makes the tier a fail-open proof rather than a co-test.
+    # Off everywhere except split_far2 and run_apart. Every other scenario runs
+    # with it clear, which is what makes the tier a fail-open proof rather than a
+    # co-test.
     'KENSHICOOP_CELL_AUTH'
+    # --- combat speed cap (Config.cpp) ------------------------------------------
+    # The speed arbiter pins the sim to 1x while either player squad fights, which
+    # is right for players and wrong for a scenario whose job is to cover 100 k u:
+    # bandit country along the way turned a 3-minute crossing into a 15-minute one.
+    # Set to 0 ONLY by run_apart. Anything measuring combat must leave it alone,
+    # since the cap is exactly what stops a fight resolving at 5x.
+    'KENSHICOOP_SPEED_COMBAT_CAP'
+    # 1 Hz position track per squad tab, log-only. For RECORDING a route: cell
+    # claims fire once per 4608 u cell, which is far too sparse to walk between.
+    'KENSHICOOP_TRACK_MOVE'
 )
 
 function Get-CoopDiagEnvKeys {

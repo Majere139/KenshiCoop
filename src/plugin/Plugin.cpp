@@ -1279,6 +1279,8 @@ void tickScenarioStart(GameWorld* gw) {
 // live: the engine tick may have STARTED a swap (gameplay just went non-live), in
 // which case the caches are now stale - skip apply this tick too (the reset runs
 // next tick's top on the reload edge).
+void trackMove(GameWorld* gw);   // KENSHICOOP_TRACK_MOVE route recorder (below)
+
 void tickReplicateApply(GameWorld* gw, bool worldLive) {
     if (worldLive && coop::engine::gameplayLive(gw)) {
         g_repl.applyTargets(gw);
@@ -1342,6 +1344,56 @@ void tickReplicateApply(GameWorld* gw, bool worldLive) {
         // session restart logic.
         g_repl.syncCamHint(gw, g_inbound, g_net, g_net.localId());
         g_repl.syncCellClaims(gw, g_inbound, g_net, g_net.localId());
+        trackMove(gw);
+    }
+}
+
+// KENSHICOOP_TRACK_MOVE=1: log one line per player squad TAB per second - where
+// its first member is and whether it is moving. Log-only; gates nothing.
+//
+// It exists because the cell claims are far too sparse to reconstruct a walked
+// route. A claim fires when a tab crosses a 4608 u cell boundary, so a 99,600 u
+// crossing left 29 points, and run_apart's attempt to walk between consecutive
+// ones wedged the pair at -48980,-5670: a straight line between two cell-crossing
+// points is not a path, because the human who produced them walked AROUND
+// whatever sits between. A 1 Hz track is ~500 points over the same crossing,
+// which is a route, and it also shows plainly whether a single distant click
+// routes across the map at all - the question run_apart is currently guessing at.
+void trackMove(GameWorld* gw) {
+    if (!g_cfg.trackMove || !gw) return;
+    static DWORD lastTick = 0;
+    const DWORD now = GetTickCount();
+    if (lastTick != 0 && (now - lastTick) < 1000) return;
+    lastTick = now;
+
+    const unsigned int MAXB = 32;
+    coop::EntityState sq[MAXB];
+    unsigned int n = coop::engine::captureSquad(gw, false, sq, MAXB);
+    // One line per tab, keyed on the container hand: every squad member would be
+    // six lines a second of the same information.
+    unsigned int seenC[8], seenS[8];
+    unsigned int nSeen = 0;
+    for (unsigned int i = 0; i < n && nSeen < 8; ++i) {
+        bool dup = false;
+        for (unsigned int k = 0; k < nSeen; ++k)
+            if (seenC[k] == (unsigned int)sq[i].hContainer &&
+                seenS[k] == (unsigned int)sq[i].hContainerSerial)
+                dup = true;
+        if (dup) continue;
+        seenC[nSeen] = (unsigned int)sq[i].hContainer;
+        seenS[nSeen] = (unsigned int)sq[i].hContainerSerial;
+        ++nSeen;
+        int cx = 0, cz = 0;
+        int haveCell = coop::engine::cellAt(gw, sq[i].x, sq[i].z, &cx, &cz) ? 1 : 0;
+        char b[224];
+        _snprintf(b, sizeof(b) - 1,
+                  "[track] tab=%u,%u pos=%.0f,%.0f,%.0f moving=%u speed=%.1f "
+                  "cell=%d(%d,%d)",
+                  (unsigned)sq[i].hContainer, (unsigned)sq[i].hContainerSerial,
+                  sq[i].x, sq[i].y, sq[i].z, (unsigned)sq[i].cMoving, sq[i].cSpeed,
+                  haveCell, cx, cz);
+        b[sizeof(b) - 1] = '\0';
+        coop::logLine(b);
     }
 }
 
@@ -1893,6 +1945,7 @@ void configureReplicator() {
         g_repl.setCensusFreezeAi(g_cfg.censusFreezeAi);
         g_repl.setAttentionRadius(g_cfg.attentionRadius);
         g_repl.setCellAuth(g_cfg.cellAuth);
+        g_repl.setSpeedCombatCap(g_cfg.speedCombatCap);
         g_repl.setStarveHold(g_cfg.starveHoldMs);
         // Camera-anchored interest (protocol 43): engine-side master enable
         // for the camera anchors in interestCenters.

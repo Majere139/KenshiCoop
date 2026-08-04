@@ -223,6 +223,7 @@ function Invoke-OneOracle {
         "travel_parity" { return (Test-TravelParity    -HostFile $HostLog -JoinFile $JoinLog) }
         "split_far"     { return (Test-SplitFar        -HostFile $HostLog -JoinFile $JoinLog) }
         "split_far2"    { return (Test-SplitFar2       -HostFile $HostLog -JoinFile $JoinLog) }
+        "run_apart"     { return (Test-RunApart        -HostFile $HostLog -JoinFile $JoinLog) }
         "world_parity"  { return (Test-WorldParity     -HostFile $HostLog -JoinFile $JoinLog) }
         "cell_probe"    { return (Test-CellProbe       -HostFile $HostLog -JoinFile $JoinLog) }
         "camp_approach" { return (Test-CampApproach    -HostFile $HostLog -JoinFile $JoinLog) }
@@ -436,7 +437,7 @@ Export-ModuleMember -Function @(
     "Test-SnapRate", "Test-SuppressChurn", "Test-RestFlap",
     "Test-ExistenceParity",
     "Get-WnpcRows", "Get-WorldRows", "Group-WnpcSamples", "Test-FollowTravel", "Test-TravelParity",
-    "Test-SplitFar", "Test-SplitFar2",
+    "Test-SplitFar", "Test-SplitFar2", "Test-RunApart",
     "Test-WorldParity", "Test-CellProbe",
     "Test-CampApproach",
     "Test-MintDistance", "Test-AntiZombie", "Test-Lifecycle",

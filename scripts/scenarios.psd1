@@ -261,6 +261,61 @@
             Tier = 'probe'; WanVariant = $false
         }
 
+        # run_apart: split_far2's question over ground actually CROSSED, cross-map.
+        #
+        # split_far2 starts from a fixture that already has the squads 5200 u
+        # apart and walks the last 600 u, which isolates the arrival transient but
+        # never crosses country - watching it, the squads barely move. This starts
+        # both tabs TOGETHER (runfar1 loads them ~37 u apart at -50879,3676) and
+        # sends them in OPPOSITE directions, the host north and the join south,
+        # ~160 k u of path each, ending 138,465 u apart - sixty-nine times the
+        # 2000 u census reach - with zones streaming under moving anchors and cells
+        # claimed and vacated the whole way.
+        #
+        # Both routes are a RECORDING of a human driving these two squads to those
+        # two places (KENSHICOOP_TRACK_MOVE at 1 Hz, session 20260804_114911),
+        # decimated to ~2000 u legs. That matters more than it sounds: the host's
+        # recorded path is 164,532 u long for 88,242 u of displacement, so a
+        # straight line between two points a human reached usually passes through
+        # whatever they walked around. Three earlier revisions failed on exactly
+        # that - one separated the pair no further than split_far2 does, one sent
+        # the join across alone and it was knocked out 12,200 u in, and one walked
+        # between an earlier session's cell claims (one per 4608 u) and wedged both
+        # squads at -48980,-5670 with no path and nothing wrong with them.
+        #
+        # KENSHICOOP_SPEED_COMBAT_CAP=0: the arbiter pins the sim to 1x while either
+        # squad fights, which is right for players and wrong here - the squad is
+        # running AWAY from the encounter, and the cap stretched the crossing
+        # five-fold for nothing. Only this scenario clears it.
+        #
+        # Speed sync arbitrates min(host, join), so the scenario votes 5x on BOTH
+        # sides and re-votes every 10 s. Measured rate under that vote: ~570-600
+        # u/s, so ~160 k u is ~280 s of running. split_far2's note that 5200 u
+        # costs ~9 minutes is out by about 60x; it is ~9 seconds.
+        #
+        # runfar1 is a COPY of the buff1 manual save, tracked as a fixture so
+        # run_test.ps1 restores it every run: buff1 itself is untracked, and the
+        # host's connect-push bakes the live world over whatever it loaded, so
+        # pointing a scenario at buff1 would consume the save it was testing.
+        #
+        # Seconds/KillGraceSec outlive the 590 s host window.
+        run_apart = @{
+            Save = 'runfar1'; Setup = ''; Tolerance = 18.0
+            # The longest scenario in the suite by a wide margin: two ~160 k u
+            # foot crossings plus four camera phases. 420 s of walk window and
+            # 160 s of phases is 580 s on the join, and the host self-exits at
+            # 590; the window has to outlive that or the kill lands mid-run and
+            # the gate reads a truncated route as a stalled one.
+            Seconds = 650; KillGraceSec = 620
+            PrimaryGate = 'run_apart'
+            Gating   = @('run_apart', 'clock_sync')
+            Advisory = @('existence_parity', 'lifecycle', 'suppress_churn',
+                         'anti_zombie', 'mint_dist', 'smoothness')
+            DiagEnv = @{ KENSHICOOP_CELL_AUTH = '1'
+                         KENSHICOOP_SPEED_COMBAT_CAP = '0' }
+            Tier = 'probe'; WanVariant = $false
+        }
+
         # cell_probe: measure ZoneManager's sector grid before any authority is
         # keyed on it. Read-only - no park, no mutation - so the SAVE is the
         # experiment: on 'sync' (a live town, both tabs together) it answers

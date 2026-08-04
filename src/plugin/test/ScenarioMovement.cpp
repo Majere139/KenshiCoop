@@ -1038,9 +1038,13 @@ const float CampApproachScenario::HOP = 2800.0f;
 //      counts exactly it: bodies hidden/culled/minted in the window attention
 //      arrived.
 //
-// APPROACH, not teleport. The baked fixture puts each squad in its town, and
-// walking between the two at Kenshi's locomotion speed would take ~9 minutes -
-// longer than any harness window. So each side PARKS its own tab leader
+// APPROACH, not teleport. The baked fixture puts each squad in its town, and the
+// approach is deliberately short so the run isolates the ARRIVAL - not because
+// the distance is unaffordable. (This comment used to claim walking the 5200 u
+// between the towns costs ~9 minutes. It does not: run_apart measured ~570-600
+// u/s under a 5x vote, so it is ~9 SECONDS, and run_apart's first window was
+// sized three minutes too long on the strength of the wrong figure.) So each
+// side PARKS its own tab leader
 // APPROACH_D out from where the fixture placed it and WALKS it back in. The
 // approach is the part that matters: it is when zones stream, when the census
 // first covers a region, and when the attach measurement has something to say.
@@ -1274,10 +1278,457 @@ const float SplitFar2Scenario::IDLE_LEG   = 15.0f;
 // body is the 2000 u census reach, so the probe measures inside that shell.
 const float SplitFar2Scenario::PROBE_R    = 1800.0f;
 
+// run_apart: the pair starts TOGETHER, runs ~160 k u each on foot at 5x in
+// OPPOSITE directions, and ends ~138,500 u apart - then the camera phases ask
+// what the two clients make of that.
+//
+// split_far2 answers "who authors this region" from a fixture that already has
+// the squads 5200 u apart, and walks only the last 600 u. That is deliberate -
+// it isolates the arrival transient - but it means the run never crosses ground,
+// and crossing ground is where the reported symptoms live: zones streaming in
+// under a moving anchor, cells being claimed and vacated one after another, and
+// the census first covering regions neither client has ever attended. Watching
+// split_far2, the squads barely move.
+//
+// So this one starts from runfar1, where both tabs stand together at about
+// -50879,3676, and sends the host north to 11470,65362 while the join goes south
+// to 35914,-70928. That is sixty-nine times the 2000 u census reach between them,
+// well outside anything either engine has streamed, and each squad has crossed
+// most of the map to get there - the configuration the field reports come from
+// and the one no existing scenario produces.
+//
+// Both squads run their OWN route, and both run the whole way. An earlier
+// revision convoyed them and stopped the host half way, on the theory that half
+// a party cannot survive bandit country alone - which was true of the route it
+// was then using. These routes are a recording of a human doing exactly this,
+// both squads separately, and both arrived, so the convoy is not needed and the
+// separation is a real ~138 k rather than the 48 k a shared corridor allowed.
+//
+// Speed sync arbitrates min(host, join), so BOTH sides must vote 5x or the pair
+// runs at whatever the quieter side asked for - which is why this votes on each
+// side rather than only on the host, and re-votes.
+//
+// That arbitration also pins the sim to 1x while either squad fights, which for
+// this scenario is the wrong answer to the right question: we are fleeing the
+// encounter, not resolving it. The manifest therefore clears
+// KENSHICOOP_SPEED_COMBAT_CAP, and the stall handler below skips a waypoint we
+// have stopped closing on, so a fight costs a detour instead of the run.
+//
+// How fast that actually is, measured rather than assumed: ~570-600 u/s of real
+// time under the 5x vote, sampled per second off the tab leader's own position,
+// walk clip playing and the path curving round obstacles. The note in split_far2
+// that 5200 u costs ~9 minutes is wrong by about sixty times - it is ~9 seconds.
+// Worth knowing before sizing any window on this, as its first run showed.
+//
+// A ~160 k path is therefore ~280 s if nothing interrupts. The recording took
+// 480 s, a human at the wheel, stationary 41% of the time (fights, orders,
+// looking around) and with the combat cap still on. WALK_MS below allows 420 s,
+// between the two.
+struct RunWp { float x, z; };
+// The two routes are RECORDED, at 1 Hz, from a human driving both squads apart
+// (KENSHICOOP_TRACK_MOVE, session 20260804_114911), then decimated to ~2000 u
+// legs. They are not a straight line and must not be replaced by one.
+//
+// That is the whole lesson of the three runs before this. The first tried
+// split_far2's towns and separated the pair by 6400 u, no further than
+// split_far2 already does. The second sent the join cross-map alone and it was
+// knocked out 12,200 u in (blood 20 of 117, a limb at 1.7%) - half a party
+// cannot cross bandit country, and no amount of re-ordering moves an
+// unconscious body. The third walked between the CELL CLAIMS of an earlier
+// session, which fire once per 4608 u cell, and wedged both squads at
+// -48980,-5670: healthy, idle, out of combat, no path. The reason is in the
+// numbers here - the host's recorded path is 164,532 u long to cover 88,242 u
+// of displacement, so a straight line between two points a human reached is
+// very often through something they walked around, and the router answers by
+// not moving at all.
+//
+// Y is not stored. Each order reuses the body's CURRENT y and lets the engine
+// ground the path, which is what keeps a recorded route valid on uneven terrain.
+const RunWp HOST_ROUTE[] = {
+    { -50879.0f,   3676.0f },    { -50590.0f,   3651.0f },    { -50517.0f,   6158.0f },
+    { -51565.0f,   8192.0f },    { -52486.0f,  10021.0f },    { -53212.0f,  12378.0f },
+    { -52990.0f,  14737.0f },    { -53785.0f,  17179.0f },    { -54589.0f,  18695.0f },
+    { -55734.0f,  20625.0f },    { -55201.0f,  22672.0f },    { -56739.0f,  23085.0f },
+    { -56618.0f,  24294.0f },    { -54766.0f,  25344.0f },    { -55482.0f,  27637.0f },
+    { -56329.0f,  29431.0f },    { -56279.0f,  31796.0f },    { -55776.0f,  34298.0f },
+    { -56683.0f,  36432.0f },    { -56588.0f,  38110.0f },    { -56916.0f,  40470.0f },
+    { -56858.0f,  42035.0f },    { -57848.0f,  43802.0f },    { -58258.0f,  45708.0f },
+    { -59179.0f,  47539.0f },    { -60246.0f,  49396.0f },    { -59636.0f,  51328.0f },
+    { -59889.0f,  53805.0f },    { -60587.0f,  55667.0f },    { -61128.0f,  57691.0f },
+    { -60865.0f,  59763.0f },    { -61011.0f,  61943.0f },    { -61081.0f,  64298.0f },
+    { -61219.0f,  66062.0f },    { -59046.0f,  67204.0f },    { -57459.0f,  66394.0f },
+    { -56040.0f,  64766.0f },    { -54110.0f,  64154.0f },    { -52102.0f,  63899.0f },
+    { -50139.0f,  63294.0f },    { -48253.0f,  63620.0f },    { -46517.0f,  62741.0f },
+    { -44633.0f,  62860.0f },    { -44379.0f,  62390.0f },    { -44999.0f,  62850.0f },
+    { -43913.0f,  63646.0f },    { -41551.0f,  63038.0f },    { -39159.0f,  62084.0f },
+    { -37189.0f,  61580.0f },    { -34800.0f,  61604.0f },    { -32287.0f,  61297.0f },
+    { -29807.0f,  61025.0f },    { -27348.0f,  60959.0f },    { -24937.0f,  60336.0f },
+    { -22889.0f,  60378.0f },    { -20607.0f,  59512.0f },    { -18501.0f,  59962.0f },
+    { -16303.0f,  60138.0f },    { -13997.0f,  60023.0f },    { -11675.0f,  59988.0f },
+    {  -9287.0f,  59204.0f },    {  -6975.0f,  58092.0f },    {  -4897.0f,  57876.0f },
+    {  -2579.0f,  57129.0f },    {    -49.0f,  56597.0f },    {   1538.0f,  57794.0f },
+    {   3193.0f,  59737.0f },    {   5013.0f,  61478.0f },    {   6874.0f,  62988.0f },
+    {   9212.0f,  64093.0f },    {  11470.0f,  65362.0f }
+};
+const RunWp JOIN_ROUTE[] = {
+    { -50914.0f,   3688.0f },    { -50237.0f,   1556.0f },    { -50129.0f,   -837.0f },
+    { -49405.0f,  -2713.0f },    { -49271.0f,  -5142.0f },    { -49018.0f,  -7306.0f },
+    { -47469.0f,  -8804.0f },    { -45246.0f,  -9338.0f },    { -43493.0f, -10962.0f },
+    { -41302.0f, -11722.0f },    { -40318.0f, -13829.0f },    { -38060.0f, -14635.0f },
+    { -35749.0f, -14511.0f },    { -34715.0f, -16121.0f },    { -33524.0f, -18276.0f },
+    { -32893.0f, -20457.0f },    { -31287.0f, -21735.0f },    { -28788.0f, -21977.0f },
+    { -27090.0f, -23229.0f },    { -24701.0f, -23950.0f },    { -22331.0f, -23430.0f },
+    { -20452.0f, -24991.0f },    { -19729.0f, -27351.0f },    { -19383.0f, -29733.0f },
+    { -19976.0f, -32037.0f },    { -19101.0f, -34479.0f },    { -17586.0f, -36526.0f },
+    { -17523.0f, -38906.0f },    { -16766.0f, -41079.0f },    { -16424.0f, -43367.0f },
+    { -16918.0f, -45909.0f },    { -16236.0f, -47523.0f },    { -13830.0f, -46874.0f },
+    { -11399.0f, -47303.0f },    {  -8998.0f, -47316.0f },    {  -6463.0f, -47373.0f },
+    {  -4470.0f, -48953.0f },    {  -2480.0f, -50177.0f },    {   -569.0f, -51567.0f },
+    {   1749.0f, -52391.0f },    {   3815.0f, -50816.0f },    {   5609.0f, -49063.0f },
+    {   7998.0f, -48317.0f },    {  10408.0f, -47785.0f },    {  12416.0f, -48423.0f },
+    {  14532.0f, -49883.0f },    {  15743.0f, -52116.0f },    {  17349.0f, -53404.0f },
+    {  18275.0f, -55442.0f },    {  19532.0f, -57154.0f },    {  19987.0f, -59255.0f },
+    {  20061.0f, -61108.0f },    {  21457.0f, -62381.0f },    {  23524.0f, -63109.0f },
+    {  25921.0f, -62114.0f },    {  28253.0f, -61757.0f },    {  29182.0f, -64136.0f },
+    {  30827.0f, -65560.0f },    {  33058.0f, -66768.0f },    {  34241.0f, -69015.0f },
+    {  35914.0f, -70928.0f }
+};
+
+class RunApartScenario : public TimedScenario {
+public:
+    RunApartScenario()
+        : TimedScenario("run_apart", 1000), recvCount_(0),
+          haveAnchor_(false), camMs_(0), camPhase_(0xFFFFFFFFu),
+          arrived_(false), arriveMs_(0), speedMs_(0),
+          route_(0), nRoute_(0), wp_(0), travelled_(0.0f), maxStep_(0.0f),
+          lastX_(0), lastZ_(0), haveLast_(false),
+          bestD_(1.0e9f), stallMs_(0), nStall_(0),
+          sx_(0), sy_(0), sz_(0) {}
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        route_  = ctx.isHost ? HOST_ROUTE : JOIN_ROUTE;
+        nRoute_ = ctx.isHost
+                    ? (unsigned int)(sizeof(HOST_ROUTE) / sizeof(HOST_ROUTE[0]))
+                    : (unsigned int)(sizeof(JOIN_ROUTE) / sizeof(JOIN_ROUTE[0]));
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        int h = tabLeaderIdx(sq, n, 0);   // host-owned tab
+        int j = tabLeaderIdx(sq, n, 1);   // join-owned tab
+        float sep = 0.0f;
+        if (h >= 0 && j >= 0) {
+            haveAnchor_ = true;
+            int own = ctx.isHost ? h : j;
+            sx_ = sq[own].x; sy_ = sq[own].y; sz_ = sq[own].z;
+            lastX_ = sx_; lastZ_ = sz_; haveLast_ = true;
+            float dx = sq[j].x - sq[h].x, dz = sq[j].z - sq[h].z;
+            sep = (float)sqrt((double)(dx * dx + dz * dz));
+        }
+        voteSpeed(ctx, 0);
+        const RunWp& last = route_[nRoute_ - 1];
+        int cx = 0, cz = 0;
+        int haveCell = (haveAnchor_ &&
+                        engine::cellAt(ctx.gw, last.x, last.z, &cx, &cz)) ? 1 : 0;
+        char b[320];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO RUNAPART start side=%s have=%d sep=%.0f "
+                  "from=%.0f,%.0f,%.0f dest=%.0f,%.0f cell=%d(%d,%d) "
+                  "wps=%u leg=%.0f straight=%.0f speed=%.1f walkMs=%lu phaseMs=%lu",
+                  ctx.isHost ? "host" : "join", haveAnchor_ ? 1 : 0, sep,
+                  sx_, sy_, sz_, last.x, last.z, haveCell, cx, cz,
+                  nRoute_, routeLength(), straightLength(), SPEED_MULT,
+                  (unsigned long)WALK_MS, (unsigned long)PHASE_MS);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (!haveAnchor_)
+            coop::logLine("SCENARIO RUNAPART needs a 2-tab save (rank-0/rank-1 member missing)");
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (!haveAnchor_) {
+            if (ctx.elapsedMs >= dur) { passed_ = false; return true; }
+            return false;
+        }
+        // Re-vote periodically. A speed vote is a UI-visible click, and anything
+        // that clicks after us (the replicator's arbitration, a phase change,
+        // the engine's own combat handling) would otherwise quietly leave the
+        // pair walking at 1x for the rest of a leg measured in thousands of
+        // units - the run would simply not finish, and the log would not say why.
+        voteSpeed(ctx, ctx.elapsedMs);
+
+        if (evidenceDue(ctx.elapsedMs)) {
+            EntityState sq[MAX_SQUAD];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+            int h = tabLeaderIdx(sq, n, 0);
+            int j = tabLeaderIdx(sq, n, 1);
+            unsigned int ph = phaseOf(ctx.elapsedMs);
+
+            // ---- camera: same phase plan as split_far2 -----------------------
+            int tgt;
+            if      (ph == 2) tgt = j;
+            else if (ph == 3) tgt = h;
+            else              tgt = ctx.isHost ? h : j;
+            if (tgt >= 0 && (camMs_ == 0 || ph != camPhase_ ||
+                             (ctx.elapsedMs - camMs_) >= CAM_REFOCUS_MS)) {
+                if (ph != camPhase_) {
+                    char pb[160];
+                    _snprintf(pb, sizeof(pb) - 1,
+                              "SCENARIO RUNAPART phase side=%s phase=%s watching=%s",
+                              ctx.isHost ? "host" : "join", phaseName(ph),
+                              (tgt == h) ? "host" : "join");
+                    pb[sizeof(pb) - 1] = '\0'; coop::logLine(pb);
+                }
+                camMs_ = ctx.elapsedMs; camPhase_ = ph;
+                Character* tc = engine::resolve(sq[tgt]);
+                if (tc) engine::cameraFocusOn(ctx.gw, tc);
+            }
+
+            // ---- locomotion --------------------------------------------------
+            // Ordered in EVERY phase, not just the walk window, because the leg
+            // is long enough that a run which loses its 5x cannot be assumed to
+            // finish on schedule. A body that has arrived just shuffles.
+            int own = ctx.isHost ? h : j;
+            float d = -1.0f;
+            if (own >= 0) {
+                // Path length actually covered, summed per sample. A straight
+                // line from the start would badly understate a route that turns
+                // twenty-nine times, and it is the covered distance - not the
+                // displacement - that says whether the squad ran.
+                if (haveLast_) {
+                    float px = sq[own].x - lastX_, pz = sq[own].z - lastZ_;
+                    float step = (float)sqrt((double)(px * px + pz * pz));
+                    travelled_ += step;
+                    if (step > maxStep_) maxStep_ = step;
+                }
+                lastX_ = sq[own].x; lastZ_ = sq[own].z; haveLast_ = true;
+
+                // Walk the route. A point counts as reached generously, since these
+                // are 1 Hz samples of somebody walking, not places to stand.
+                const unsigned int wpWas = wp_;
+                while (wp_ + 1 < nRoute_ && wpDist(sq[own]) <= WAYPOINT_R) ++wp_;
+                d = wpDist(sq[own]);
+                // A new waypoint is a new distance, ~2000 u of it. Carrying the
+                // old best across the change would read as "not closing" and trip
+                // the stall clock on a squad that is running perfectly.
+                if (wp_ != wpWas) { bestD_ = d; stallMs_ = ctx.elapsedMs; }
+
+                // Not closing on it for 20 s? Skip it. Safe here in a way it was
+                // not on the sparse route: the next point is ~2000 u further along
+                // ground a human covered, so skipping costs one leg, where skipping
+                // a cell-crossing point moved the target 5 k further into terrain
+                // with no path. A fight is the usual cause and running on is the
+                // right answer to it. Capped, so a genuinely stuck squad ends the
+                // run reporting stalls rather than teleporting up the route.
+                // Only while still running. After arrival the squad shuffles in
+                // place on purpose, which never closes distance, and the first run
+                // duly reported four "stalls" per side for a route both had
+                // finished - a stall count is a fight count and must stay readable.
+                if (d < bestD_ - STALL_EPS) { bestD_ = d; stallMs_ = ctx.elapsedMs; }
+                else if (!arrived_ && ctx.elapsedMs - stallMs_ >= STALL_MS) {
+                    char sb[208];
+                    _snprintf(sb, sizeof(sb) - 1,
+                              "SCENARIO RUNAPART stall side=%s wp=%u/%u d=%.0f "
+                              "forMs=%lu n=%u%s",
+                              ctx.isHost ? "host" : "join", wp_ + 1, nRoute_, d,
+                              ctx.elapsedMs - stallMs_, nStall_ + 1,
+                              (nStall_ < MAX_STALL_SKIPS && wp_ + 1 < nRoute_)
+                                  ? " - skipping it" : " - holding");
+                    sb[sizeof(sb) - 1] = '\0'; coop::logLine(sb);
+                    if (nStall_ < MAX_STALL_SKIPS && wp_ + 1 < nRoute_) ++wp_;
+                    ++nStall_;
+                    d = wpDist(sq[own]);
+                    bestD_ = d; stallMs_ = ctx.elapsedMs;
+                }
+                const RunWp& dest = route_[nRoute_ - 1];
+                bool lastWp = (wp_ + 1 == nRoute_);
+                float dd = destDist(sq[own]);
+                if (!(lastWp && d <= ARRIVE_R) && !arrived_) {
+                    // Order the next RECORDED point, ~2000 u away along ground a
+                    // human covered. Not the far destination: asking for one order
+                    // across 160 k u leaves the whole crossing to a single routing
+                    // decision, and this route exists precisely because that
+                    // decision is the thing that failed.
+                    //
+                    // The WHOLE owned tab, not just the leader: an unordered member
+                    // stays put, keeps its region attended, and ends the run with
+                    // the squad strung across the map for reasons that have nothing
+                    // to do with authority.
+                    for (unsigned int i = 0; i < n; ++i) {
+                        if ((int)tabRankOf(sq, n, i) != (ctx.isHost ? 0 : 1)) continue;
+                        Character* mc = engine::resolve(sq[i]);
+                        if (mc) engine::orderMoveTo(mc, route_[wp_].x, sq[i].y,
+                                                    route_[wp_].z);
+                    }
+                } else {
+                    if (!arrived_) {
+                        arrived_ = true;
+                        arriveMs_ = ctx.elapsedMs;
+                        char ab[192];
+                        _snprintf(ab, sizeof(ab) - 1,
+                                  "SCENARIO RUNAPART arrived side=%s atMs=%lu d=%.0f "
+                                  "travelled=%.0f maxStep=%.0f",
+                                  ctx.isHost ? "host" : "join", ctx.elapsedMs,
+                                  dd, travelled_, maxStep_);
+                        ab[sizeof(ab) - 1] = '\0'; coop::logLine(ab);
+                    }
+                    Character* oc = engine::resolve(sq[own]);
+                    bool legB = ((ctx.elapsedMs / 4000) % 2) != 0;
+                    if (oc) engine::orderMoveTo(oc, dest.x + (legB ? IDLE_LEG : 0.0f),
+                                                sq[own].y, dest.z);
+                }
+            }
+
+            if (ctx.isHost) {
+                if (h >= 0) logScenarioEntity("MEMBER", sq[h]);
+                if (j >= 0) { logScenarioEntity("RECV", sq[j]); ++recvCount_; }
+            } else {
+                if (j >= 0) logScenarioEntity("MEMBER", sq[j]);
+                if (h >= 0) { logScenarioEntity("RECV", sq[h]); ++recvCount_; }
+            }
+
+            // ---- the measurement row -----------------------------------------
+            // split_far2's row plus the two numbers this scenario exists to
+            // produce: how far our own tab has COME, and how far it still has to
+            // go. Without them a run that never moved and a run that finished
+            // look the same in the log.
+            if (h >= 0 && j >= 0) {
+                float dx = sq[j].x - sq[h].x, dz = sq[j].z - sq[h].z;
+                float sep = (float)sqrt((double)(dx * dx + dz * dz));
+                int hcx = 0, hcz = 0, jcx = 0, jcz = 0;
+                int hc = engine::cellAt(ctx.gw, sq[h].x, sq[h].z, &hcx, &hcz) ? 1 : 0;
+                int jc = engine::cellAt(ctx.gw, sq[j].x, sq[j].z, &jcx, &jcz) ? 1 : 0;
+                unsigned int popH = engine::countNpcsNear(ctx.gw, sq[h].x, sq[h].y,
+                                                          sq[h].z, PROBE_R);
+                unsigned int popJ = engine::countNpcsNear(ctx.gw, sq[j].x, sq[j].y,
+                                                          sq[j].z, PROBE_R);
+                int zH = engine::isZoneLoadedAt(ctx.gw, sq[h].x, sq[h].y, sq[h].z) ? 1 : 0;
+                int zJ = engine::isZoneLoadedAt(ctx.gw, sq[j].x, sq[j].y, sq[j].z) ? 1 : 0;
+                float mult = 0.0f; bool paused = false;
+                engine::readGameSpeed(ctx.gw, &mult, &paused);
+                char b[384];
+                _snprintf(b, sizeof(b) - 1,
+                          "SCENARIO RUNAPART side=%s phase=%s sep=%.0f "
+                          "hostCell=%d(%d,%d) joinCell=%d(%d,%d) "
+                          "popHost=%u popJoin=%u zHost=%d zJoin=%d arrived=%d "
+                          "wp=%u/%u togo=%.0f travelled=%.0f stalls=%u speed=%.1f",
+                          ctx.isHost ? "host" : "join", phaseName(ph), sep,
+                          hc, hcx, hcz, jc, jcx, jcz, popH, popJ, zH, zJ,
+                          arrived_ ? 1 : 0, wp_ + 1, nRoute_, d, travelled_,
+                          nStall_, mult);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+
+        if (ctx.elapsedMs >= dur) {
+            passed_ = haveAnchor_ && recvCount_ >= 1;
+            return true;
+        }
+        return false;
+    }
+
+private:
+    // One vote per SPEED_VOTE_MS, and always one at start (ms == 0).
+    void voteSpeed(const ScenarioContext& ctx, unsigned long ms) {
+        if (ms != 0 && (ms - speedMs_) < SPEED_VOTE_MS) return;
+        speedMs_ = ms;
+        engine::writeGameSpeed(ctx.gw, SPEED_MULT, false);
+    }
+    float wpDist(const EntityState& e) const {
+        float dx = e.x - route_[wp_].x, dz = e.z - route_[wp_].z;
+        return (float)sqrt((double)(dx * dx + dz * dz));
+    }
+    float destDist(const EntityState& e) const {
+        float dx = e.x - route_[nRoute_ - 1].x, dz = e.z - route_[nRoute_ - 1].z;
+        return (float)sqrt((double)(dx * dx + dz * dz));
+    }
+    // Start -> wp0 -> wp1 -> ... : what the squad has to cover, which is what
+    // 'travelled' is measured against.
+    float routeLength() const {
+        float total = 0.0f, px = sx_, pz = sz_;
+        for (unsigned int i = 0; i < nRoute_; ++i) {
+            float dx = route_[i].x - px, dz = route_[i].z - pz;
+            total += (float)sqrt((double)(dx * dx + dz * dz));
+            px = route_[i].x; pz = route_[i].z;
+        }
+        return total;
+    }
+    float straightLength() const {
+        float dx = route_[nRoute_ - 1].x - sx_, dz = route_[nRoute_ - 1].z - sz_;
+        return (float)sqrt((double)(dx * dx + dz * dz));
+    }
+    static unsigned int phaseOf(unsigned long ms) {
+        if (ms < WALK_MS) return 0;
+        unsigned int p = 1 + (unsigned int)((ms - WALK_MS) / PHASE_MS);
+        return (p > 4) ? 4 : p;
+    }
+    static const char* phaseName(unsigned int p) {
+        return (p == 0) ? "run"       : (p == 1) ? "own"
+             : (p == 2) ? "both_join" : (p == 3) ? "both_host" : "back";
+    }
+
+    // ~160 k u of route at the measured ~570 u/s is ~280 s; the human recording
+    // of these same two routes took 480 s while stopping to fight and look
+    // around. 420 s sits between them, and since the locomotion order runs in
+    // EVERY phase, a slow run finishes late rather than stranding the squad half
+    // way - it just does its camera phases while still walking.
+    static const unsigned long WALK_MS          = 420000;
+    static const unsigned long PHASE_MS         = 40000;
+    static const unsigned long JOIN_DURATION_MS = 580000; // run + 4 phases
+    static const unsigned long HOST_DURATION_MS = 590000; // outlive the join
+    static const unsigned long CAM_REFOCUS_MS   = 5000;
+    static const unsigned long SPEED_VOTE_MS    = 10000;
+    // 20 s without getting closer is a fight or a wall, not slow going: at the
+    // measured rate a clear run closes 400 u in under a second.
+    static const unsigned long STALL_MS         = 20000;
+    // Skipping is for getting past a fight, not for covering the route. Twenty
+    // skips is ~40 k u of the recorded path at most; beyond that the run is not
+    // running and should say so instead of shuffling to the end.
+    static const unsigned int  MAX_STALL_SKIPS   = 20;
+    static const unsigned int  MAX_SQUAD        = 32;
+    static const float SPEED_MULT;
+    static const float STALL_EPS;      // progress worth resetting the stall clock
+    static const float WAYPOINT_R;
+    static const float ARRIVE_R;
+    static const float IDLE_LEG;
+    static const float PROBE_R;
+
+    unsigned int  recvCount_;
+    bool          haveAnchor_;
+    unsigned long camMs_;
+    unsigned int  camPhase_;
+    bool          arrived_;
+    unsigned long arriveMs_;
+    unsigned long speedMs_;
+    const RunWp*  route_;
+    unsigned int  nRoute_;
+    unsigned int  wp_;             // index of the waypoint we are heading for
+    float         travelled_;      // summed path length, not displacement
+    float         maxStep_;        // biggest single-sample jump (a snap shows here)
+    float         lastX_, lastZ_;
+    bool          haveLast_;
+    float         bestD_;          // closest we have been to the current waypoint
+    unsigned long stallMs_;        // when we last got closer to it
+    unsigned int  nStall_;         // stalls seen (a fight count, in effect)
+    float         sx_, sy_, sz_;   // where our tab started (travel baseline)
+};
+const float RunApartScenario::SPEED_MULT = 5.0f;
+// 50 u of closing counts as progress. Below that is combat jostle, which should
+// not keep resetting the stall clock and hiding a squad that is going nowhere.
+const float RunApartScenario::STALL_EPS = 50.0f;
+// 400 u to call a waypoint reached. At ~570 u/s a sample can overshoot one by
+// several hundred units, so a tight radius would leave the squad circling back to
+// touch a point that was only ever a breadcrumb.
+const float RunApartScenario::WAYPOINT_R = 400.0f;
+// The LAST point is a real destination, so it gets a real radius: 150 u, loose
+// enough for a squad arriving strung out behind its leader.
+const float RunApartScenario::ARRIVE_R = 150.0f;
+const float RunApartScenario::IDLE_LEG = 15.0f;
+const float RunApartScenario::PROBE_R  = 1800.0f;
+
 } // namespace
 
 Scenario* makeMovementScenario(const std::string& name) {
     if (name == "split_far2")   return new SplitFar2Scenario();
+    if (name == "run_apart")    return new RunApartScenario();
     if (name == "leader_move")  return new LeaderMoveScenario();
     if (name == "fast_march")   return new FastMarchScenario();
     if (name == "coop_presence") return new CoopPresenceScenario();

@@ -1909,7 +1909,7 @@ void Replicator::syncSpeed(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId
         float eff = (speedMyReq_ >= 0.0f) ? speedMyReq_ : 1.0f;
         if (speedPeerReq_ >= 0.0f && speedPeerReq_ < eff) eff = speedPeerReq_;
         bool combat = speedMyCombat_ || speedPeerCombat_;
-        if (combat && eff > 1.0f) eff = 1.0f;
+        if (combat && speedCombatCap_ && eff > 1.0f) eff = 1.0f;
         bool changed = (speedLastSet_ < 0.0f || fabs(eff - speedLastSet_) > EPS);
         // userActed with an UNCHANGED effective = a denied raise (consensus
         // holdback): re-apply immediately so the host engine doesn't run fast

@@ -1487,3 +1487,163 @@ function Test-MintDistance {
                             medianDist = $median; minDist = $minD })
 }
 
+
+# run_apart gate: did the pair actually RUN the distance?
+#
+# Everything about whether the two clients stayed in sync while they did is
+# already judged by the advisory oracles attached to the scenario. What none of
+# them can tell you is whether the run happened at all - and that is the whole
+# reason this scenario exists, because split_far2's squads cover 600 u and look
+# stationary. A run that never left the start, or one that quietly dropped to 1x
+# and got a fifth of the way, must not read as a pass just because nothing
+# desynced over ground nobody crossed.
+#
+# So: both sides present, speed really applied, each tab covered its own leg, and
+# both arrived. Legs are asymmetric by design (~1200 u host, ~6400 u join), so
+# each side is measured against ITS OWN leg rather than a shared threshold.
+function Test-RunApart {
+    param([string]$HostFile, [string]$JoinFile,
+          [int]$MinSamples = 5,
+          # Floors, not fractions of the planned route: the scenario ABANDONS a
+          # waypoint it has stopped closing on (a fight), which legitimately cuts
+          # a corner, so "did it cover the ground" is the question and "did it
+          # follow the plan exactly" is not. Both routes are ~160 k of path for
+          # ~90-115 k of displacement, and each ends where a human took that
+          # squad, so 80 k of covered ground is a comfortable two thirds.
+          [double]$MinHostTravel = 80000.0, [double]$MinJoinTravel = 80000.0,
+          # The endpoints are 138,465 u apart. 100 k still means fifty times the
+          # census reach, and leaves room for a run that stalls short.
+          [double]$MinSep = 100000.0, [double]$MinSpeed = 2.0)
+
+    function Get-RARows([string]$File) {
+        $o = @{ start = $null; arrived = $null; rows = (New-Object System.Collections.ArrayList) }
+        if (-not (Test-Path $File)) { return $o }
+        $sp = "SCENARIO RUNAPART start side=(\w+) have=(\d) sep=([\d\.]+) " +
+              "from=(-?[\d\.]+),(-?[\d\.]+),(-?[\d\.]+) " +
+              "dest=(-?[\d\.]+),(-?[\d\.]+) cell=(\d)\((-?\d+),(-?\d+)\) " +
+              "wps=(\d+) leg=([\d\.]+) straight=([\d\.]+) speed=([\d\.]+)"
+        $m = Select-String -Path $File -Pattern $sp -ErrorAction SilentlyContinue |
+             Select-Object -First 1
+        if ($m) {
+            $g = $m.Matches[0].Groups
+            $o.start = @{ side = $g[1].Value; have = [int]$g[2].Value
+                          wps = [int]$g[12].Value
+                          leg = [double]$g[13].Value
+                          straight = [double]$g[14].Value
+                          cell = "$($g[10].Value),$($g[11].Value)" }
+        }
+        $ap = "SCENARIO RUNAPART arrived side=(\w+) atMs=(\d+) d=([\d\.]+) travelled=([\d\.]+)"
+        $m = Select-String -Path $File -Pattern $ap -ErrorAction SilentlyContinue |
+             Select-Object -First 1
+        if ($m) {
+            $g = $m.Matches[0].Groups
+            $o.arrived = @{ atMs = [long]$g[2].Value; d = [double]$g[3].Value
+                            travelled = [double]$g[4].Value }
+        }
+        # togo/travelled can be -1 when the tab leader was momentarily
+        # unresolvable, so the pattern allows the sign and the reader drops them.
+        $rp = "SCENARIO RUNAPART side=(\w+) phase=(\w+) sep=([\d\.]+) .*" +
+              "wp=(\d+)/(\d+) togo=(-?[\d\.]+) travelled=(-?[\d\.]+) " +
+              "stalls=(\d+) speed=([\d\.]+)"
+        foreach ($m in (Select-String -Path $File -Pattern $rp -ErrorAction SilentlyContinue)) {
+            $g = $m.Matches[0].Groups
+            [void]$o.rows.Add(@{ side = $g[1].Value; phase = $g[2].Value
+                                 sep = [double]$g[3].Value
+                                 wp = [int]$g[4].Value; wps = [int]$g[5].Value
+                                 togo = [double]$g[6].Value
+                                 travelled = [double]$g[7].Value
+                                 stalls = [int]$g[8].Value
+                                 speed = [double]$g[9].Value })
+        }
+        return $o
+    }
+
+    $h = Get-RARows -File $HostFile
+    $j = Get-RARows -File $JoinFile
+    if (-not $h.start -or -not $j.start) {
+        return (Add-GateResult -Name "run_apart" -Status SKIP `
+            -Detail "no RUNAPART start row on one or both sides (scenario did not arm)")
+    }
+    if ($h.start.have -ne 1 -or $j.start.have -ne 1) {
+        return (Add-GateResult -Name "run_apart" -Status SKIP `
+            -Detail "the save has no rank-0/rank-1 tab pair to send in two directions")
+    }
+    if ($h.rows.Count -lt $MinSamples -or $j.rows.Count -lt $MinSamples) {
+        return (Add-GateResult -Name "run_apart" -Status SKIP `
+            -Detail "too few samples (host=$($h.rows.Count) join=$($j.rows.Count) < $MinSamples)")
+    }
+
+    # Max of one key across a list of HASHTABLES. Not Measure-Object: it reads
+    # .PSObject properties, and a hashtable's keys are not those, so it throws
+    # "the property cannot be found in the input for any objects" on rows that
+    # plainly have the key - which is how the first run of this gate ended,
+    # after a 650 s scenario that had otherwise succeeded.
+    function Get-MaxOf([object[]]$rows, [string]$key) {
+        $best = $null
+        foreach ($r in $rows) {
+            $v = $r[$key]
+            if ($null -eq $v) { continue }
+            if ($null -eq $best -or $v -gt $best) { $best = $v }
+        }
+        if ($null -eq $best) { return 0 }
+        return $best
+    }
+
+    # Each side's OWN progress comes from its own rows: 'side=host' rows in the
+    # host log are the host describing its own tab.
+    function Get-Own([hashtable]$o, [string]$side) {
+        $mine = @($o.rows | Where-Object { $_.side -eq $side -and $_.travelled -ge 0 })
+        if ($mine.Count -eq 0) { return @{ travelled = 0.0; togo = -1.0; wp = 0; wps = 0 } }
+        return @{ travelled = [double](Get-MaxOf -rows $mine -key "travelled")
+                  togo = [double]$mine[-1].togo
+                  wp = [int](Get-MaxOf -rows $mine -key "wp")
+                  wps = [int]$mine[-1].wps }
+    }
+    $ho = Get-Own -o $h -side "host"
+    $jo = Get-Own -o $j -side "join"
+    $maxSpeed = 0.0
+    foreach ($r in @($h.rows) + @($j.rows)) { if ($r.speed -gt $maxSpeed) { $maxSpeed = $r.speed } }
+
+    $metrics = @{
+        hostLeg = [math]::Round($h.start.leg, 0); joinLeg = [math]::Round($j.start.leg, 0)
+        hostTravelled = [math]::Round($ho.travelled, 0)
+        joinTravelled = [math]::Round($jo.travelled, 0)
+        hostToGo = [math]::Round($ho.togo, 0); joinToGo = [math]::Round($jo.togo, 0)
+        hostStalls = [int](Get-MaxOf -rows @($h.rows) -key "stalls")
+        joinStalls = [int](Get-MaxOf -rows @($j.rows) -key "stalls")
+        hostArriveMs = if ($h.arrived) { $h.arrived.atMs } else { -1 }
+        joinArriveMs = if ($j.arrived) { $j.arrived.atMs } else { -1 }
+        maxSpeed = $maxSpeed
+        hostSamples = $h.rows.Count; joinSamples = $j.rows.Count
+        hostWp = "$($ho.wp)/$($ho.wps)"; joinWp = "$($jo.wp)/$($jo.wps)"
+        # What this scenario exists for: how far apart they ended up.
+        maxSep = [math]::Round((Get-MaxOf -rows (@($h.rows) + @($j.rows)) -key "sep"), 0)
+    }
+
+    $why = ""
+    if ($maxSpeed -lt $MinSpeed) {
+        $why = "the speed vote never took - peak speed $maxSpeed x (< $MinSpeed x), " +
+               "so the legs were never affordable"
+    } elseif ($ho.travelled -lt $MinHostTravel -or $jo.travelled -lt $MinJoinTravel) {
+        $why = "a tab did not cover the ground - host $($metrics.hostTravelled) u " +
+               "(need $MinHostTravel), join $($metrics.joinTravelled) u " +
+               "(need $MinJoinTravel); stalls host=$($metrics.hostStalls) " +
+               "join=$($metrics.joinStalls), so check whether a fight stopped one"
+    } elseif ($metrics.maxSep -lt $MinSep) {
+        $why = "they never got far apart - peak separation $($metrics.maxSep) u " +
+               "(need $MinSep), which is the whole point of the run"
+    } elseif (-not $h.arrived -or -not $j.arrived) {
+        $why = "a tab never reached its last waypoint (host $($metrics.hostWp) " +
+               "togo=$($metrics.hostToGo) u, join $($metrics.joinWp) " +
+               "togo=$($metrics.joinToGo) u)"
+    }
+    $v = if ($why) { "FAIL" } else { "PASS" }
+    if (-not $why) {
+        $why = "both tabs ran their own route at ${maxSpeed}x and arrived - " +
+               "host $($metrics.hostTravelled) u by $($metrics.hostArriveMs) ms, " +
+               "join $($metrics.joinTravelled) u by $($metrics.joinArriveMs) ms, " +
+               "ending $($metrics.maxSep) u apart"
+    }
+    Write-Host "  RUN-APART $v - $why"
+    return (Add-GateResult -Name "run_apart" -Status $v -Metrics $metrics -Detail $why)
+}
