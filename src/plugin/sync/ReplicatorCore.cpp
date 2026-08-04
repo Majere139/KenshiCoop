@@ -55,7 +55,7 @@ Replicator::Replicator()
       censusParkDist_(0.0f), censusParks_(0), censusFreezeAi_(true),
       attentionRadius_(0.0f),
       attnFlips_(0), attnWinMs_(0), attnBaseSupp_(0), attnBaseCull_(0),
-      attnBaseProxy_(0), attnVetoMs_(0), attnVetoRawN_(0), attnVetoOutN_(0),
+      attnBaseProxy_(0), attnVetoMs_(0), attnVetoRawN_(0), attnVetoMask_(0),
       auditRows_(false), jailProbe_(false), jailObserve_(false),
       speedLastApplied_(-1.0f), speedMyReq_(-1.0f), speedPeerReq_(-1.0f),
       speedCombatCap_(true),
@@ -215,7 +215,7 @@ void Replicator::resetSession() {
     // The zone verdict describes the OLD world's streaming state.
     attnVetoMs_ = 0;
     attnVetoRawN_ = 0;
-    attnVetoOutN_ = 0;
+    attnVetoMask_ = 0;
     furnPeerPend_.clear();
     ownFurnExit_.clear();
     // Session maps + change-gate baselines (they describe the OLD world; the

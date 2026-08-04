@@ -1097,11 +1097,21 @@ private:
     // Cached zone-loaded verdict for the anchor set (Phase C veto). The query
     // takes an engine lock the zone-loader thread writes, so the authority pass
     // reuses a verdict for ATTN_VETO_MS unless an anchor jumped.
+    //
+    // What is cached is the VERDICT - which anchor indices passed - and never
+    // their positions. Caching the surviving positions is what this used to do,
+    // and it meant attention was judged against where the players were up to
+    // 500 ms ago: at run_apart's ~570 u/s that is ~285 u of error, and 40 u of
+    // it was enough to read a body 991 u from a player character as 1031 u from
+    // the anchor set and leave it dormant beside its own squad (run
+    // 20260804_125739: toPc=991 toAttn=1031 toRaw=991 with anchors=3/3, i.e.
+    // nothing vetoed - purely stale coordinates). A verdict is what actually
+    // ages slowly, since zones are 4608 u across and the jump check bounds how
+    // far an anchor can drift before we ask again.
     unsigned long             attnVetoMs_;     // last query stamp (0 = never)
     float                     attnVetoRaw_[12];// anchors the verdict was for
     unsigned int              attnVetoRawN_;
-    float                     attnVetoOut_[12];// the surviving anchors
-    unsigned int              attnVetoOutN_;
+    unsigned int              attnVetoMask_;   // bit a = raw anchor a survived
     bool                      auditRows_;     // travel_parity worldstate rows
     bool                      jailProbe_;     // KENSHICOOP_JAIL_PROBE [jail] STATE
     bool                      jailObserve_;   // KENSHICOOP_JAIL_OBSERVE [jail] OBSERVE

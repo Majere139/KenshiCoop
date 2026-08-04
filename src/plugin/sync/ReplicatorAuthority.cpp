@@ -591,6 +591,7 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
         if (attentionRadius_ > 0.0f)
             nPc = engine::captureSquad(gw, /*leaderOnly*/ false, pcStates, MAX_PC);
         unsigned int cDormPc = 0;
+        unsigned int dormPcRows = 0;   // offender dumps this sample (see below)
         static int dumpGhost = -1;
         if (dumpGhost < 0) {
             const char* e = getenv("KENSHICOOP_DEBUG_CENSUS");
@@ -640,11 +641,78 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
                                        sts[i].x, sts[i].y, sts[i].z)) {
                     cls = "dorm"; ++cDorm;
                     for (unsigned int p = 0; p < nPc; ++p) {
-                        if (dist3(sts[i].x, sts[i].y, sts[i].z, pcStates[p].x,
-                                  pcStates[p].y, pcStates[p].z)
-                                <= attentionRadius_) {
-                            ++cDormPc; break;
+                        float dPc = dist3(sts[i].x, sts[i].y, sts[i].z,
+                                          pcStates[p].x, pcStates[p].y,
+                                          pcStates[p].z);
+                        if (dPc > attentionRadius_) continue;
+                        ++cDormPc;
+                        // A count alone cannot be acted on, because the two ways
+                        // to get here need opposite fixes. Either an anchor that
+                        // WOULD have covered this body was vetoed (the body is
+                        // within reach of a raw anchor but not a surviving one),
+                        // or the player character it stands next to is not an
+                        // anchor at all - a squad member strung out behind its
+                        // tab leader, which is the gap the design notes call out
+                        // as uncovered by construction. Measuring the body
+                        // against both anchor sets says which, without needing a
+                        // theory: raw <= attnR while attn > attnR is the veto,
+                        // both > attnR is the straggler. run_apart 20260804
+                        // reported dormPc=16 with no way to tell them apart.
+                        if (dormPcRows < 3) {
+                            ++dormPcRows;
+                            float dAttn = -1.0f, dRaw = -1.0f;
+                            for (unsigned int a = 0; a < nAttnAnch; ++a) {
+                                float d = dist3(sts[i].x, sts[i].y, sts[i].z,
+                                                attnAnch[a * 3 + 0],
+                                                attnAnch[a * 3 + 1],
+                                                attnAnch[a * 3 + 2]);
+                                if (dAttn < 0.0f || d < dAttn) dAttn = d;
+                            }
+                            for (unsigned int a = 0; a < nRawAnch; ++a) {
+                                float d = dist3(sts[i].x, sts[i].y, sts[i].z,
+                                                rawAnch[a * 3 + 0],
+                                                rawAnch[a * 3 + 1],
+                                                rawAnch[a * 3 + 2]);
+                                if (dRaw < 0.0f || d < dRaw) dRaw = d;
+                            }
+                            // Is the PC in question one of the anchors? A leader
+                            // sits ON its anchor, so ~0 means this body's
+                            // neighbour anchors attention and something else is
+                            // wrong; a large value means it anchors nothing.
+                            float dPcAnchor = -1.0f;
+                            for (unsigned int a = 0; a < nRawAnch; ++a) {
+                                float d = dist3(pcStates[p].x, pcStates[p].y,
+                                                pcStates[p].z,
+                                                rawAnch[a * 3 + 0],
+                                                rawAnch[a * 3 + 1],
+                                                rawAnch[a * 3 + 2]);
+                                if (dPcAnchor < 0.0f || d < dPcAnchor) dPcAnchor = d;
+                            }
+                            // Three causes, told apart by the two distances and
+                            // the anchor counts. Same count but a body inside
+                            // toRaw and outside toAttn is the cache replaying
+                            // stale POSITIONS (the run_apart finding); a smaller
+                            // count with the body inside toRaw means the veto
+                            // dropped an anchor that covered it; anything else is
+                            // a player character that anchors nothing.
+                            bool inRaw  = dRaw  >= 0.0f && dRaw  <= attentionRadius_;
+                            bool inAttn = dAttn >= 0.0f && dAttn <= attentionRadius_;
+                            const char* cause =
+                                (inRaw && !inAttn && nAttnAnch == nRawAnch)
+                                    ? "stale anchor positions"
+                                : (inRaw && nAttnAnch < nRawAnch)
+                                    ? "anchor vetoed"
+                                    : "pc anchors nothing";
+                            char b[288]; _snprintf(b, sizeof(b) - 1,
+                                "[audit] dormPc hand=%u,%u toPc=%.0f toAttn=%.0f "
+                                "toRaw=%.0f pcToAnchor=%.0f attnR=%.0f "
+                                "anchors=%u/%u cause=%s",
+                                sts[i].hIndex, sts[i].hSerial, dPc, dAttn, dRaw,
+                                dPcAnchor, attentionRadius_, nAttnAnch, nRawAnch,
+                                cause);
+                            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
                         }
+                        break;
                     }
                 } else {
                     cls = "ghost"; ++cGhost;
@@ -799,6 +867,12 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
 // multi-second scale, so a cached verdict costs nothing and a permanently
 // wedged main thread costs the session. Re-query on the interval, or at once if
 // an anchor jumped (a camera cut or teleport can cross a zone edge instantly).
+//
+// The cache holds the VERDICT ONLY. It used to hold the surviving anchors'
+// coordinates too, which quietly turned a zone-loading throttle into a 500 ms
+// delay on where the players are - harmless while everything measured stood
+// still, and 285 u of error once run_apart ran at 570 u/s. attnVetoMask_ carries
+// the full account.
 unsigned int Replicator::attentionAnchors(GameWorld* gw, const float* raw,
                                           unsigned int nRaw, float* out) {
     if (!raw || !out) return 0;
@@ -811,32 +885,60 @@ unsigned int Replicator::attentionAnchors(GameWorld* gw, const float* raw,
         if (dist3(raw[a * 3 + 0], raw[a * 3 + 1], raw[a * 3 + 2],
                   attnVetoRaw_[a * 3 + 0], attnVetoRaw_[a * 3 + 1],
                   attnVetoRaw_[a * 3 + 2]) > ATTN_VETO_JUMP) reuse = false;
+    // Re-query the zones, or reuse the verdict - but ALWAYS emit the anchors'
+    // current positions. Replaying cached positions is what made a body beside
+    // its own squad dormant (see attnVetoMask_).
+    unsigned int keepMask;
     if (reuse) {
-        for (unsigned int i = 0; i < attnVetoOutN_ * 3; ++i) out[i] = attnVetoOut_[i];
-        return attnVetoOutN_;
+        keepMask = attnVetoMask_;
+    } else {
+        keepMask = 0;
+        for (unsigned int a = 0; a < nRaw && a < 8; ++a) {
+            const float* p = raw + a * 3;
+            if (attentionRadius_ > 0.0f &&
+                !engine::isZoneLoadedAt(gw, p[0], p[1], p[2])) continue;
+            keepMask |= (1u << a);
+        }
+        attnVetoMs_   = nowV;
+        attnVetoRawN_ = nRaw;
+        attnVetoMask_ = keepMask;
+        for (unsigned int i = 0; i < nRaw * 3 && i < 12; ++i) attnVetoRaw_[i] = raw[i];
     }
     unsigned int nOut = 0;
+    unsigned int vetoMask = 0;   // which raw indices were dropped
     for (unsigned int a = 0; a < nRaw && nOut < 4; ++a) {
+        if (a < 8 && !(keepMask & (1u << a))) { vetoMask |= (1u << a); continue; }
         const float* p = raw + a * 3;
-        if (attentionRadius_ > 0.0f && !engine::isZoneLoadedAt(gw, p[0], p[1], p[2]))
-            continue;
         out[nOut * 3 + 0] = p[0];
         out[nOut * 3 + 1] = p[1];
         out[nOut * 3 + 2] = p[2];
         ++nOut;
     }
-    attnVetoMs_   = nowV;
-    attnVetoRawN_ = nRaw;
-    for (unsigned int i = 0; i < nRaw * 3 && i < 12; ++i) attnVetoRaw_[i] = raw[i];
-    attnVetoOutN_ = nOut;
-    for (unsigned int i = 0; i < nOut * 3; ++i) attnVetoOut_[i] = out[i];
-    if (nOut < nRaw) {
+    if (nOut < nRaw && !reuse) {
         static unsigned long vetoLogMs = 0; // main-thread only
         if (vetoLogMs == 0 || (nowV - vetoLogMs) >= 10000) {
             vetoLogMs = nowV;
-            char b[112]; _snprintf(b, sizeof(b) - 1,
-                "[attn] anchor veto %u/%u (zone not loaded here)",
-                nRaw - nOut, nRaw);
+            // WHICH anchor, and where. interestCenters fills tab leaders first
+            // and cameras after, so index 0-1 are leaders in this 2-player scope
+            // - and the difference matters completely. Dropping the PEER's tab
+            // leader is the veto working: on run_apart the join holds a driven
+            // copy of the host's leader 138,000 u away, in ground it has never
+            // loaded and cannot speak for. Dropping OUR OWN leader would mean
+            // the gate stopped reconciling a player's own surroundings, which is
+            // the failure dormPc exists to catch. The old line counted vetoes
+            // without saying which, so the two were indistinguishable.
+            char idx[72]; unsigned int w = 0;
+            for (unsigned int a = 0; a < nRaw && a < 8 && w + 16 < sizeof(idx); ++a) {
+                if (!(vetoMask & (1u << a))) continue;
+                int k = _snprintf(idx + w, sizeof(idx) - w - 1, "%s%u%s",
+                                  w ? "," : "", a, a < 2 ? "(leader)" : "(cam)");
+                if (k <= 0) break;
+                w += (unsigned int)k;
+            }
+            idx[w] = '\0';
+            char b[192]; _snprintf(b, sizeof(b) - 1,
+                "[attn] anchor veto %u/%u (zone not loaded here) dropped=%s",
+                nRaw - nOut, nRaw, idx[0] ? idx : "?");
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
     }
