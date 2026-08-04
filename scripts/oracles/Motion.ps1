@@ -832,6 +832,251 @@ function Test-SplitFar {
     return (Add-GateResult -Name "split_far" -Status $v -Metrics $metrics -Detail $why)
 }
 
+# split_far2 gate: presence authority. Reads three things, and the order they
+# are checked in is the order they can invalidate each other:
+#
+#   0. PRECONDITION. The two tabs must be in DIFFERENT cells and claims must
+#      actually be flowing. Same cell, or no [cell] lines at all (the flag was
+#      off, or nothing claimed), and there is no authority to move - SKIP, not
+#      pass. A gate that greens on a run which never exercised the mechanism is
+#      worse than no gate (pitfalls S7).
+#
+#   1. AGREEMENT. Both clients dump their resolved map as
+#        [cell] MAP cells=N slots=M X,Y=owner ...
+#      and for every cell BOTH have an entry for, the owner must match. This is
+#      the property the whole design rests on: two owners for one cell means two
+#      clients authoring the same bodies, and nobody owning it means neither
+#      does. Disagreement is a hard FAIL regardless of how the populations look.
+#
+#   2. PRESENCE. The join's own cell must resolve to the JOIN (a non-zero owner)
+#      on both sides. Host id is 0 and unclaimed cells fall back to host, so
+#      "the host owns the host's cell" is true by default and proves nothing;
+#      the join owning the join's cell is the entire claim, and it is only true
+#      if a claim was published, delivered and applied.
+#
+#   3. THE OWNER KEEPS ITS WORLD. The reported symptom is a population being
+#      DESTROYED: "NPCs disappear as I get close and get replaced by the
+#      host's". Its measurable form is the owner's own count of its own town
+#      across the moment the peer's camera arrives - it must not be cut down
+#      toward the peer's view. Both towns are checked, so the assertion is
+#      symmetric rather than a statement about the join.
+#
+#      [attn] attach is REPORTED here rather than gated, and the reason is
+#      worth stating because gating it was the first draft. A camera entering a
+#      cold zone makes the LOCAL engine stream it and generate its own ambient
+#      bodies; the cell's author never authored those, so culling them is the
+#      convergence working, and it happens on the WATCHER, in a cell it does
+#      not own. Counting those culls measures how differently two Kenshi
+#      instances populate a zone - the content-parity problem this plan
+#      explicitly does not solve - and a gate on it would fail for a cause the
+#      code under test cannot affect. The culls that WOULD be a defect, an
+#      author culling in its own cell, cannot occur: enforcement skips every
+#      body in a cell we author.
+function Test-SplitFar2 {
+    param([string]$HostFile, [string]$JoinFile,
+          [int]$MinSamples = 5, [double]$MaxOwnerDrop = 0.25)
+
+    function Get-SF2Rows([string]$File) {
+        $rows = New-Object System.Collections.ArrayList
+        if (-not (Test-Path $File)) { return $rows }
+        $off = Get-LogClockOffsetMs -File $File
+        $pat = "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO SPLITFAR2 side=(\w+) " +
+               "phase=(\w+) sep=([\d\.]+) hostCell=(\d)\((-?\d+),(-?\d+)\) " +
+               "joinCell=(\d)\((-?\d+),(-?\d+)\) popHost=(\d+) popJoin=(\d+) " +
+               "zHost=(\d+) zJoin=(\d+) arrived=(\d+)"
+        foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
+            $g = $m.Matches[0].Groups
+            [void]$rows.Add(@{
+                t = (Convert-StampToMs -Groups $g -OffsetMs $off)
+                side = $g[5].Value; phase = $g[6].Value; sep = [double]$g[7].Value
+                hostCellOk = [int]$g[8].Value
+                hostCell = "$($g[9].Value),$($g[10].Value)"
+                joinCellOk = [int]$g[11].Value
+                joinCell = "$($g[12].Value),$($g[13].Value)"
+                popHost = [int]$g[14].Value; popJoin = [int]$g[15].Value
+                zHost = [int]$g[16].Value; zJoin = [int]$g[17].Value
+                arrived = [int]$g[18].Value })
+        }
+        return $rows
+    }
+    # The resolved cell->owner map as of $BeforeMs. Latest wins within the
+    # window: claims are latest-sequence-wins and re-asserted, so the last dump
+    # inside the run is the settled answer.
+    #
+    # The cutoff is not cosmetic. A session teardown clears every claim and the
+    # surviving client immediately re-claims its own cell, so the very last
+    # dumps in a log describe a world with one player in it - reading those made
+    # the first version of this gate report "the host never learned the join's
+    # cell" on a run whose logs show it learning it 200 s earlier and holding it.
+    function Get-CellMap([string]$File, [double]$BeforeMs) {
+        $map = @{}
+        $n = 0
+        if (-not (Test-Path $File)) { return @{ map = $map; dumps = 0 } }
+        $off = Get-LogClockOffsetMs -File $File
+        $pat = "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[cell\] MAP cells=(\d+) slots=(\d+)(.*)$"
+        foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
+            $g = $m.Matches[0].Groups
+            if ((Convert-StampToMs -Groups $g -OffsetMs $off) -gt $BeforeMs) { continue }
+            $n++
+            $cur = @{}
+            foreach ($p in ([regex]::Matches($g[7].Value, "(-?\d+),(-?\d+)=(\d+)"))) {
+                $cur["$($p.Groups[1].Value),$($p.Groups[2].Value)"] = [int]$p.Groups[3].Value
+            }
+            $map = $cur
+        }
+        return @{ map = $map; dumps = $n }
+    }
+    function Get-AttachEvents([string]$File) {
+        $ev = New-Object System.Collections.ArrayList
+        if (-not (Test-Path $File)) { return $ev }
+        $off = Get-LogClockOffsetMs -File $File
+        $pat = "\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*\[attn\] attach bodies=(\d+) " +
+               "hid=\+(\d+) culled=\+(\d+) minted=([+-]?\d+)"
+        foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
+            $g = $m.Matches[0].Groups
+            [void]$ev.Add(@{ t = (Convert-StampToMs -Groups $g -OffsetMs $off)
+                             bodies = [int]$g[5].Value; hid = [int]$g[6].Value
+                             culled = [int]$g[7].Value; minted = [int]$g[8].Value })
+        }
+        return $ev
+    }
+    function Get-Med($values) {
+        $s = @($values | Sort-Object)
+        if ($s.Count -eq 0) { return 0.0 }
+        return [double]$s[[int]([Math]::Floor($s.Count / 2))]
+    }
+
+    $jrows = @(Get-SF2Rows -File $JoinFile)
+    $hrows = @(Get-SF2Rows -File $HostFile)
+    if ($jrows.Count -lt $MinSamples -or $hrows.Count -lt $MinSamples) {
+        Write-Host "  SPLIT-FAR2 SKIP - join=$($jrows.Count) host=$($hrows.Count) SPLITFAR2 rows (< $MinSamples)"
+        return (Add-GateResult -Name "split_far2" -Status SKIP `
+                    -Metrics @{ joinRows = $jrows.Count; hostRows = $hrows.Count } `
+                    -Detail "scenario produced too few rows")
+    }
+
+    # ---- 0. precondition --------------------------------------------------
+    $last = $jrows[$jrows.Count - 1]
+    $hostCell = $last.hostCell; $joinCell = $last.joinCell
+    $sepMed = [Math]::Round((Get-Med @($jrows | ForEach-Object { $_.sep })), 0)
+    if ($last.hostCellOk -ne 1 -or $last.joinCellOk -ne 1) {
+        Write-Host "  SPLIT-FAR2 SKIP - cellAt() did not resolve (hostOk=$($last.hostCellOk) joinOk=$($last.joinCellOk)); the sector mapping is unavailable"
+        return (Add-GateResult -Name "split_far2" -Status SKIP -Detail "cellAt unavailable")
+    }
+    if ($hostCell -eq $joinCell) {
+        Write-Host "  SPLIT-FAR2 SKIP - both tabs in cell ($hostCell) at sep=$sepMed; authority cannot move within one cell"
+        return (Add-GateResult -Name "split_far2" -Status SKIP `
+                    -Metrics @{ sep = $sepMed; cell = $hostCell } `
+                    -Detail "squads share a cell")
+    }
+    # Read both maps as of the last measured sample, not the end of the log.
+    $endMs = $last.t
+    $jm = Get-CellMap -File $JoinFile -BeforeMs $endMs
+    $hm = Get-CellMap -File $HostFile -BeforeMs $endMs
+    if ($jm.dumps -eq 0 -and $hm.dumps -eq 0) {
+        Write-Host "  SPLIT-FAR2 SKIP - no [cell] MAP dumps in either log (KENSHICOOP_CELL_AUTH off?)"
+        return (Add-GateResult -Name "split_far2" -Status SKIP `
+                    -Metrics @{ sep = $sepMed; hostCell = $hostCell; joinCell = $joinCell } `
+                    -Detail "cell authority disabled")
+    }
+
+    # ---- 1. agreement ------------------------------------------------------
+    $disagree = New-Object System.Collections.ArrayList
+    foreach ($k in $jm.map.Keys) {
+        if ($hm.map.ContainsKey($k) -and $hm.map[$k] -ne $jm.map[$k]) {
+            [void]$disagree.Add("$k join=$($jm.map[$k]) host=$($hm.map[$k])")
+        }
+    }
+
+    # ---- 2. presence -------------------------------------------------------
+    # Absent from a map = unclaimed = host by fail-open, which for the join's
+    # own cell is exactly the failure this checks for.
+    $jSaysJoin = if ($jm.map.ContainsKey($joinCell)) { $jm.map[$joinCell] } else { 0 }
+    $hSaysJoin = if ($hm.map.ContainsKey($joinCell)) { $hm.map[$joinCell] } else { 0 }
+    $presenceOk = ($jSaysJoin -ne 0) -and ($hSaysJoin -ne 0)
+
+    # ---- attach, observed ---------------------------------------------------
+    # Windows come from the JOIN's rows (both sides share the armed clock) and
+    # each is trimmed to the phase as logged rather than to a nominal length,
+    # so a slow arm shifts the window with the run.
+    $attachCull = 0; $attachHid = 0; $attachEvents = 0
+    foreach ($p in @("both_join", "both_host")) {
+        $pr = @($jrows | Where-Object { $_.phase -eq $p })
+        if ($pr.Count -eq 0) { continue }
+        $ts = @(@($pr | ForEach-Object { $_.t }) | Sort-Object)
+        $t0 = $ts[0]; $t1 = $ts[$ts.Count - 1]
+        foreach ($f in @($HostFile, $JoinFile)) {
+            foreach ($e in (Get-AttachEvents -File $f)) {
+                if ($e.t -ge $t0 -and $e.t -le $t1) {
+                    $attachCull += $e.culled; $attachHid += $e.hid; $attachEvents++
+                }
+            }
+        }
+    }
+
+    # ---- per-phase populations, and gate 3 over them ------------------------
+    # Each town read on BOTH sides. The owner's own column is the one that is
+    # judged; the peer's is printed beside it so the read is legible.
+    $PhaseSkipMs = 12000
+    $ownerHost = @{}   # phase -> host's count of the HOST town (host owns it)
+    $ownerJoin = @{}   # phase -> join's count of the JOIN town (join owns it)
+    $table = New-Object System.Collections.ArrayList
+    $metrics = @{ sep = $sepMed; hostCell = $hostCell; joinCell = $joinCell
+                  joinCellOwnerJoin = $jSaysJoin; joinCellOwnerHost = $hSaysJoin
+                  disagreements = $disagree.Count
+                  attachCulled = $attachCull; attachHid = $attachHid
+                  joinRows = $jrows.Count; hostRows = $hrows.Count }
+    foreach ($p in @("walk", "own", "both_join", "both_host", "back")) {
+        $jp = @($jrows | Where-Object { $_.phase -eq $p })
+        $hp = @($hrows | Where-Object { $_.phase -eq $p })
+        if ($jp.Count -eq 0 -or $hp.Count -eq 0) { continue }
+        $t0 = @(@($jp | ForEach-Object { $_.t }) | Sort-Object)[0]
+        $jp = @($jp | Where-Object { $_.t -ge ($t0 + $PhaseSkipMs) })
+        $hp = @($hp | Where-Object { $_.t -ge ($t0 + $PhaseSkipMs) })
+        if ($jp.Count -eq 0 -or $hp.Count -eq 0) { continue }
+        $jH = Get-Med @($jp | ForEach-Object { $_.popHost })
+        $hH = Get-Med @($hp | ForEach-Object { $_.popHost })
+        $jJ = Get-Med @($jp | ForEach-Object { $_.popJoin })
+        $hJ = Get-Med @($hp | ForEach-Object { $_.popJoin })
+        [void]$table.Add(("    phase={0,-10} host town: join={1,-4} host={2,-4}* | join town: join={3,-4}* host={4,-4} (n={5}/{6})" -f `
+                    $p, $jH, $hH, $jJ, $hJ, $jp.Count, $hp.Count))
+        $metrics["${p}_hostTown_join"] = $jH; $metrics["${p}_hostTown_host"] = $hH
+        $metrics["${p}_joinTown_join"] = $jJ; $metrics["${p}_joinTown_host"] = $hJ
+        $ownerHost[$p] = $hH; $ownerJoin[$p] = $jJ
+    }
+
+    # ---- 3. the owner keeps its world --------------------------------------
+    # Baseline is 'own': both cameras on their own squad, disjoint attention,
+    # nobody looking at anybody else's region. Then the peer looks. The owner's
+    # count may RISE (its zone finishes streaming, ambient spawns) - what it
+    # must not do is fall toward the peer's, which is the reported symptom.
+    $drops = New-Object System.Collections.ArrayList
+    foreach ($t in @(@{ n = "host town"; s = $ownerHost }, @{ n = "join town"; s = $ownerJoin })) {
+        if (-not $t.s.ContainsKey("own")) { continue }
+        $base = [double]$t.s["own"]
+        if ($base -le 0) { continue }
+        $floor = [Math]::Max($base * (1.0 - $MaxOwnerDrop), $base - 2.0)
+        foreach ($p in @("both_join", "both_host", "back")) {
+            if (-not $t.s.ContainsKey($p)) { continue }
+            if ([double]$t.s[$p] -lt $floor) {
+                [void]$drops.Add("$($t.n) owner $base -> $($t.s[$p]) in $p")
+            }
+        }
+    }
+    $ownerOk = ($drops.Count -eq 0)
+
+    $ok = ($disagree.Count -eq 0) -and $presenceOk -and $ownerOk
+    $v = if ($ok) { "PASS" } else { "FAIL" }
+    $why = if ($disagree.Count -gt 0) { "clients disagree on cell ownership: $($disagree -join '; ')" }
+           elseif (-not $presenceOk) { "join's cell ($joinCell) resolves to owner join=$jSaysJoin host=$hSaysJoin - authority did not follow presence" }
+           elseif (-not $ownerOk) { "an owner's population was cut down when the peer looked: $($drops -join '; ')" }
+           else { "each client authors its own cell, both agree, and neither loses its population when the peer looks" }
+    Write-Host "  SPLIT-FAR2 $v - sep=$sepMed, hostCell=($hostCell) joinCell=($joinCell); joinCell owner: join says $jSaysJoin, host says $hSaysJoin; maps join=$($jm.map.Count)/host=$($hm.map.Count) cells, $($disagree.Count) disagreement(s); overlap-phase attach hid=$attachHid culled=$attachCull over $attachEvents event(s), reported not gated - $why"
+    Write-Host "    (* = the cell's owner, the column gate 3 judges)"
+    foreach ($line in $table) { Write-Host $line }
+    return (Add-GateResult -Name "split_far2" -Status $v -Metrics $metrics -Detail $why)
+}
+
 # world_parity gate: full-roster tiered cross-comparison on a dense save.
 # Both sides dump SCENARIO WNPC rows every 5 s (with task=/pelvis=/mv= parity
 # fields and cls=pc player rows). Each HOST dump sample is paired with the

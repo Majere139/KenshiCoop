@@ -116,6 +116,8 @@ static void testSizes() {
     CHECK_EQ("sizeof(NpcCensusHeader)",         sizeof(NpcCensusHeader),         7); // v35: census
     CHECK_EQ("sizeof(ResearchPacket)",          sizeof(ResearchPacket),          57); // v37: research
     CHECK_EQ("sizeof(CamHintPacket)",           sizeof(CamHintPacket),           17); // v43: camera hint
+    CHECK_EQ("sizeof(CellClaimPacket)",         sizeof(CellClaimPacket),         21); // v49: cell claim
+    CHECK_EQ("sizeof(InvXferAckPacket)",        sizeof(InvXferAckPacket),        18); // v50: transfer verdict
     // A full entity batch must fit one ~1400 B datagram (NetLink chunking cap).
     CHECK("entity batch fits datagram",
           sizeof(EntityBatchHeader) + ENTITY_BATCH_MAX * sizeof(EntityState) <= 1428);
@@ -221,8 +223,8 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v48: nested container contents)",
-             (int)PROTOCOL_VERSION, 48);
+    CHECK_EQ("PROTOCOL_VERSION (v50: transfer verdicts)",
+             (int)PROTOCOL_VERSION, 50);
 
     // Protocol 48: the parent reference. A worn backpack owns a PRIVATE inventory, so a bagged
     // item is described by no snapshot unless it can name its container. The byte was already
@@ -352,6 +354,8 @@ static void testRoundTrips() {
     roundTrip<LoadNackPacket>("LoadNackPacket", (u8)PKT_LOAD_NACK);
     roundTrip<ProdPacket>("ProdPacket", (u8)PKT_PROD);
     roundTrip<ResearchPacket>("ResearchPacket", (u8)PKT_RESEARCH);
+    roundTrip<CellClaimPacket>("CellClaimPacket", (u8)PKT_CELL_CLAIM);
+    roundTrip<InvXferAckPacket>("InvXferAckPacket", (u8)PKT_INV_XFER_ACK);
 
     CHECK("packetType(null) == 0", packetType(0, 10) == 0);
     unsigned char b0[1] = { 0 };
@@ -1229,6 +1233,8 @@ static void testFlushWorldStateContract() {
     SpawnReqPacket  sq;  std::memset(&sq,  0, sizeof(sq));
     SpawnInfoPacket si;  std::memset(&si,  0, sizeof(si));
     CamHintPacket   ch;  std::memset(&ch,  0, sizeof(ch));
+    CellClaimPacket cc;  std::memset(&cc,  0, sizeof(cc));
+    InvXferAckPacket xa; std::memset(&xa,  0, sizeof(xa));
     // Session-preserving payloads.
     SaveReqPacket   srq; std::memset(&srq, 0, sizeof(srq));
     SaveBeginPacket sbg; std::memset(&sbg, 0, sizeof(sbg));
@@ -1239,7 +1245,7 @@ static void testFlushWorldStateContract() {
     LoadReqPacket   lrq; std::memset(&lrq, 0, sizeof(lrq));
     LoadNackPacket  lnk; std::memset(&lnk, 0, sizeof(lnk));
 
-    // --- Push one sentinel into every WORLD-STATE queue (29).
+    // --- Push one sentinel into every WORLD-STATE queue (31).
     in.pushEntity(1, 0, e);
     in.pushEvent(1, ev);
     in.pushInv(1, 0, cKey, 0, 0);
@@ -1269,6 +1275,8 @@ static void testFlushWorldStateContract() {
     in.pushSpawnReq(1, sq);
     in.pushSpawnInfo(1, si);
     in.pushCamHint(1, ch);
+    in.pushCellClaim(1, cc);
+    in.pushInvXferAck(1, xa);
 
     // --- Push one sentinel into every SESSION-PRESERVING queue (10).
     in.pushConnect(0);
@@ -1317,6 +1325,8 @@ static void testFlushWorldStateContract() {
     WS_EMPTY("spawnReq",    InboundSpawnReq,    drainSpawnReqs);
     WS_EMPTY("spawnInfo",   InboundSpawnInfo,   drainSpawnInfos);
     WS_EMPTY("camHint",     InboundCamHint,     drainCamHints);
+    WS_EMPTY("cellClaim",   InboundCellClaim,   drainCellClaims);
+    WS_EMPTY("invXferAck",  InboundInvXferAck,  drainInvXferAcks);
     #undef WS_EMPTY
 
     // --- Every SESSION-PRESERVING queue must still hold its sentinel.

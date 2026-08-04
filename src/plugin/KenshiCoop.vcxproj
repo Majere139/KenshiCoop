@@ -121,6 +121,7 @@
     <ClCompile Include="Plugin.cpp" />
     <ClCompile Include="CoopLog.cpp" />
     <ClCompile Include="core\Config.cpp" />
+    <ClCompile Include="core\CrashDump.cpp" />
     <ClCompile Include="net\NetLink.cpp" />
     <ClCompile Include="net\SteamP2P.cpp" />
     <ClCompile Include="net\SteamInvite.cpp" />

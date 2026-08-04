@@ -743,11 +743,10 @@ void Replicator::rekeyPeerBody(GameWorld* gw, const Key& oldK, const Key& newK,
     // and self-corrects on a later edge.
     bool destOwned = false;
     if (squadSync_ && tag && tag[0] == 's') {
+        std::pair<u32, u32> destTab((u32)newK.c, (u32)newK.cs);
         std::map<std::pair<u32, u32>, unsigned int>::const_iterator rit =
-            tabRank_.find(std::make_pair((u32)newK.c, (u32)newK.cs));
-        if (rit != tabRank_.end())
-            destOwned = ownRanks_.empty() ? (rit->second == 0u)
-                                          : (ownRanks_.count(rit->second) != 0);
+            tabRank_.find(destTab);
+        if (rit != tabRank_.end()) destOwned = ownsTab(destTab, rit->second);
     }
     // The author owns a peer-tab hand even if a local tab census would rank it
     // into a tab we own; but a transfer INTO a tab we own is exactly the control
@@ -969,6 +968,10 @@ void Replicator::insertPeerMember(GameWorld* gw, Character* c, const Key& newK,
     // readObjectHand re-reads post-move in Key order [type,container,
     // containerSerial,index,serial].
     if (ownIt) { pinOwned_.insert(newK); pinPeer_.erase(newK); }
+    // The re-container we just performed will surface as a roster MOVE edge on
+    // the next poll. Claim it as ours-to-ignore before publishSquadMoves can
+    // read it as a user action and publish it (see moveEcho_).
+    if (ok) moveEcho_[newK.s] = nowMs();
     unsigned int lh[5] = { 0, 0, 0, 0, 0 };
     bool haveLh = false;
     __try {
@@ -981,6 +984,7 @@ void Replicator::insertPeerMember(GameWorld* gw, Character* c, const Key& newK,
     if (haveLh && (lh[0] | lh[1] | lh[2] | lh[3] | lh[4]) && !sameAsNew) {
         if (ownIt) { pinPeer_.erase(lk); pinOwned_.insert(lk); }
         else       { pinOwned_.erase(lk); pinPeer_.insert(lk); }
+        if (ok) moveEcho_[lk.s] = nowMs();  // the engine may renumber the serial
         pinnedLocal = true;
     }
     int inSquad = -1;

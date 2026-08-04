@@ -1707,6 +1707,13 @@ void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 owne
                 wdSuppress_[std::make_pair(f.src, f.key.first)] = now + XFER_GRACE_MS;
                 wdSuppress_[std::make_pair(f.dst, f.key.first)] = now + XFER_GRACE_MS;
             }
+            // Protocol 50: remember what this intent latched, so the verdict has
+            // something to undo. Recorded even for a peer that will never answer -
+            // applyXferAcks sweeps the unanswered on the same wall clock.
+            XferOut o;
+            o.src = f.src; o.dst = f.dst; o.key = f.key; o.qty = f.qty;
+            o.srcPeer = !srcOwn; o.dstPeer = !dstOwn; o.sentMs = now;
+            xferOut_[pkt.xferId] = o;
             char b[240]; _snprintf(b, sizeof(b) - 1,
                 "[xfer] SEND id=%u sid='%s' type=%u qty=%d src=%u,%u,%u,%u,%u(%s) dst=%u,%u,%u,%u,%u(%s)",
                 pkt.xferId, pkt.stringID, pkt.itemType, f.qty,
@@ -1721,7 +1728,7 @@ void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 owne
     }
 }
 
-void Replicator::applyTransfers(GameWorld* gw, Inbound& in, u32 localId) {
+void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 localId) {
     std::deque<InboundInvXfer> got;
     in.drainInvXfers(got);
     if (got.empty()) return;
@@ -1788,11 +1795,93 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, u32 localId) {
         // Keep the transfer detector blind to the relocation we just made.
         xferRebase(gw, sk);
         xferRebase(gw, dk);
+        // Protocol 50: answer. The author cannot know any of this - only the
+        // receiver knows whether its own copy of the source actually held the
+        // item - so state it rather than let a deadline stand in for it.
+        InvXferAckPacket ack; memset(&ack, 0, sizeof(ack));
+        ack.type        = (u8)PKT_INV_XFER_ACK;
+        ack.ownerId     = localId;
+        ack.xferOwnerId = p.ownerId;
+        ack.xferId      = p.xferId;
+        ack.applied     = (u16)((applied < 0) ? 0 : (applied > 65535 ? 65535 : applied));
+        ack.requested   = p.quantity;
+        ack.verdict     = (u8)((applied <= 0) ? XFER_ACK_REJECT
+                             : (applied >= (int)p.quantity) ? XFER_ACK_ACCEPT
+                             : XFER_ACK_PARTIAL);
+        net.queueInvXferAck(ack);
         char b[240]; _snprintf(b, sizeof(b) - 1,
-            "[xfer] APPLY id=%u from=%u sid='%s' type=%u qty=%u moved=%d fab=%d",
-            p.xferId, p.ownerId, p.stringID, p.itemType, (unsigned)p.quantity, moved, fab);
+            "[xfer] APPLY id=%u from=%u sid='%s' type=%u qty=%u moved=%d fab=%d ack=%u",
+            p.xferId, p.ownerId, p.stringID, p.itemType, (unsigned)p.quantity,
+            moved, fab, (unsigned)ack.verdict);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
+}
+
+void Replicator::applyXferAcks(GameWorld* gw, Inbound& in, u32 localId) {
+    std::deque<InboundInvXferAck> got;
+    in.drainInvXferAcks(got);
+    unsigned long now = nowMs();
+    for (std::deque<InboundInvXferAck>::iterator it = got.begin(); it != got.end(); ++it) {
+        const InvXferAckPacket& a = it->pkt;
+        if (a.xferOwnerId != localId) continue;      // not answering us (relay safety)
+        std::map<u32, XferOut>::iterator o = xferOut_.find(a.xferId);
+        if (o == xferOut_.end()) continue;           // already settled or swept
+        const XferOut& x = o->second;
+        // Back out this intent's latch contribution, and do it for EVERY
+        // verdict - the latch exists only to bridge the window where the
+        // receiver had not answered yet, and the answer has arrived:
+        //   accepted - the receiver's snapshots now carry the move, so holding
+        //              the latch for the rest of the grace only delays
+        //              convergence
+        //   partial  - the units the receiver refused are units its snapshots
+        //              still show where they were, and we want to converge on
+        //              that, not defend our optimistic copy of them
+        //   rejected - the same thing at full size. Dropping the latch is what
+        //              lets applyInventories put our local copy back the way
+        //              the owner sees it; that is the rollback, through the
+        //              reconcile path rather than a second mutation that could
+        //              itself dupe.
+        if (x.srcPeer) releaseXferLatch(x.src, x.key, +x.qty);
+        if (x.dstPeer) releaseXferLatch(x.dst, x.key, -x.qty);
+        const char* vn = (a.verdict == XFER_ACK_ACCEPT)  ? "accept"
+                       : (a.verdict == XFER_ACK_PARTIAL) ? "partial" : "reject";
+        char b[224]; _snprintf(b, sizeof(b) - 1,
+            "[xfer] ACK id=%u from=%u verdict=%s applied=%u/%u waitedMs=%lu sid='%s'",
+            a.xferId, a.ownerId, vn, (unsigned)a.applied, (unsigned)a.requested,
+            now - x.sentMs, x.key.first.c_str());
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        xferOut_.erase(o);
+        (void)gw;
+    }
+    // Sweep intents nobody answered. The latches themselves already expire on
+    // XFER_GRACE_MS; this only stops the pending map growing over a session and
+    // records that the channel went unanswered, which is the signal that the
+    // peer is an older build (or that the "reliable" channel was not).
+    const unsigned long XFER_ACK_WAIT_MS = 15000;    // > XFER_GRACE_MS
+    for (std::map<u32, XferOut>::iterator i = xferOut_.begin(); i != xferOut_.end(); ) {
+        if (now - i->second.sentMs < XFER_ACK_WAIT_MS) { ++i; continue; }
+        char b[176]; _snprintf(b, sizeof(b) - 1,
+            "[xfer] ACK-MISSING id=%u sid='%s' qty=%d (fell back to the wall clock)",
+            i->first, i->second.key.first.c_str(), i->second.qty);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        xferOut_.erase(i++);
+    }
+}
+
+// Undo one intent's contribution to a latch. `delta` is the inverse of what
+// detectAndPublishTransfers added, so a lone intent lands the latch back on
+// zero and it is erased; a second, still-unanswered intent on the same
+// container and item leaves its own contribution behind to be cleared by its
+// own verdict. The deadline is deliberately untouched: it belongs to whatever
+// is left, not to what we just removed.
+void Replicator::releaseXferLatch(const Key& k, const XKey& key, int delta) {
+    std::map<Key, std::map<XKey, XferLatch> >::iterator lt = xferLatch_.find(k);
+    if (lt == xferLatch_.end()) return;
+    std::map<XKey, XferLatch>::iterator le = lt->second.find(key);
+    if (le == lt->second.end()) return;
+    le->second.delta += delta;
+    if (le->second.delta == 0) lt->second.erase(le);
+    if (lt->second.empty()) xferLatch_.erase(lt);
 }
 
 

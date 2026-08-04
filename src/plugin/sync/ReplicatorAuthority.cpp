@@ -20,7 +20,35 @@ void Replicator::debugMark(Character* c, int colorId, const char* tag) {
         en = (e && e[0] == '1') ? 1 : 0;
     }
     if (en != 1 || !c) return;
+    ObjectHand oh;
+    bool haveHand = engine::charHandOf(c, oh);
     std::map<Character*, DebugMarker>::iterator it = debugMarkers_.find(c);
+    // Two ways an entry found here can be somebody else's, both fatal if trusted:
+    // the address was recycled onto a different body, or the GUI has already
+    // destroyed the label. Either means forget the entry and mint a fresh label
+    // rather than re-caption a dead one.
+    if (it != debugMarkers_.end()) {
+        bool mine  = haveHand && it->second.index == oh.index &&
+                                 it->second.serial == oh.serial;
+        bool alive = engine::markerAlive(it->second.label);
+        if (!mine || !alive) {
+            if (alive) engine::markerDestroy(it->second.label);
+            debugMarkers_.erase(it);
+            it = debugMarkers_.end();
+            // Say so, rate-limited. Without this the guard is invisible and a run
+            // that does not crash proves nothing about whether it was needed -
+            // which is the whole question, since the bug it prevents took a mint
+            // burst to reach. reused = the engine handed a new body an address we
+            // still had a label for; dead = the GUI destroyed the label under us.
+            static unsigned int nStale = 0;
+            if (++nStale <= 20u) {
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[marker] stale entry dropped (%s) n=%u",
+                    !mine ? "address reused" : "label destroyed by GUI", nStale);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+    }
     if (it != debugMarkers_.end() && it->second.color == colorId) return;
     char nm[40];
     engine::charName(c, nm, sizeof(nm));
@@ -28,9 +56,14 @@ void Replicator::debugMark(Character* c, int colorId, const char* tag) {
     _snprintf(cap, sizeof(cap) - 1, "%s %s", tag, nm);
     cap[sizeof(cap) - 1] = '\0';
     if (it == debugMarkers_.end()) {
+        // No hand means no way to tell this body from the next one to land on
+        // this address, so don't cache a label we could never re-identify.
+        if (!haveHand) return;
         void* l = engine::markerCreate(c, cap, colorId);
         if (l) {
-            DebugMarker m; m.label = l; m.color = colorId;
+            DebugMarker m;
+            m.label = l; m.color = colorId;
+            m.index = oh.index; m.serial = oh.serial;
             debugMarkers_[c] = m;
         }
     } else if (engine::markerUpdate(it->second.label, cap, colorId)) {
@@ -44,6 +77,11 @@ void Replicator::applyNpcCensus(Inbound& in) {
     if (got.empty()) return;
     // Latest wins (reliable-ordered channel, 1 Hz - normally one pending).
     const InboundNpcCensus& nc = got.back();
+    // Whose existence claim this is. At two players there is exactly one peer,
+    // so a single set IS "the peer's census" - what was missing is the label,
+    // which is what lets enforcement ask whether the sender actually owns the
+    // cell a body stands in.
+    censusOwner_ = nc.ownerId;
     censusHands_.clear();
     censusPos_.clear();
     unsigned int n = (unsigned int)(nc.hands.size() / 5);
@@ -75,7 +113,7 @@ void Replicator::applyNpcCensus(Inbound& in) {
     }
 }
 
-void Replicator::enforceHostAuthority(GameWorld* gw) {
+void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
     if (!gw) return;
     // Hysteresis (step 5, spike 18): a hard streamed/unstreamed edge churned
     // boundary NPCs. Suppress only after a sustained unstreamed run (~1 s), and
@@ -165,9 +203,13 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
         censusFreshChkMs_ = nowF;
     }
 
+    // Under presence authority this pass runs on both sides, so the audit label
+    // has to follow the role rather than the pass. With cellAuth off it is
+    // join-only and this still reads "join".
+    const char* roleTag = isHostRole() ? "host" : "join";
     if (auditRows_) {
-        notePlatoons(gw, states, n, "join");
-        notePlatoons(gw, wStates, wn, "join");
+        notePlatoons(gw, states, n, roleTag);
+        notePlatoons(gw, wStates, wn, roleTag);
     }
 
     // Attention gate anchors, resolved once for both passes and the audit. A
@@ -182,6 +224,7 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
     unsigned int nRawAnch = engine::interestAnchors(gw, rawAnch);
     float attnAnch[12];
     unsigned int nAttnAnch = attentionAnchors(gw, rawAnch, nRawAnch, attnAnch);
+    unsigned int authSkip = 0;   // bodies left alone because we author them
 
     // Prune counters for hands the enumeration no longer sees (left interest),
     // preserving suppressed entries (a hidden body may drop out of the query but
@@ -201,6 +244,12 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
         // local hand (which exists on no other client) - never judge them.
         if (proxyChars.find(chars[i]) != proxyChars.end()) continue;
         Key k = keyOf(states[i]);
+        // Presence authority: not every body here answers to us.
+        if (authorHoldsBody(gw, localId, k, chars[i], states[i].x, states[i].z)) {
+            authCount_[k].unstreamed = 0;
+            ++authSkip;
+            continue;
+        }
         // Streamed = the hand is in this tick's fresh set, OR the body pointer is
         // one applyTargets drove this tick. The pointer check covers combat-
         // detached NPCs: detachFromTownAI re-containers the body, so its LOCAL
@@ -342,6 +391,11 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
                 driven = ds != drivenSeen_.end() && (nowR - ds->second) < 8000;
             }
             Key k = keyOf(wStates[i]);
+            if (authorHoldsBody(gw, localId, k, wChars[i], wStates[i].x, wStates[i].z)) {
+                authCount_[k].unstreamed = 0;
+                ++authSkip;
+                continue;
+            }
             if (driven && suppressed_.find(k) == suppressed_.end()) continue;
             bool exists = censusHands_.find(k) != censusHands_.end() ||
                           keep.find(k) != keep.end() || driven;
@@ -522,6 +576,7 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
     if ((now - auditMs) >= 5000) {
         auditMs = now;
         unsigned int cDrv = 0, cCen = 0, cHid = 0, cGhost = 0, cDorm = 0;
+        unsigned int cMine = 0;   // bodies in cells WE author (presence authority)
         // Safety check on the attention gate. The design rests on a squad
         // never going dormant just because no camera is on it: every squad-tab
         // LEADER is an interest anchor, so bodies beside a leader are observed
@@ -573,6 +628,11 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
                     cls = "drv"; ++cDrv;
                 } else if (suppressed_.find(k) != suppressed_.end()) {
                     cls = "hid"; ++cHid;
+                } else if (cellAuth_ &&
+                           authorityFor(gw, sts[i].x, sts[i].z) == localId) {
+                    // Ours to author - it is not a ghost for lacking a census
+                    // row, because nobody but us was ever going to write one.
+                    cls = "mine"; ++cMine;
                 } else if (censusFresh &&
                            censusHands_.find(k) != censusHands_.end()) {
                     cls = "cen"; ++cCen;
@@ -674,12 +734,12 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
             // Phase 0.5 fields are APPENDED: Get-WorldRows' regex stops at
             // ghost= and tolerates any trailing text (fresh= already rides
             // past it), so the oracle contract is unchanged.
-            char w[224]; _snprintf(w, sizeof(w) - 1,
-                "SCENARIO WORLD n=%u cls=join drv=%u cen=%u hid=%u ghost=%u fresh=%d "
-                "cap=%d ghostMax=%.0f ghostEdge=%u dorm=%u",
-                (unsigned)counted.size(), cDrv, cCen, cHid, cGhost,
+            char w[256]; _snprintf(w, sizeof(w) - 1,
+                "SCENARIO WORLD n=%u cls=%s drv=%u cen=%u hid=%u ghost=%u fresh=%d "
+                "cap=%d ghostMax=%.0f ghostEdge=%u dorm=%u mine=%u",
+                (unsigned)counted.size(), roleTag, cDrv, cCen, cHid, cGhost,
                 censusFresh ? 1 : 0, (nearTrunc || wideTrunc) ? 1 : 0,
-                ghostMaxD, ghostEdge, cDorm);
+                ghostMaxD, ghostEdge, cDorm, cMine);
             w[sizeof(w) - 1] = '\0'; coop::logLine(w);
         }
         // Phase 0.5 fields appended after parks= (existing prefix untouched):
@@ -696,17 +756,18 @@ void Replicator::enforceHostAuthority(GameWorld* gw) {
         //                     within attnR of a player character (must be 0),
         //                     over the pcs squad members it was measured
         //                     against - pcs=0 makes the zero vacuous
-        char b[352]; _snprintf(b, sizeof(b) - 1,
+        char b[448]; _snprintf(b, sizeof(b) - 1,
             "[audit] exist near=%u wide=%u drv=%u cen=%u hid=%u ghost=%u "
             "supp=%u census=%u fresh=%d parks=%lu "
             "nearCap=%d wideCap=%d staleMs=%lu edges=%lu ghostMax=%.0f ghostEdge=%u "
-            "dorm=%u attnR=%.0f dormPc=%u pcs=%u",
+            "dorm=%u attnR=%.0f dormPc=%u pcs=%u mine=%u skip=%u cells=%u",
             n, wn, cDrv, cCen, cHid, cGhost,
             (unsigned)suppressed_.size(), (unsigned)censusHands_.size(),
             censusFresh ? 1 : 0, censusParks_,
             nearTrunc ? 1 : 0, wideTrunc ? 1 : 0,
             censusStaleMs_, censusStaleEdges_, ghostMaxD, ghostEdge,
-            cDorm, attentionRadius_, cDormPc, nPc);
+            cDorm, attentionRadius_, cDormPc, nPc,
+            cMine, authSkip, (unsigned)claimedCells_.size());
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
@@ -782,8 +843,261 @@ unsigned int Replicator::attentionAnchors(GameWorld* gw, const float* raw,
     return nOut;
 }
 
+void Replicator::rebuildClaimedCells() {
+    claimedCells_.clear();
+    for (std::map<std::pair<u32, u32>, CellClaim>::const_iterator it = claimSlots_.begin();
+         it != claimSlots_.end(); ++it) {
+        std::pair<int, int> cell(it->second.cx, it->second.cz);
+        u32 owner = it->first.first;
+        std::map<std::pair<int, int>, u32>::iterator ex = claimedCells_.find(cell);
+        if (ex == claimedCells_.end()) claimedCells_[cell] = owner;
+        else if (owner == (u32)CELL_OWNER_HOST) ex->second = owner;  // host wins ties
+    }
+    // Remember it, so walking out of a cell does not hand it to the host.
+    for (std::map<std::pair<int, int>, u32>::const_iterator it = claimedCells_.begin();
+         it != claimedCells_.end(); ++it) {
+        cellLastOwner_[it->first] = it->second;
+    }
+}
+
+u32 Replicator::authorityFor(GameWorld* gw, float x, float z) const {
+    if (!cellAuth_) return (u32)CELL_OWNER_HOST;
+    int cx = 0, cz = 0;
+    if (!engine::cellAt(gw, x, z, &cx, &cz)) return (u32)CELL_OWNER_HOST;
+    std::pair<int, int> cell(cx, cz);
+    std::map<std::pair<int, int>, u32>::const_iterator it = claimedCells_.find(cell);
+    if (it != claimedCells_.end()) return it->second;
+    // Nobody is standing here now; the last client that was still speaks for it.
+    std::map<std::pair<int, int>, u32>::const_iterator lo = cellLastOwner_.find(cell);
+    if (lo != cellLastOwner_.end()) return lo->second;
+    return (u32)CELL_OWNER_HOST;
+}
+
+bool Replicator::authorHoldsBody(GameWorld* gw, u32 localId, const Key& k,
+                                 Character* c, float x, float z) {
+    if (!cellAuth_) return false;
+    u32 owner = authorityFor(gw, x, z);
+    // Ours to author, or nobody's we have heard from: either way this body is
+    // not ours to judge. The second case matters as much as the first - a cell
+    // whose owner has sent no census is unspoken-for, not empty, and treating
+    // silence as absence is the whole ghost mechanism.
+    if (owner != localId && owner == censusOwner_) return false;
+    // A body the peer's stream is still writing is not ours to author YET, even
+    // though the cell now says it is. Both at once is two writers on one
+    // Character: we publish it as ours while applyTargets keeps teleporting it
+    // to the peer's transform, and authorHoldsBody restores it out from under
+    // the drive. That is the same contradiction as the death/exit/drive one,
+    // and it is what a handover looks like without an ordering rule. So order
+    // it: drop the drive now, author from the next tick. The peer stops
+    // publishing the body as soon as its own claim moves, so the release is
+    // permanent rather than a fight - and one tick of neither side authoring
+    // costs nothing, where one tick of both costs a crash.
+    if (c) {
+        std::set<Character*>::iterator dc = drivenChars_.find(c);
+        bool driving = dc != drivenChars_.end();
+        if (driving) drivenChars_.erase(dc);
+        std::map<Character*, unsigned long>::iterator ds = drivenSeen_.find(c);
+        if (ds != drivenSeen_.end()) { drivenSeen_.erase(ds); driving = true; }
+        if (driving) {
+            char b[144]; _snprintf(b, sizeof(b) - 1,
+                "[cell] handover hand=%u,%u owner=%u - released the drive, authoring next tick",
+                (unsigned)k.i, (unsigned)k.s, owner);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            return false;
+        }
+    }
+    // Authority just moved to us (or away from a census we no longer read):
+    // anything we hid on the old author's word has to come back, or a handover
+    // leaves a town permanently invisible.
+    std::map<Key, Character*>::iterator sp = suppressed_.find(k);
+    if (sp != suppressed_.end()) {
+        engine::restoreNpc(gw, c ? c : sp->second);
+        suppressed_.erase(sp);
+        ++authRestores_;
+        lifeSet(k, LIFE_RESOLVED, "author-restore");
+        char b[144]; _snprintf(b, sizeof(b) - 1,
+            "[cell] restore NPC hand=%u,%u owner=%u (we author here; supp=%u)",
+            (unsigned)k.i, (unsigned)k.s, owner, (unsigned)suppressed_.size());
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    return true;
+}
+
+void Replicator::syncCellClaims(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId) {
+    // Drain unconditionally: with the feature off the queue must still not grow
+    // (a peer running with it on would otherwise back up against us forever).
+    std::deque<InboundCellClaim> got;
+    in.drainCellClaims(got);
+    if (!cellAuth_ || !gw) {
+        if (!claimSlots_.empty()) {
+            claimSlots_.clear(); claimedCells_.clear(); cellLastOwner_.clear();
+        }
+        return;
+    }
+    unsigned long now = nowMs();
+    bool changed = false;
+    for (std::deque<InboundCellClaim>::const_iterator it = got.begin();
+         it != got.end(); ++it) {
+        const CellClaimPacket& p = it->pkt;
+        if (p.ownerId == ownerId) continue;   // our own broadcast, echoed back
+        std::pair<u32, u32> slot(p.ownerId, p.tabRank);
+        std::map<std::pair<u32, u32>, CellClaim>::iterator s = claimSlots_.find(slot);
+        // Signed difference so a wrapped seq still orders correctly.
+        if (s != claimSlots_.end() && (int)(p.seq - s->second.seq) <= 0) continue;
+        bool moved = (s == claimSlots_.end()) ||
+                     s->second.cx != p.cellX || s->second.cz != p.cellY;
+        CellClaim cc;
+        cc.cx = p.cellX; cc.cz = p.cellY; cc.seq = p.seq; cc.recvMs = now;
+        claimSlots_[slot] = cc;
+        if (moved) {
+            changed = true;
+            char b[128]; _snprintf(b, sizeof(b) - 1,
+                "[cell] RECV owner=%u rank=%u cell=%d,%d seq=%u",
+                p.ownerId, p.tabRank, p.cellX, p.cellY, p.seq);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+
+    // Publish our own tabs' cells at 1 Hz.
+    if (claimSendMs_ == 0 || (now - claimSendMs_) >= 1000) {
+        claimSendMs_ = now;
+        bool assertDue = (claimAssertMs_ == 0) ||
+                         (now - claimAssertMs_) >= (unsigned long)CELL_ASSERT_MS;
+        if (assertDue) claimAssertMs_ = now;
+        const unsigned int MAX_SQ = 96;
+        static EntityState raw[MAX_SQ];   // main-thread only
+        unsigned int nSquad = engine::captureSquad(gw, /*leaderOnly*/ false, raw, MAX_SQ);
+        std::vector<std::pair<u32, u32> > ctnrs;
+        ctnrs.reserve(nSquad);
+        for (unsigned int i = 0; i < nSquad; ++i)
+            ctnrs.push_back(std::make_pair(raw[i].hContainer, raw[i].hContainerSerial));
+        std::sort(ctnrs.begin(), ctnrs.end());
+        ctnrs.erase(std::unique(ctnrs.begin(), ctnrs.end()), ctnrs.end());
+        for (unsigned int ci = 0; ci < ctnrs.size(); ++ci) {
+            unsigned int rank = tabRankFor(ctnrs[ci], ctnrs);
+            if (!ownsTab(ctnrs[ci], rank)) continue;
+            // The tab's leader stands for the tab: presence is about where the
+            // squad IS, and a scattered squad still has one home cell.
+            const EntityState* lead = 0;
+            for (unsigned int i = 0; i < nSquad && !lead; ++i)
+                if (raw[i].hContainer == ctnrs[ci].first &&
+                    raw[i].hContainerSerial == ctnrs[ci].second) lead = &raw[i];
+            if (!lead) continue;
+            int cx = 0, cz = 0;
+            if (!engine::cellAt(gw, lead->x, lead->z, &cx, &cz)) continue;
+            std::pair<u32, u32> slot(ownerId, (u32)rank);
+            std::map<std::pair<u32, u32>, CellClaim>::iterator cur = claimSlots_.find(slot);
+            bool same = (cur != claimSlots_.end()) &&
+                        cur->second.cx == cx && cur->second.cz == cz;
+            // Dwell: a boundary walker must settle before authority moves.
+            CellDwell& d = claimDwell_[(u32)rank];
+            if (d.n == 0 || d.cx != cx || d.cz != cz) { d.cx = cx; d.cz = cz; d.n = 1; }
+            else if (d.n < 0xFFFFu) ++d.n;
+            if (same) { if (!assertDue) continue; }
+            else if (d.n < (unsigned int)CELL_DWELL_N) continue;
+            u32 seq = ++claimSeqOut_[(u32)rank];
+            CellClaimPacket p;
+            memset(&p, 0, sizeof(p));
+            p.type    = (u8)PKT_CELL_CLAIM;
+            p.ownerId = ownerId;
+            p.tabRank = (u32)rank;
+            p.seq     = seq;
+            p.cellX   = cx;
+            p.cellY   = cz;
+            net.queueCellClaim(p);
+            CellClaim cc;
+            cc.cx = cx; cc.cz = cz; cc.seq = seq; cc.recvMs = now;
+            claimSlots_[slot] = cc;
+            if (!same) {
+                changed = true;
+                char b[144]; _snprintf(b, sizeof(b) - 1,
+                    "[cell] CLAIM rank=%u cell=%d,%d seq=%u dwell=%u pos=%.0f,%.0f",
+                    rank, cx, cz, seq, d.n, lead->x, lead->z);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+    }
+
+    if (changed) rebuildClaimedCells();
+    // Dump the resolved map on change AND on a slow cadence. split_far2's
+    // central claim - that both clients resolve the SAME owner for the same
+    // cell - can only be read by diffing the two logs, so the line has to
+    // carry the pairs, and it has to appear in every camera phase rather than
+    // only at the edges where something moved.
+    if (changed || claimMapMs_ == 0 || (now - claimMapMs_) >= 5000) {
+        claimMapMs_ = now;
+        char b[256];
+        int off = _snprintf(b, sizeof(b) - 1, "[cell] MAP cells=%u slots=%u",
+                            (unsigned)claimedCells_.size(),
+                            (unsigned)claimSlots_.size());
+        if (off < 0) off = 0;
+        for (std::map<std::pair<int, int>, u32>::const_iterator mi = claimedCells_.begin();
+             mi != claimedCells_.end() && off < (int)sizeof(b) - 32; ++mi) {
+            int w = _snprintf(b + off, sizeof(b) - 1 - off, " %d,%d=%u",
+                              mi->first.first, mi->first.second, mi->second);
+            if (w < 0) break;
+            off += w;
+        }
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+unsigned int Replicator::peerAnchors(GameWorld* gw, float* out) {
+    if (!gw || !out) return 0;
+    unsigned int nOut = 0;
+    const unsigned int MAX_SQ = 96;
+    static EntityState raw[MAX_SQ];   // main-thread only
+    unsigned int nSquad = engine::captureSquad(gw, /*leaderOnly*/ false, raw, MAX_SQ);
+    std::vector<std::pair<u32, u32> > ctnrs;
+    ctnrs.reserve(nSquad);
+    for (unsigned int i = 0; i < nSquad; ++i)
+        ctnrs.push_back(std::make_pair(raw[i].hContainer, raw[i].hContainerSerial));
+    std::sort(ctnrs.begin(), ctnrs.end());
+    ctnrs.erase(std::unique(ctnrs.begin(), ctnrs.end()), ctnrs.end());
+    // EVERY tab leader, ours included - this has to model what the PEER's
+    // attentionAnchors will compute, and that anchors on all tab leaders
+    // because a body standing next to any player character must never be
+    // dormant (the dormPc safety property). Restricting this to the peer's own
+    // tabs was a wrong model of the peer's attention, and the two predicates
+    // disagreeing is exactly the failure this channel exists to prevent: on
+    // split_far2 the host stopped censusing its own town because the join's
+    // TAB was 5200 u away, while the join went on attending it through its
+    // local copy of the host's leader - and suppressed 26 real bodies against
+    // the resulting silence.
+    for (unsigned int ci = 0; ci < ctnrs.size() && nOut < 3; ++ci) {
+        for (unsigned int i = 0; i < nSquad; ++i) {
+            if (raw[i].hContainer != ctnrs[ci].first ||
+                raw[i].hContainerSerial != ctnrs[ci].second) continue;
+            out[nOut * 3 + 0] = raw[i].x;
+            out[nOut * 3 + 1] = raw[i].y;
+            out[nOut * 3 + 2] = raw[i].z;
+            ++nOut;
+            break;
+        }
+    }
+    float pc[3];
+    if (nOut < 4 && engine::peerCamAnchor(pc)) {
+        out[nOut * 3 + 0] = pc[0];
+        out[nOut * 3 + 1] = pc[1];
+        out[nOut * 3 + 2] = pc[2];
+        ++nOut;
+    }
+    return nOut;
+}
+
 bool Replicator::observedAt(const Key& k, const float* anchors,
                             unsigned int nAnchor, float x, float y, float z) {
+    return observedIn(attnObs_, /*countFlips*/ true, k, anchors, nAnchor, x, y, z);
+}
+
+bool Replicator::observedByPeer(const Key& k, const float* anchors,
+                                unsigned int nAnchor, float x, float y, float z) {
+    return observedIn(attnObsPeer_, /*countFlips*/ false, k, anchors, nAnchor, x, y, z);
+}
+
+bool Replicator::observedIn(std::map<Key, bool>& obs, bool countFlips, const Key& k,
+                            const float* anchors, unsigned int nAnchor,
+                            float x, float y, float z) {
     if (attentionRadius_ <= 0.0f) return true;   // gate off
     // No anchors at all means no players in gameplay (interestCenters returns
     // 0 before the squads exist). Fail OPEN - a startup tick must not declare
@@ -793,8 +1107,8 @@ bool Replicator::observedAt(const Key& k, const float* anchors,
     // anchor sets that agree only approximately, so a body parked on the
     // threshold would flip out of phase between them without the deadband.
     const float ATTN_LEAVE_SCALE = 1.25f;
-    std::map<Key, bool>::iterator it = attnObs_.find(k);
-    bool was = (it != attnObs_.end()) && it->second;
+    std::map<Key, bool>::iterator it = obs.find(k);
+    bool was = (it != obs.end()) && it->second;
     float r = was ? attentionRadius_ * ATTN_LEAVE_SCALE : attentionRadius_;
     bool now = false;
     for (unsigned int a = 0; a < nAnchor && !now; ++a) {
@@ -802,9 +1116,9 @@ bool Replicator::observedAt(const Key& k, const float* anchors,
                         anchors[a * 3 + 2]);
         now = (d <= r);
     }
-    if (now && !was) ++attnFlips_;   // Phase B: an attach to be paid for
-    if (it != attnObs_.end()) it->second = now;
-    else                      attnObs_[k] = now;
+    if (countFlips && now && !was) ++attnFlips_;   // Phase B: an attach to pay for
+    if (it != obs.end()) it->second = now;
+    else                 obs[k] = now;
     return now;
 }
 
@@ -840,6 +1154,11 @@ void Replicator::pruneAttention(const std::set<Key>& seen) {
     for (std::map<Key, bool>::iterator it = attnObs_.begin();
          it != attnObs_.end(); ) {
         if (seen.find(it->first) == seen.end()) attnObs_.erase(it++);
+        else ++it;
+    }
+    for (std::map<Key, bool>::iterator it = attnObsPeer_.begin();
+         it != attnObsPeer_.end(); ) {
+        if (seen.find(it->first) == seen.end()) attnObsPeer_.erase(it++);
         else ++it;
     }
 }

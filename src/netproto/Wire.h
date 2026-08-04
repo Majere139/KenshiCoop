@@ -14,6 +14,7 @@ namespace coop {
 
 typedef unsigned char  u8;
 typedef signed char    i8;
+typedef signed int     i32;
 typedef unsigned short u16;
 typedef unsigned int   u32;
 typedef float          f32;
@@ -24,7 +25,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 48;
+const u16 PROTOCOL_VERSION = 50;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -70,7 +71,9 @@ enum PacketType {
     PKT_RESEARCH         = 40,// RELIABLE host-authoritative known-research row (protocol 38); ResearchPacket
     PKT_CAM_HINT         = 41,// UNRELIABLE join camera center hint (protocol 43, join -> host); CamHintPacket
     PKT_COMBAT_HIT       = 42,// RELIABLE join-dealt authoritative damage report (join -> host, protocol 45); CombatHitPacket
-    PKT_WORLD_ITEM_CLAIM = 43 // RELIABLE proxy-consumed notice (protocol 47); WorldItemClaimHeader
+    PKT_WORLD_ITEM_CLAIM = 43,// RELIABLE proxy-consumed notice (protocol 47); WorldItemClaimHeader
+    PKT_CELL_CLAIM       = 44,// RELIABLE zone-cell presence claim (protocol 49); CellClaimPacket
+    PKT_INV_XFER_ACK     = 45 // RELIABLE transfer verdict (protocol 50); InvXferAckPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -633,6 +636,46 @@ struct InvXferPacket {
     u16  quality;    // quality*100 of the moved stack (advisory)
     char manufacturer[48];
     char material[48];
+};
+
+// ---- Protocol 50: transfer VERDICT ------------------------------------------
+// PKT_INV_XFER is optimistic. The author moves the item locally, latches both
+// peer ends so the owner's in-flight snapshots cannot reconcile the move away,
+// and then waits out a 10 s wall clock - because nothing ever comes back. That
+// deadline is a guess standing in for an answer: too short and a slow receiver
+// looks like a refusal, too long and a genuinely refused transfer stays visibly
+// duped for ten seconds. It is also a guess the author cannot improve on,
+// because whether the move succeeded is a fact only the RECEIVER has.
+//
+// So the receiver states it. One ack per intent, reliable, carrying how many
+// units actually landed:
+//   applied == quantity  ACCEPT  - the author drops its latches now, not on a
+//                                  timer, and the two worlds agree immediately
+//   0 < applied < qty    PARTIAL - the author keeps a latch for the shortfall
+//   applied == 0         REJECT  - the author drops every latch for the intent,
+//                                  which lets the owner's next snapshot
+//                                  reconcile the optimistic local move away.
+//                                  That is the rollback, and it happens through
+//                                  the existing reconcile path rather than a
+//                                  second mutation path that could itself dupe.
+// The wall clock stays as a BACKSTOP for a peer that never answers (an older
+// build, or a drop on a channel that is nominally reliable but disconnected),
+// so this strictly narrows the window rather than replacing one guess with a
+// dependency.
+struct InvXferAckPacket {
+    u8  type;        // = PKT_INV_XFER_ACK
+    u32 ownerId;     // sender of the ACK (the receiver that applied it)
+    u32 xferOwnerId; // ownerId of the intent being answered
+    u32 xferId;      // xferId of the intent being answered
+    u16 applied;     // units actually moved + fabricated (0 = rejected)
+    u16 requested;   // units the intent asked for (echo, for log/audit clarity)
+    u8  verdict;     // XFER_ACK_* below
+};
+
+enum XferAckVerdict {
+    XFER_ACK_REJECT  = 0,
+    XFER_ACK_ACCEPT  = 1,
+    XFER_ACK_PARTIAL = 2
 };
 
 // Reserved netId meaning "no/invalid world item".
@@ -1269,6 +1312,29 @@ struct CamHintPacket {
     u8  type;    // = PKT_CAM_HINT
     u32 ownerId; // network player id of the sender
     f32 x, y, z; // CameraClass::getCenter() world position
+};
+
+// Cell claim (protocol 49, BOTH directions, ~1 Hz RELIABLE): "my tab is
+// standing in this zone cell". Cells are the engine's own 4608 u sector grid
+// (ZoneManager::getMapSector, the coord that names the zone.X.Y files), so both
+// clients derive the key from the shared save with nothing exchanged - only the
+// PRESENCE is news.
+//
+// One claim per (ownerId, tabRank) SLOT, latest-seq wins. A tab walking into a
+// new cell supersedes its own previous claim, so there is no release message
+// and no lease to expire. tabRank is an opaque slot id here: ranks assigned
+// after session start differ between clients, but a claim is only ever compared
+// against other claims from the SAME owner.
+//
+// Reliable because a dropped claim silently reverts a cell to host authority,
+// which is a duplicate-authorship window rather than a missed frame.
+struct CellClaimPacket {
+    u8  type;     // = PKT_CELL_CLAIM
+    u32 ownerId;  // network player id of the claimant (host = 0)
+    u32 tabRank;  // claim slot within that owner
+    u32 seq;      // per-slot monotonic; stale arrivals are dropped
+    i32 cellX;    // ZoneManager::getMapSector coords, = the zone.X.Y filename
+    i32 cellY;
 };
 
 struct TimePingPacket {

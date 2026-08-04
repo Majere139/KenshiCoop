@@ -70,6 +70,34 @@ bool markerUpdateSeh(ScreenLabel* l, const std::string* text,
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+// Is this label one the GUI still owns? ForgottenGUI keeps the authoritative
+// registry of live ScreenLabels (plus deferred add/remove queues), and that
+// registry - not our cached pointer - is the only ground truth available: the
+// GUI destroys labels on its own schedule and notifies nobody, so a handle held
+// across ticks dangles silently. Measured 2026-08-03: the join minted three
+// proxies in one burst, debugMark found stale map entries sitting at RECYCLED
+// Character* addresses, and setCaption on the previous occupants' dead labels
+// faulted twice inside ScreenLabel::setCaption (kenshi+0x6e451e) moments before
+// the process died. Same lesson as the world-item proxy hands - never
+// dereference a cached engine pointer without re-asking the engine.
+//
+// Deliberately unlocked. guiScreenLabelsMutex guards these lektors, but taking
+// an engine shared_mutex from inside a detour is its own class of hazard, and a
+// torn read here is harmless BECAUSE we test for an exact pointer match: garbage
+// answers "not present", which costs one discarded marker, whereas a false
+// "alive" would need the torn word to equal the very pointer we are asking
+// about. The safe direction is the likely one.
+bool labelListHas(const lektor<ScreenLabelInterface*>* v, const void* l) {
+    __try {
+        ScreenLabelInterface* const* p = v->stuff;
+        unsigned int n = v->count;
+        if (!p || n > 8192u) return false;   // bound a torn/garbage count
+        for (unsigned int i = 0; i < n; ++i)
+            if ((const void*)p[i] == l) return true;
+        return false;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 bool markerDestroySeh(ForgottenGUI* g, ScreenLabel* l) {
     __try {
         g->destroy(l);
@@ -90,8 +118,21 @@ void* markerCreate(Character* c, const char* text, int colorId) {
     return markerCreateSeh(g, c, &t, &col, &off);
 }
 
+bool markerAlive(void* label) {
+    if (!label) return false;
+    ForgottenGUI* g = ::gui; // KenshiLib data export (spike 46)
+    if (!g) return false;
+    // Queued for removal counts as dead: the GUI has already decided, and we
+    // would only be racing its next flush.
+    if (labelListHas(&g->guiScreenLabelsToRemove, label)) return false;
+    // A freshly created label sits in the add queue until the GUI flushes it, so
+    // both lists are "alive" or markerCreate's own handle would look dead.
+    return labelListHas(&g->guiScreenLabels, label) ||
+           labelListHas(&g->guiScreenLabelsToAdd, label);
+}
+
 bool markerUpdate(void* label, const char* text, int colorId) {
-    if (!label || !text) return false;
+    if (!label || !text || !markerAlive(label)) return false;
     std::string t(text);
     MyGUI::Colour col;
     markerColour(colorId, &col);
@@ -102,6 +143,10 @@ void markerDestroy(void* label) {
     if (!label) return;
     ForgottenGUI* g = ::gui; // KenshiLib data export (spike 46)
     if (!g) return;
+    // Handing the GUI a label it has already destroyed is the same
+    // use-after-free as updating one; prune paths reach here with handles whose
+    // Character went away, which is exactly when the GUI has cleaned up too.
+    if (!markerAlive(label)) return;
     markerDestroySeh(g, (ScreenLabel*)label);
 }
 

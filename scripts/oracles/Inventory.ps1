@@ -425,6 +425,28 @@ function Test-TradePeer {
     # The channel evidence: the dragger authored intents, the peer applied them.
     $sends   = @(Select-String -Path $HostFile -Pattern "\[xfer\] SEND id=").Count
     $applies = @(Select-String -Path $JoinFile -Pattern "\[xfer\] APPLY id=").Count
+    # Protocol 50: and the peer ANSWERED. Every intent the dragger sent must come
+    # back with a verdict, because the alternative is the 10 s wall clock - which
+    # would still let this gate pass, just ten seconds later and with a visible
+    # dupe in between. ACK-MISSING is the dragger's own record of having given up
+    # on an answer, so one of those is a channel failure however the totals read.
+    $acks     = @(Select-String -Path $HostFile -Pattern "\[xfer\] ACK id=")
+    $ackIds   = @{}
+    $rejects  = 0; $partials = 0; $maxWait = 0
+    foreach ($a in $acks) {
+        if ($a.Line -match "\[xfer\] ACK id=(\d+) from=\d+ verdict=(\w+) applied=\d+/\d+ waitedMs=(\d+)") {
+            $ackIds[[int]$matches[1]] = $true
+            if ($matches[2] -eq "reject")  { $rejects++ }
+            if ($matches[2] -eq "partial") { $partials++ }
+            if ([int]$matches[3] -gt $maxWait) { $maxWait = [int]$matches[3] }
+        }
+    }
+    $ackMissing = @(Select-String -Path $HostFile -Pattern "\[xfer\] ACK-MISSING id=").Count
+    # These drags are all legal cross-owner moves of an item the source really
+    # holds, so the only correct verdict is accept. A reject here means the
+    # receiver could not find what the author swore it had moved.
+    $ackOk = ($ackIds.Count -ge $sends) -and ($ackMissing -eq 0) -and
+             ($rejects -eq 0) -and ($partials -eq 0)
 
     $summar = {
         param($S)
@@ -500,7 +522,7 @@ function Test-TradePeer {
     $consJ = $js.probeFinal -eq ($js.probeFirst + 5)
     $probeAgree = ($hR0end -eq $jR0end) -and ($hR1end -eq $jR1end)
     $mv = { param($m) if ($moves.ContainsKey($m)) { "n=$($moves[$m].n) sid='$($moves[$m].sid)'" } else { "(missing)" } }
-    Write-Host "  TRADE-PEER moves: TAKE $(& $mv 'TAKE')  GIVE $(& $mv 'GIVE')  WTAKE $(& $mv 'WTAKE')  seeds host=$seedH join=$seedJ  xfer sent=$sends applied=$applies"
+    Write-Host "  TRADE-PEER moves: TAKE $(& $mv 'TAKE')  GIVE $(& $mv 'GIVE')  WTAKE $(& $mv 'WTAKE')  seeds host=$seedH join=$seedJ  xfer sent=$sends applied=$applies acked=$($ackIds.Count) (reject=$rejects partial=$partials missing=$ackMissing slowestMs=$maxWait)"
     Write-Host "  TRADE-PEER probe totals: host $($hs.probeFirst)->$($hs.probeFinal) (r0=$hR0end r1=$hR1end)  join $($js.probeFirst)->$($js.probeFinal) (r0=$jR0end r1=$jR1end)  conserve host=$consH join=$consJ agree=$probeAgree"
     Write-Host "  TRADE-PEER wpn   totals: host $($hs.wpnFirst)->$($hs.wpnFinal) (r0=$($hs.wpnR0) r1=$($hs.wpnR1))  join $($js.wpnFirst)->$($js.wpnFinal) (r0=$($js.wpnR0) r1=$($js.wpnR1))"
     Write-Host "  TRADE-PEER TAKE : landed=$takeLanded removalPropagated=$takePropagated noDupe=$takeNoDupe => $takeSig"
@@ -510,15 +532,17 @@ function Test-TradePeer {
                 $moves.ContainsKey("GIVE") -and $moves["GIVE"].n -ge 1 -and `
                 $moves.ContainsKey("WTAKE") -and $moves["WTAKE"].n -ge 1 -and `
                 $seedH -and $seedJ
-    $channel = ($sends -ge 3) -and ($applies -ge 3)
+    $channel = ($sends -ge 3) -and ($applies -ge 3) -and $ackOk
     $ok = $executed -and $channel -and $takeOk -and $giveOk -and $wpnOk -and `
           $consH -and $consJ -and $probeAgree
     $v = if ($ok) { "PASS" } else { "FAIL" }
-    Write-Host "  TRADE-PEER $v - executed=$executed channel=$channel take=$takeOk give=$giveOk wpn=$wpnOk conserve=$($consH -and $consJ) agree=$probeAgree"
+    Write-Host "  TRADE-PEER $v - executed=$executed channel=$channel (ack=$ackOk) take=$takeOk give=$giveOk wpn=$wpnOk conserve=$($consH -and $consJ) agree=$probeAgree"
     return (Add-GateResult -Name "trade_peer" -Status $v -Metrics @{
         hostProbe = "$($hs.probeFirst)->$($hs.probeFinal)"; joinProbe = "$($js.probeFirst)->$($js.probeFinal)"
         hostWpn = "$($hs.wpnFirst)->$($hs.wpnFinal)"; joinWpn = "$($js.wpnFirst)->$($js.wpnFinal)"
-        sends = $sends; applies = $applies
+        sends = $sends; applies = $applies; acked = $ackIds.Count
+        ackReject = $rejects; ackPartial = $partials; ackMissing = $ackMissing
+        ackSlowestMs = $maxWait
         takeSig = $takeSig; giveSig = $giveSig; wpnSig = $wpnSig })
 }
 

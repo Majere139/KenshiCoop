@@ -78,6 +78,10 @@ $script:CoopDiagEnvKeys = @(
     # a block. The real window is one frame wide (the publish sweep clears dead proxies
     # every tick), so it cannot be reached by scheduling a scenario into it.
     'KENSHICOOP_WI_TEST_STALE'
+    # --- presence authority (Config.cpp) ----------------------------------------
+    # Off everywhere except split_far2. Every other scenario runs with it clear,
+    # which is what makes the tier a fail-open proof rather than a co-test.
+    'KENSHICOOP_CELL_AUTH'
 )
 
 function Get-CoopDiagEnvKeys {

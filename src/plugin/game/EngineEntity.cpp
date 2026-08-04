@@ -706,6 +706,12 @@ void setPeerCamHint(bool valid, float x, float y, float z) {
     if (valid) { s_peerCam[0] = x; s_peerCam[1] = y; s_peerCam[2] = z; }
 }
 
+bool peerCamAnchor(float out[3]) {
+    if (!s_peerCamValid || !out) return false;
+    out[0] = s_peerCam[0]; out[1] = s_peerCam[1]; out[2] = s_peerCam[2];
+    return true;
+}
+
 // DUAL-INTEREST centers (step 5): one interest sphere per squad TAB leader, up
 // to two. Both clients load the same save, so the shared playerCharacters list
 // (and its tab/container partition) is identical on each machine - the first

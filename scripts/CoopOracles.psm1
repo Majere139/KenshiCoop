@@ -85,6 +85,14 @@ function Get-ScenarioManifest {
     return Import-PowerShellDataFile -Path $Path
 }
 
+# Gates Invoke-Oracles evaluates ITSELF, before manifest dispatch, because they
+# read run artifacts (the archived engine log) rather than the two client logs
+# that Invoke-OneOracle is handed. A scenario may still name one in its Gating
+# list to be judged on it - the dispatch is skipped, the result already stands.
+# Exported so the contract check counts these as real oracle ids instead of
+# reporting a manifest that names one as a dangling reference.
+function Get-PreRunGates { return @("engine_integrity") }
+
 # Run ONE named oracle. Central dispatch keyed by the oracle ids used in the
 # manifest's Gating/Advisory lists.
 function Invoke-OneOracle {
@@ -214,7 +222,9 @@ function Invoke-OneOracle {
         "follow_travel" { return (Test-FollowTravel    -HostFile $HostLog -JoinFile $JoinLog) }
         "travel_parity" { return (Test-TravelParity    -HostFile $HostLog -JoinFile $JoinLog) }
         "split_far"     { return (Test-SplitFar        -HostFile $HostLog -JoinFile $JoinLog) }
+        "split_far2"    { return (Test-SplitFar2       -HostFile $HostLog -JoinFile $JoinLog) }
         "world_parity"  { return (Test-WorldParity     -HostFile $HostLog -JoinFile $JoinLog) }
+        "cell_probe"    { return (Test-CellProbe       -HostFile $HostLog -JoinFile $JoinLog) }
         "camp_approach" { return (Test-CampApproach    -HostFile $HostLog -JoinFile $JoinLog) }
         "mint_dist"     { return (Test-MintDistance    -JoinFile $JoinLog) }
         "anti_zombie"   { return (Test-AntiZombie      -HostFile $HostLog -JoinFile $JoinLog) }
@@ -313,10 +323,7 @@ function Invoke-RunAnalysis {
                     }
                 }
             }
-            # Gates already evaluated above (they read run artifacts rather than the
-            # two client logs, so Invoke-OneOracle cannot dispatch them). A scenario
-            # may still LIST one to gate on it; skip the re-dispatch, keep the result.
-            $preRun = @("engine_integrity")
+            $preRun = Get-PreRunGates
             foreach ($id in ($gating + $advisory)) {
                 if ($preRun -contains $id) { continue }
                 [void](Invoke-OneOracle -Id $id -HostLog $HostLog -JoinLog $JoinLog `
@@ -390,6 +397,7 @@ function Invoke-RunAnalysis {
 
 Export-ModuleMember -Function @(
     "Reset-GateResults", "Add-GateResult", "Get-GateResults", "Merge-Status",
+    "Get-PreRunGates",
     "Get-LogClockOffsetMs", "Get-ClockSyncStats", "Convert-StampToMs",
     "Get-ScenarioLines", "Get-ScenarioSeries", "Get-MarkerTimeMs",
     "Test-LogHealth", "Test-EngineIntegrity", "Test-NoCheckFail", "Test-ScenarioResultPass", "Test-ClockSync",
@@ -428,8 +436,8 @@ Export-ModuleMember -Function @(
     "Test-SnapRate", "Test-SuppressChurn", "Test-RestFlap",
     "Test-ExistenceParity",
     "Get-WnpcRows", "Get-WorldRows", "Group-WnpcSamples", "Test-FollowTravel", "Test-TravelParity",
-    "Test-SplitFar",
-    "Test-WorldParity",
+    "Test-SplitFar", "Test-SplitFar2",
+    "Test-WorldParity", "Test-CellProbe",
     "Test-CampApproach",
     "Test-MintDistance", "Test-AntiZombie", "Test-Lifecycle",
     "Get-PanelConnects", "Get-PanelIntents", "Test-PanelConfig",

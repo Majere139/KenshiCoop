@@ -1019,9 +1019,265 @@ private:
 };
 const float CampApproachScenario::HOP = 2800.0f;
 
+// split_far2 - the scenario presence authority exists for.
+//
+// split_far establishes the CONDITION (two squads held apart, each in a
+// populated place) and measures whether the two clients agree about what is
+// there. It cannot say anything about WHO SHOULD AUTHOR a region, because
+// under fixed host authority there is only ever one answer. This one is built
+// around the two claims the presence-authority design makes:
+//
+//   1. Each client authors the cell it is standing in, and BOTH clients
+//      resolve the same owner for the same cell. The scenario cannot read
+//      authorityFor() - scenarios have no handle on the Replicator - so it
+//      logs its own leader's cell and lets the oracle join that against the
+//      `[cell] MAP` dumps in the two logs. Agreement is the assertion.
+//   2. The peer looking at a region we author costs no visible pop. That is
+//      the reported symptom in its purest form ("NPCs disappear as I get
+//      close, then get replaced by the host's"), and `[attn] attach` already
+//      counts exactly it: bodies hidden/culled/minted in the window attention
+//      arrived.
+//
+// APPROACH, not teleport. The baked fixture puts each squad in its town, and
+// walking between the two at Kenshi's locomotion speed would take ~9 minutes -
+// longer than any harness window. So each side PARKS its own tab leader
+// APPROACH_D out from where the fixture placed it and WALKS it back in. The
+// approach is the part that matters: it is when zones stream, when the census
+// first covers a region, and when the attach measurement has something to say.
+// A run that teleported into position would skip the transient under test.
+//
+// Then the same phased-camera design split_far uses, for the same reason -
+// pointing both cameras at ONE squad is the only configuration in which "these
+// two clients disagree about what is here" has a single explanation.
+//
+//   walk       each -> own      approach + claim settling (dwell is 3 s)
+//   own        each -> own      steady state, disjoint attention
+//   both_join  both -> join tab the HOST attends a cell the JOIN authors
+//   both_host  both -> host tab the JOIN attends a cell the HOST authors
+//   back       each -> own      does the peer's population SURVIVE us leaving
+//
+// Requires KENSHICOOP_CELL_AUTH=1 (manifest DiagEnv). With it off the run
+// still completes and still logs, and the oracle reports the flag state, so a
+// misconfigured run reads as inconclusive rather than as a pass.
+class SplitFar2Scenario : public TimedScenario {
+public:
+    SplitFar2Scenario()
+        : TimedScenario("split_far2", 1000), recvCount_(0),
+          haveAnchor_(false), camMs_(0), camPhase_(0xFFFFFFFFu),
+          arrived_(false),
+          hx_(0), hy_(0), hz_(0), jx_(0), jy_(0), jz_(0),
+          tx_(0), ty_(0), tz_(0) {}
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        int h = tabLeaderIdx(sq, n, 0);   // host-owned tab
+        int j = tabLeaderIdx(sq, n, 1);   // join-owned tab
+        float sep = 0.0f;
+        if (h >= 0 && j >= 0) {
+            haveAnchor_ = true;
+            hx_ = sq[h].x; hy_ = sq[h].y; hz_ = sq[h].z;
+            jx_ = sq[j].x; jy_ = sq[j].y; jz_ = sq[j].z;
+            float dx = jx_ - hx_, dz = jz_ - hz_;
+            sep = (float)sqrt((double)(dx * dx + dz * dz));
+            // Our own town centre is the walk TARGET; the start-out point is
+            // APPROACH_D beyond it, directly AWAY from the peer. Outward so
+            // the approach never shrinks the separation the scenario depends
+            // on, and so the corridor walked is genuinely un-streamed ground
+            // rather than the strip between the two squads.
+            tx_ = ctx.isHost ? hx_ : jx_;
+            ty_ = ctx.isHost ? hy_ : jy_;
+            tz_ = ctx.isHost ? hz_ : jz_;
+            float ox = ctx.isHost ? (hx_ - jx_) : (jx_ - hx_);
+            float oz = ctx.isHost ? (hz_ - jz_) : (jz_ - hz_);
+            float m = (float)sqrt((double)(ox * ox + oz * oz));
+            if (m > 1.0f) { ox /= m; oz /= m; } else { ox = 1.0f; oz = 0.0f; }
+            // Park the WHOLE owned tab, not just its leader: a squad left
+            // behind would keep the region attended and there would be no
+            // approach to measure.
+            for (unsigned int i = 0; i < n; ++i) {
+                if ((int)tabRankOf(sq, n, i) != (ctx.isHost ? 0 : 1)) continue;
+                Character* c = engine::resolve(sq[i]);
+                if (!c) continue;
+                float sx = sq[i].x + ox * APPROACH_D;
+                float sz = sq[i].z + oz * APPROACH_D;
+                engine::park(c, sx, sq[i].y, sz, 0.0f);
+            }
+        }
+        int cx = 0, cz = 0;
+        int haveCell = (haveAnchor_ && engine::cellAt(ctx.gw, tx_, tz_, &cx, &cz)) ? 1 : 0;
+        char b[256];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO SPLITFAR2 start side=%s have=%d sep=%.0f "
+                  "town=%.0f,%.0f,%.0f cell=%d(%d,%d) approach=%.0f walkMs=%lu "
+                  "phaseMs=%lu",
+                  ctx.isHost ? "host" : "join", haveAnchor_ ? 1 : 0, sep,
+                  tx_, ty_, tz_, haveCell, cx, cz, APPROACH_D,
+                  (unsigned long)WALK_MS, (unsigned long)PHASE_MS);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (!haveAnchor_)
+            coop::logLine("SCENARIO SPLITFAR2 needs a 2-tab save (rank-0/rank-1 member missing)");
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        unsigned long dur = ctx.isHost ? HOST_DURATION_MS : JOIN_DURATION_MS;
+        if (!haveAnchor_) {
+            if (ctx.elapsedMs >= dur) { passed_ = false; return true; }
+            return false;
+        }
+
+        if (evidenceDue(ctx.elapsedMs)) {
+            EntityState sq[MAX_SQUAD];
+            unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+            int h = tabLeaderIdx(sq, n, 0);
+            int j = tabLeaderIdx(sq, n, 1);
+            unsigned int ph = phaseOf(ctx.elapsedMs);
+
+            // ---- camera ------------------------------------------------------
+            int tgt;
+            if      (ph == 2) tgt = j;
+            else if (ph == 3) tgt = h;
+            else              tgt = ctx.isHost ? h : j;
+            if (tgt >= 0 && (camMs_ == 0 || ph != camPhase_ ||
+                             (ctx.elapsedMs - camMs_) >= CAM_REFOCUS_MS)) {
+                if (ph != camPhase_) {
+                    char pb[160];
+                    _snprintf(pb, sizeof(pb) - 1,
+                              "SCENARIO SPLITFAR2 phase side=%s phase=%s watching=%s",
+                              ctx.isHost ? "host" : "join", phaseName(ph),
+                              (tgt == h) ? "host" : "join");
+                    pb[sizeof(pb) - 1] = '\0'; coop::logLine(pb);
+                }
+                camMs_ = ctx.elapsedMs; camPhase_ = ph;
+                Character* tc = engine::resolve(sq[tgt]);
+                if (tc) engine::cameraFocusOn(ctx.gw, tc);
+            }
+
+            // ---- locomotion: approach during walk, hold after ----------------
+            int own = ctx.isHost ? h : j;
+            if (own >= 0) {
+                Character* oc = engine::resolve(sq[own]);
+                float dx = sq[own].x - tx_, dz = sq[own].z - tz_;
+                float d = (float)sqrt((double)(dx * dx + dz * dz));
+                if (oc) {
+                    if (d > ARRIVE_R) {
+                        engine::orderMoveTo(oc, tx_, ty_, tz_);
+                    } else {
+                        if (!arrived_) {
+                            arrived_ = true;
+                            char ab[160];
+                            _snprintf(ab, sizeof(ab) - 1,
+                                      "SCENARIO SPLITFAR2 arrived side=%s atMs=%lu d=%.0f",
+                                      ctx.isHost ? "host" : "join",
+                                      ctx.elapsedMs, d);
+                            ab[sizeof(ab) - 1] = '\0'; coop::logLine(ab);
+                        }
+                        // Keep the body a live subject rather than a statue,
+                        // the travel_parity precedent - but on a short leg
+                        // that never leaves the town it just walked into.
+                        bool legB = ((ctx.elapsedMs / 4000) % 2) != 0;
+                        engine::orderMoveTo(oc, tx_ + (legB ? IDLE_LEG : 0.0f),
+                                            ty_, tz_);
+                    }
+                }
+            }
+
+            if (ctx.isHost) {
+                if (h >= 0) logScenarioEntity("MEMBER", sq[h]);
+                if (j >= 0) { logScenarioEntity("RECV", sq[j]); ++recvCount_; }
+            } else {
+                if (j >= 0) logScenarioEntity("MEMBER", sq[j]);
+                if (h >= 0) { logScenarioEntity("RECV", sq[h]); ++recvCount_; }
+            }
+
+            // ---- the measurement row -----------------------------------------
+            // Per side, per sample: where each tab is, which CELL it is in,
+            // how many bodies WE can see around each, and whether our engine
+            // has the ground loaded there. The oracle pairs host and join rows
+            // by phase and asks whether the two views of the same region agree
+            // - and joins them against `[cell] MAP` to check that they also
+            // agree about who authors it.
+            if (h >= 0 && j >= 0) {
+                float dx = sq[j].x - sq[h].x, dz = sq[j].z - sq[h].z;
+                float sep = (float)sqrt((double)(dx * dx + dz * dz));
+                int hcx = 0, hcz = 0, jcx = 0, jcz = 0;
+                int hc = engine::cellAt(ctx.gw, sq[h].x, sq[h].z, &hcx, &hcz) ? 1 : 0;
+                int jc = engine::cellAt(ctx.gw, sq[j].x, sq[j].z, &jcx, &jcz) ? 1 : 0;
+                unsigned int popH = engine::countNpcsNear(ctx.gw, sq[h].x, sq[h].y,
+                                                          sq[h].z, PROBE_R);
+                unsigned int popJ = engine::countNpcsNear(ctx.gw, sq[j].x, sq[j].y,
+                                                          sq[j].z, PROBE_R);
+                int zH = engine::isZoneLoadedAt(ctx.gw, sq[h].x, sq[h].y, sq[h].z) ? 1 : 0;
+                int zJ = engine::isZoneLoadedAt(ctx.gw, sq[j].x, sq[j].y, sq[j].z) ? 1 : 0;
+                char b[288];
+                _snprintf(b, sizeof(b) - 1,
+                          "SCENARIO SPLITFAR2 side=%s phase=%s sep=%.0f "
+                          "hostCell=%d(%d,%d) joinCell=%d(%d,%d) "
+                          "popHost=%u popJoin=%u zHost=%d zJoin=%d arrived=%d",
+                          ctx.isHost ? "host" : "join", phaseName(ph), sep,
+                          hc, hcx, hcz, jc, jcx, jcz, popH, popJ, zH, zJ,
+                          arrived_ ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+
+        if (ctx.elapsedMs >= dur) {
+            // As split_far: the scenario passes when it PRODUCED the evidence.
+            // Whether authority followed presence is a judgement over the rows
+            // and belongs to the oracle.
+            passed_ = haveAnchor_ && recvCount_ >= 1;
+            return true;
+        }
+        return false;
+    }
+
+private:
+    // Phase 0 is the approach; 1..4 are the camera phases. Both sides derive
+    // it from the same armed clock, so the swaps happen together.
+    static unsigned int phaseOf(unsigned long ms) {
+        if (ms < WALK_MS) return 0;
+        unsigned int p = 1 + (unsigned int)((ms - WALK_MS) / PHASE_MS);
+        return (p > 4) ? 4 : p;
+    }
+    static const char* phaseName(unsigned int p) {
+        return (p == 0) ? "walk"      : (p == 1) ? "own"
+             : (p == 2) ? "both_join" : (p == 3) ? "both_host" : "back";
+    }
+
+    static const unsigned long WALK_MS          = 60000;  // approach window
+    static const unsigned long PHASE_MS         = 40000;  // per camera phase
+    static const unsigned long JOIN_DURATION_MS = 220000; // walk + 4 phases
+    static const unsigned long HOST_DURATION_MS = 230000; // outlive the join
+    static const unsigned long CAM_REFOCUS_MS   = 5000;
+    static const unsigned int  MAX_SQUAD        = 32;
+    static const float         APPROACH_D;  // start-out distance from the town
+    static const float         ARRIVE_R;    // "we are in the town"
+    static const float         IDLE_LEG;    // post-arrival shuffle
+    static const float         PROBE_R;     // population probe sphere
+
+    unsigned int  recvCount_;
+    bool          haveAnchor_;
+    unsigned long camMs_;
+    unsigned int  camPhase_;
+    bool          arrived_;
+    float         hx_, hy_, hz_;   // host tab, as the fixture baked it
+    float         jx_, jy_, jz_;   // join tab, as the fixture baked it
+    float         tx_, ty_, tz_;   // OUR town centre = the walk target
+};
+// 600 u: far enough that the destination is outside the ~200 u stream bubble
+// and well outside render range, so the walk really does stream the town in,
+// but reachable inside WALK_MS at Kenshi's locomotion speed.
+const float SplitFar2Scenario::APPROACH_D = 600.0f;
+const float SplitFar2Scenario::ARRIVE_R   = 60.0f;
+const float SplitFar2Scenario::IDLE_LEG   = 15.0f;
+// Matches split_far: what governs whether the two clients can disagree about a
+// body is the 2000 u census reach, so the probe measures inside that shell.
+const float SplitFar2Scenario::PROBE_R    = 1800.0f;
+
 } // namespace
 
 Scenario* makeMovementScenario(const std::string& name) {
+    if (name == "split_far2")   return new SplitFar2Scenario();
     if (name == "leader_move")  return new LeaderMoveScenario();
     if (name == "fast_march")   return new FastMarchScenario();
     if (name == "coop_presence") return new CoopPresenceScenario();

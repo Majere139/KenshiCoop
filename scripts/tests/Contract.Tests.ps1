@@ -51,13 +51,17 @@ $manifest = Get-ScenarioManifest
 $scenarios = $manifest.Scenarios
 
 # The oracle registry = the dispatch case ids in CoopOracles.psm1's
-# Invoke-OneOracle switch (Phase 0 stand-in for the Phase 2 registry hashtable).
+# Invoke-OneOracle switch (Phase 0 stand-in for the Phase 2 registry hashtable),
+# plus the pre-run gates, which are resolvable ids that simply resolve somewhere
+# other than the switch. Taken from the module rather than restated here, so a
+# gate cannot be dispatchable at run time and dangling at check time.
 function Get-OracleRegistry {
     $psm = Join-Path $scriptsRoot "CoopOracles.psm1"
     $ids = New-Object System.Collections.Generic.HashSet[string]
     foreach ($m in (Select-String -Path $psm -Pattern '^\s*"([a-z0-9_]+)"\s*\{\s*return')) {
         [void]$ids.Add($m.Matches[0].Groups[1].Value)
     }
+    foreach ($g in (Get-PreRunGates)) { [void]$ids.Add($g) }
     return $ids
 }
 

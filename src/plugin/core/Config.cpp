@@ -308,6 +308,8 @@ void loadConfig(Config& c) {
         std::string ar = envOr("KENSHICOOP_ATTENTION_RADIUS", "");
         c.attentionRadius = ar.empty() ? 1000.0f : (float)std::atof(ar.c_str());
         if (c.attentionRadius < 0.0f) c.attentionRadius = 0.0f;
+        // Presence authority (protocol 49). Opt-in until it has run the tier.
+        c.cellAuth = envOr("KENSHICOOP_CELL_AUTH", "0") != "0";
         // Census-band AI freeze: quiesce a diverging census-band body's local
         // AI so it can't flee/aggro the join's guards. DEFAULT ON; the A/B
         // escape hatch restores the position-park-only behavior.
@@ -398,10 +400,10 @@ std::string describeConfig(const Config& c) {
     char b[192];
     _snprintf(b, sizeof(b) - 1,
               " censusR=%.0f mintR=%.0f park=%.0f snap=%.1f/%.2fs armMs=%lu"
-              " attnR=%.0f",
+              " attnR=%.0f cellAuth=%d",
               c.censusRadius, c.spawnMintRadius, c.censusParkDist,
               c.snapDist, c.snapSeconds, c.scenarioArmTimeoutMs,
-              c.attentionRadius);
+              c.attentionRadius, c.cellAuth ? 1 : 0);
     b[sizeof(b) - 1] = '\0';
     s += b;
     return s;

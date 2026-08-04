@@ -233,6 +233,8 @@ void NetLink::queueStealth(const StealthPacket& pkt) { pushLocked(outCs_, outSte
 
 void NetLink::queueCamHint(const CamHintPacket& pkt) { pushLocked(outCs_, outCamHint_, pkt); }
 
+void NetLink::queueCellClaim(const CellClaimPacket& pkt) { pushLocked(outCs_, outCellClaim_, pkt); }
+
 void NetLink::queueSpawnReq(const SpawnReqPacket& pkt) { pushLocked(outCs_, outSpawnReq_, pkt); }
 
 void NetLink::queueSpawnInfo(const SpawnInfoPacket& pkt) { pushLocked(outCs_, outSpawnInfo_, pkt); }
@@ -240,6 +242,8 @@ void NetLink::queueSpawnInfo(const SpawnInfoPacket& pkt) { pushLocked(outCs_, ou
 void NetLink::queueWorldPickup(const WorldPickupPacket& pkt) { pushLocked(outCs_, outWorldPickups_, pkt); }
 
 void NetLink::queueInvXfer(const InvXferPacket& pkt) { pushLocked(outCs_, outInvXfers_, pkt); }
+
+void NetLink::queueInvXferAck(const InvXferAckPacket& pkt) { pushLocked(outCs_, outInvXferAcks_, pkt); }
 
 void NetLink::queueSaveReq(const SaveReqPacket& pkt) { pushLocked(outCs_, outSaveReq_, pkt); }
 
@@ -658,6 +662,15 @@ void NetLink::threadLoop() {
                             && inbound_) {
                             inbound_->pushInvXfer(ixp.ownerId, ixp);
                         }
+                    } else if (type == PKT_INV_XFER_ACK) {
+                        // Reliable transfer verdict (protocol 50). Must be as
+                        // reliable as the intent it answers: a lost ack leaves
+                        // the author back on the wall-clock guess it replaces.
+                        InvXferAckPacket iap;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &iap)
+                            && inbound_) {
+                            inbound_->pushInvXferAck(iap.ownerId, iap);
+                        }
                     } else if (type == PKT_MEDICAL) {
                         // Reliable owner-authoritative vitals snapshot (phase 2).
                         // Delivered immediately like the other reliable packets.
@@ -886,6 +899,15 @@ void NetLink::threadLoop() {
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &chp)
                             && inbound_) {
                             inbound_->pushCamHint(chp.ownerId, chp);
+                        }
+                    } else if (type == PKT_CELL_CLAIM) {
+                        // Cell claim (protocol 49): presence-based authorship.
+                        // Both directions - each side claims the cells its own
+                        // tabs are standing in.
+                        CellClaimPacket ccp;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &ccp)
+                            && inbound_) {
+                            inbound_->pushCellClaim(ccp.ownerId, ccp);
                         }
                     } else if (type == PKT_TIME_PING) {
                         // Wall-clock sync probe: echo immediately (host side). Answered
@@ -1204,6 +1226,23 @@ void NetLink::threadLoop() {
             }
         }
 
+        // Transfer VERDICTS (protocol 50), same channel as the intents.
+        std::vector<InvXferAckPacket> xferAcks;
+        EnterCriticalSection(&outCs_);
+        xferAcks.swap(outInvXferAcks_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < xferAcks.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&xferAcks[i], sizeof(InvXferAckPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
         // Drain + send any queued medical snapshots + treatment deltas on
         // CH_RELIABLE (phase 2). Fixed-size PODs like events; change-gated by the
         // Replicator so steady state is silent.
@@ -1509,6 +1548,26 @@ void NetLink::threadLoop() {
                 enet_host_broadcast(enetHost_, CH_UNRELIABLE, out);
             } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
                 enet_peer_send(serverPeer_, CH_UNRELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Cell claims ride CH_RELIABLE (protocol 49, ~1 Hz): losing one leaves
+        // the cell reading as host-authored until the next re-assert, and both
+        // sides authoring the same bodies is the failure this channel exists to
+        // prevent.
+        std::vector<CellClaimPacket> cellClaims;
+        EnterCriticalSection(&outCs_);
+        cellClaims.swap(outCellClaim_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < cellClaims.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&cellClaims[i], sizeof(CellClaimPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
             } else {
                 enet_packet_destroy(out);
             }

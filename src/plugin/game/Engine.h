@@ -201,6 +201,10 @@ bool cameraFocusOn(GameWorld* gw, Character* c);
 // hint stale). Main-thread only.
 void setLocalCamAnchor(bool valid, float x, float y, float z);
 void setPeerCamHint(bool valid, float x, float y, float z);
+// Read the peer's camera hint back out, for predicates that must reason about
+// where THEY are looking rather than about the merged anchor set. False when no
+// fresh hint has arrived.
+bool peerCamAnchor(float out[3]);
 // KENSHICOOP_CAM_INTEREST master enable: when off, interestCenters ignores
 // the camera anchors (squad-tab leaders only - the pre-43 behavior).
 void setCamInterest(bool on);
@@ -304,6 +308,12 @@ void charName(Character* c, char* out, unsigned int cap);
 void* markerCreate(Character* c, const char* text, int colorId);
 bool  markerUpdate(void* label, const char* text, int colorId);
 void  markerDestroy(void* label);
+// True while the GUI still owns this label. A ScreenLabel belongs to
+// ForgottenGUI, which destroys labels on its own schedule and tells nobody, so
+// every handle we cache can die under us; markerUpdate/markerDestroy consult
+// this before dereferencing and callers holding a handle across ticks should
+// too. Cheap (a pointer scan of the GUI's own label registry).
+bool  markerAlive(void* label);
 
 // ---- In-game co-op session panel ---------------------------------------------
 // Moved to EngineUi.h (Phase 5a domain split): CoopPanelState, CoopConnectFn,
@@ -362,6 +372,38 @@ Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
 // distance. resolveZoneQuery() is called from engine::resolve().
 bool isZoneLoadedAt(GameWorld* gw, float x, float y, float z);
 void resolveZoneQuery();
+
+// One position mapped through EVERY sector function ZoneManager exposes, plus
+// the rect of the zone containing it. Measurement instrument, not an authority
+// key: the engine has three separate position->coord mappings at (presumably)
+// three resolutions, and which one the .zone filenames - and therefore a
+// cross-client cell identity - correspond to is not knowable from the headers.
+//
+// A cell is only useful as an authority key if it is COARSE enough that a town
+// sits in one (otherwise ownership changes hands mid-settlement) and FINE enough
+// that two separated squads sit in different ones (otherwise everything collapses
+// to a single cell and authority never moves). Both are answered by comparing
+// coords across positions, which is what the cell_probe scenario does. The have*
+// flags distinguish "mapping returned 0,0" from "mapping never resolved".
+struct CellProbe {
+    int mapX, mapY;         // ZoneManager::getMapSector(x,z) - the zone.X.Y coord
+    int subX, subY;         // ZoneManager::getSubMapSector(x,z)
+    int resX, resY;         // ZoneManager::getZoneMapFromResolutionCoord(x,z)
+    int haveMap, haveSub, haveRes;
+};
+
+// SEH-guarded (game/ZoneQuery.cpp, same quarantined TU as isZoneLoadedAt).
+// False only on a fault or a missing ZoneManager; a mapping that failed to
+// resolve leaves its have* flag at 0 and still returns true.
+bool cellProbe(GameWorld* gw, float x, float y, float z, CellProbe* out);
+
+// SEH-guarded: the engine's own sector coordinate for a world position - the
+// ZoneManager::getMapSector mapping, which cell_probe measured (2026-08-03) to be
+// the coordinate the save's zone.X.Y files are named after. That is what makes it
+// usable as a cross-client cell identity: it is the engine's own partition of a
+// SHARED save, so both clients compute the same coord for the same point without
+// exchanging anything. Y is not an input - the grid is 2D, x/z only.
+bool cellAt(GameWorld* gw, float x, float z, int* outCx, int* outCz);
 
 // SEH-guarded (Phase 1 spawn parity): destroy a previously-minted proxy body
 // (GameWorld::destroy, true destruction). Used when the proxy's original hand

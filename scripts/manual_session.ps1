@@ -115,6 +115,14 @@ param(
     # in the host census. Makes pops and ghosts self-explaining on screen
     # (pair with -Save zoom for long-run wide-camera inspection).
     [switch]$DebugMarkers,
+    # Presence authority (KENSHICOOP_CELL_AUTH=1 on both clients, protocol 49):
+    # each side claims the 4608 u zone cells its own squad tabs are standing in
+    # and AUTHORS the NPC census there, instead of the host authoring everywhere.
+    # Split the pair across two towns and the join keeps its own population
+    # instead of having it culled and re-minted from the host's stream. OFF by
+    # default (fail-open to host authority); this is the switch that arms it.
+    # Pair with -DebugMarkers to see the handover on screen.
+    [switch]$CellAuth,
     # Phase 6 shackle diagnostic (KENSHICOOP_DEBUG_SHACKLE=1 on both clients):
     # emits the ~1 Hz [shackledbg] per-body chained/lock trace so a manual camp
     # session captures the exact tick a peer's driven copy diverges from the
@@ -328,6 +336,10 @@ function Set-CoopEnv {
     $env:KENSHICOOP_INV_DUMP     = if ($InvDump) { "1" } else { "" }
     # Authority markers render on the DRIVEN side; harmless on both, so set both.
     $env:KENSHICOOP_DEBUG_MARKERS = if ($DebugMarkers) { "1" } else { "" }
+    # Presence authority MUST match on both clients: each side publishes claims and
+    # reads the peer's, so one side alone would author its cells while the other
+    # went on enforcing host authority over the same bodies.
+    $env:KENSHICOOP_CELL_AUTH    = if ($CellAuth) { "1" } else { "" }
     # Phase 6 shackle trace on both clients (see -DebugShackle).
     $env:KENSHICOOP_DEBUG_SHACKLE = if ($DebugShackle) { "1" } else { "" }
     # Jail long-play probes on BOTH clients (spike 58, see -JailProbe): STATE/SNAP

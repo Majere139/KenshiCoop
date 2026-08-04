@@ -42,6 +42,10 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
     // newly-seen containers APPEND - a mid-session move/createSquad can never
     // reshuffle existing ranks and silently flip whole-tab ownership.
     latchTabs(ctnrs);
+    // ...and decide who OWNS each tab. The latch alone was not enough: an
+    // appended tab's rank is outside ownRanks_ on both clients, so it belonged
+    // to neither of them until this ran.
+    decideTabs(raw, nSquad, ctnrs);
     ownHands_.clear();
     // Full squad roster (own + peer) for the trade veto's owner classifier: every
     // captured member, before the ownership partition below decides which we own.
@@ -51,9 +55,12 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
     for (unsigned int i = 0; i < nSquad && n < MAX_PUBLISH; ++i) {
         std::pair<u32, u32> key(raw[i].hContainer, raw[i].hContainerSerial);
         unsigned int rank = tabRankFor(key, ctnrs);
-        // Empty ownRanks_ (never configured) is a safety fallback to the first tab,
-        // so a missing setOwnRanks never makes us stream every tab or nothing.
-        bool owned = ownRanks_.empty() ? (rank == 0u) : (ownRanks_.count(rank) != 0);
+        // The per-tab verdict (decideTabs). For the save's own tabs this is the
+        // historical rank rule; for a tab created mid-session it is the side that
+        // authored it, or the host. Empty ownRanks_ (never configured) still falls
+        // back to the first tab, so a missing setOwnRanks never makes us stream
+        // every tab or nothing.
+        bool owned = ownsTab(key, rank);
         // Ownership pins (protocols 23 + 35): a RECRUIT belongs to its
         // RECRUITER and a MOVED member to its MOVER regardless of which local
         // tab rank the engine parked it in (recruit_probe: a join recruit
@@ -212,8 +219,21 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
     }
     // Host also streams nearby world NPCs (host-authoritative world). The join leaves
     // streamNpcs_ off, so on the join this publishes ONLY its owned squad subset.
-    if (streamNpcs_ && n < MAX_PUBLISH)
-        n += engine::captureNpcs(gw, buf + n, MAX_PUBLISH - n);
+    // Under presence authority BOTH sides stream, so each must keep to the cells
+    // it actually owns or the two of us drive the same bodies.
+    if (streamNpcs_ && n < MAX_PUBLISH) {
+        unsigned int got = engine::captureNpcs(gw, buf + n, MAX_PUBLISH - n);
+        if (cellAuth_) {
+            unsigned int kept = 0;
+            for (unsigned int i = 0; i < got; ++i) {
+                if (!weAuthor(gw, ownerId, buf[n + i].x, buf[n + i].z)) continue;
+                if (kept != i) buf[n + kept] = buf[n + i];
+                ++kept;
+            }
+            got = kept;
+        }
+        n += got;
+    }
     // Phase 2 mid-band tier (host): append a rotating slice of the census-walk
     // NPCs beyond the stream bubble (midBand_, nearest-first, rebuilt at 1 Hz
     // by publishNpcCensus). Quota = |midBand|/10 puts each mid NPC in ~1 of
@@ -717,24 +737,38 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
     }
     static u32   hands[NPC_CENSUS_MAX * 5];
     static float poss[NPC_CENSUS_MAX * 3];
-    // Attention gate: anchors once per publish, then leave DORMANT bodies out
-    // of the packet. A census row is read on the far side as "this exists",
-    // and the ABSENCE of a row as "this does not" - which is a claim the host
-    // has no business making about a place neither player is standing in nor
-    // looking at. Omitting the row is the honest answer there, and it costs
-    // nothing: the join does not suppress dormant bodies either, so nothing
-    // downstream reads the omission as a cull.
+    // Attention gate: anchors once per publish, then leave bodies the PEER is
+    // not attending out of the packet. A census row is read on the far side as
+    // "this exists", and the ABSENCE of a row as "this does not" - a claim
+    // worth making only about a place they are actually looking at.
+    //
+    // The gate used to ask about OUR attention, which is the wrong question and
+    // the destructive one. Our anchor set is zone-vetoed, so a region the peer
+    // was standing in could read dormant here while reading fully attended over
+    // there: we stopped writing rows, and they culled real local bodies against
+    // the silence. That is the mismatch that survived a save reload and cleared
+    // only on reconnect. Note we have already ENUMERATED these bodies, so the
+    // zone veto - "can I see this region" - has been answered by construction.
+    //
+    // No peer anchors at all means we know nothing about them; publish
+    // everything, which is the pre-gate behaviour.
     float rawAnch[12];
     unsigned int nRawAnch = engine::interestAnchors(gw, rawAnch);
-    float attnAnch[12];
-    unsigned int nAttnAnch = attentionAnchors(gw, rawAnch, nRawAnch, attnAnch);
+    float peerAnch[12];
+    unsigned int nPeerAnch = peerAnchors(gw, peerAnch);
     std::set<Key> censusKeys;
     unsigned int m = 0;      // rows that survived the gate
     for (unsigned int i = 0; i < n; ++i) {
         Key k = keyOf(states[i]);
         censusKeys.insert(k);
-        if (!observedAt(k, attnAnch, nAttnAnch, states[i].x, states[i].y,
-                        states[i].z)) continue;
+        if (nPeerAnch > 0 &&
+            !observedByPeer(k, peerAnch, nPeerAnch, states[i].x, states[i].y,
+                            states[i].z)) continue;
+        // Presence authority: a census row is an existence CLAIM, and we only
+        // get to make it about cells we own. Without this the two clients would
+        // each broadcast the whole overlapping walk and each cull the other's
+        // bodies against it.
+        if (cellAuth_ && !weAuthor(gw, ownerId, states[i].x, states[i].z)) continue;
         hands[m * 5 + 0] = states[i].hType;
         hands[m * 5 + 1] = states[i].hContainer;
         hands[m * 5 + 2] = states[i].hContainerSerial;
@@ -771,6 +805,8 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
                 if (best < 0.0f || d < best) best = d;
             }
             if (best < 0.0f || best <= MID_NEAR_EDGE) continue; // near tier
+            // Same ownership rule as the near band: we drive what we author.
+            if (cellAuth_ && !weAuthor(gw, ownerId, states[i].x, states[i].z)) continue;
             MidBandEntry e;
             e.k.t  = states[i].hType;
             e.k.c  = states[i].hContainer;
@@ -855,9 +891,9 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
         char b[320];
         _snprintf(b, sizeof(b) - 1,
                   "[census] sent n=%u radius=%.0f mid=%u anchors=%u%s"
-                  " enum=%u dorm=%u attnR=%.0f",
+                  " enum=%u dorm=%u attnR=%.0f pAnch=%u",
                   m, censusRadius_, (unsigned)midBand_.size(), na, det,
-                  n, nDorm, attentionRadius_);
+                  n, nDorm, attentionRadius_, nPeerAnch);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         // KENSHICOOP_DEBUG_CENSUS=1: dump every census row (hand + name) at the
         // same 10 s cadence, so a join-side cull can be classified against the

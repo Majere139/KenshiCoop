@@ -2,7 +2,7 @@
 // (monolith split from Scenario.cpp, 2026-07-12): spike (the numbered-probe
 // dispatcher), shop_probe/money_sync, vendor_trade, recruit_probe/
 // recruit_sync, squad_probe/squad_sync, faction_probe/faction_sync,
-// time_probe/time_sync, hunger_probe/hunger_sync. Classes are TU-private
+// time_probe/time_sync, hunger_probe/hunger_sync, cell_probe. Classes are TU-private
 // (anonymous namespace); only makeProbeScenario (ScenarioSupport.h) is
 // exported.
 // Must NOT: change any SCENARIO/SPIKE log string (oracle API, resources/CODE_MAP.md).
@@ -1653,8 +1653,284 @@ private:
 
 } // namespace
 
+// ===========================================================================
+// cell_probe - measure the engine's sector grid before anything is built on it.
+//
+// The cell-authority design wants a spatial key both clients compute the same
+// answer for, and ZoneManager exposes THREE position->coord mappings
+// (getMapSector, getSubMapSector, getZoneMapFromResolutionCoord) with nothing in
+// the headers to say which resolution each is, nor which one the zone.X.Y save
+// files correspond to. A guess here is expensive in both directions: too coarse
+// and both squads share one cell so authority never moves; too fine and it
+// changes hands inside a single town.
+//
+// So this measures instead of assuming, and it reads the two facts that decide
+// whether a cell is a usable authority key at all:
+//   - cell SIZE, from getZoneBoundsT's rect around our own position, and the
+//     rect's origin, which is what lets a coord be cross-checked against the
+//     zone.X.Y filenames in the save folder;
+//   - whether a TOWN fits in one cell, from how many distinct cells the NPCs
+//     standing around us occupy (SPAN), and whether the two player squads sit in
+//     DIFFERENT cells, which is the same question from the other end.
+//
+// Read-only: no park, no teleport, no mutation. It reports what the world it was
+// given looks like, so the save it runs on is the experiment - a town save
+// answers the span question, a split save answers the separation question.
+// ===========================================================================
+class CellProbeScenario : public Scenario {
+public:
+    CellProbeScenario()
+        : passed_(false), lastMs_(0), samples_(0), maxSpan_(0), tabs_(0),
+          tabsDistinct_(0), sizeX_(0.0f), sizeZ_(0.0f), swept_(false), bailed_(0) {}
+
+    virtual const char* name() const { return "cell_probe"; }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        engine::CellProbe p;
+        float px = 0.0f, py = 0.0f, pz = 0.0f;
+        bool have = leaderPos(ctx, &px, &py, &pz);
+        bool ok = have && engine::cellProbe(ctx.gw, px, py, pz, &p);
+        char b[288];
+        _snprintf(b, sizeof(b) - 1,
+            "SCENARIO CELL anchor host=%d have=%d ok=%d pos=%.1f,%.1f,%.1f "
+            "map=%d(%d,%d) sub=%d(%d,%d) res=%d(%d,%d)",
+            ctx.isHost ? 1 : 0, have ? 1 : 0, ok ? 1 : 0, px, py, pz,
+            ok ? p.haveMap : 0, ok ? p.mapX : 0, ok ? p.mapY : 0,
+            ok ? p.haveSub : 0, ok ? p.subX : 0, ok ? p.subY : 0,
+            ok ? p.haveRes : 0, ok ? p.resX : 0, ok ? p.resY : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (ctx.elapsedMs - lastMs_ >= SAMPLE_MS || lastMs_ == 0) {
+            lastMs_ = ctx.elapsedMs;
+            sample(ctx);
+        }
+        if (ctx.elapsedMs >= DURATION_MS) {
+            // A measurement passes when it MEASURED. Whether the grid it found is
+            // suitable as an authority key is a judgement about the numbers, and
+            // belongs to the oracle reading them, not to the scenario producing them.
+            passed_ = (samples_ > 0) && (sizeX_ > 0.0f);
+            char b[288];
+            _snprintf(b, sizeof(b) - 1,
+                "SCENARIO CELL verdict role=%s pass=%d samples=%d cellX=%.1f cellZ=%.1f "
+                "maxSpan=%d tabs=%d tabCells=%d",
+                ctx.isHost ? "host" : "join", passed_ ? 1 : 0, samples_,
+                sizeX_, sizeZ_, maxSpan_, tabs_, tabsDistinct_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool passed() const { return passed_; }
+
+private:
+    static const unsigned long SAMPLE_MS   = 2000;
+    static const unsigned long DURATION_MS = 24000;
+    static const float         TOWN_R;      // settlement scale, for the span count
+    static const unsigned int  MAX_SQUAD = 64;
+    static const unsigned int  MAX_NPC   = 128;
+
+    // ---- grid geometry, measured with the mapping itself ---------------------
+    // getZoneBoundsT would hand back a cell's rect in one call, but it returns a
+    // 16-byte class and the first attempt at its hidden-return-pointer convention
+    // came back as junk. Walking getMapSector until the coord changes needs no
+    // convention at all: it only ever reads an int pair out of RAX, which the
+    // zone.X.Y filenames already confirmed is correct. Two consecutive boundaries
+    // give the size; the second one plus its cell index gives the grid origin, and
+    // with both, the coord of any position is predictable - which is the check.
+    bool cellAtV(const ScenarioContext& ctx, bool axisX, float fixed, float v,
+                 int* cx, int* cz) {
+        return axisX ? engine::cellAt(ctx.gw, v, fixed, cx, cz)
+                     : engine::cellAt(ctx.gw, fixed, v, cx, cz);
+    }
+
+    bool findEdge(const ScenarioContext& ctx, bool axisX, float fixed, float start,
+                  float* outEdge) {
+        int c0x = 0, c0z = 0;
+        if (!cellAtV(ctx, axisX, fixed, start, &c0x, &c0z)) return false;
+        const float LIMIT = 60000.0f, STEP = 100.0f;
+        float lo = start, hi = 0.0f;
+        bool bracket = false;
+        for (float d = STEP; d <= LIMIT; d += STEP) {
+            int cx = 0, cz = 0;
+            if (!cellAtV(ctx, axisX, fixed, start + d, &cx, &cz)) return false;
+            if (cx != c0x || cz != c0z) {
+                lo = start + d - STEP; hi = start + d; bracket = true; break;
+            }
+        }
+        if (!bracket) return false;
+        for (int i = 0; i < 24; ++i) {   // ~0.004 u on a 100 u bracket
+            float mid = 0.5f * (lo + hi);
+            int cx = 0, cz = 0;
+            if (!cellAtV(ctx, axisX, fixed, mid, &cx, &cz)) return false;
+            if (cx == c0x && cz == c0z) lo = mid; else hi = mid;
+        }
+        *outEdge = hi;
+        return true;
+    }
+
+    void sweepAxis(const ScenarioContext& ctx, bool axisX, float fixed, float from,
+                   float* outSize) {
+        float e1 = 0.0f, e2 = 0.0f;
+        if (!findEdge(ctx, axisX, fixed, from, &e1)) {
+            char b[144];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO CELL grid axis=%s no-edge within 60000u",
+                      axisX ? "x" : "z");
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            return;
+        }
+        if (!findEdge(ctx, axisX, fixed, e1 + 1.0f, &e2)) return;
+        float size = e2 - e1;
+        int cx = 0, cz = 0;
+        if (!cellAtV(ctx, axisX, fixed, e2 + 1.0f, &cx, &cz)) return;
+        int idx = axisX ? cx : cz;
+        float origin = e2 - (float)idx * size;
+        // Predict our own coord from (origin, size) and compare with the engine's.
+        int selfIdx = (int)floor(((from - origin) / size));
+        int ax = 0, az = 0;
+        cellAtV(ctx, axisX, fixed, from, &ax, &az);
+        int engineIdx = axisX ? ax : az;
+        if (size > 0.0f) *outSize = size;
+        char b[288];
+        _snprintf(b, sizeof(b) - 1,
+            "SCENARIO CELL grid axis=%s size=%.2f edge1=%.2f edge2=%.2f idx=%d "
+            "origin=%.2f predict=%d engine=%d check=%d",
+            axisX ? "x" : "z", size, e1, e2, idx, origin, selfIdx, engineIdx,
+            (selfIdx == engineIdx) ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    bool leaderPos(const ScenarioContext& ctx, float* x, float* y, float* z) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, /*leaderOnly*/ true, sq, MAX_SQUAD);
+        if (n == 0) return false;
+        *x = sq[0].x; *y = sq[0].y; *z = sq[0].z;
+        return true;
+    }
+
+    // A probe that produces nothing must say why: the join's first run reported
+    // samples=0 with no other trace, which is indistinguishable from the scenario
+    // never having ticked. Logged once per distinct reason so a stuck cause is
+    // visible without flooding.
+    void bail(const char* why) {
+        if (bailed_ && strcmp(bailed_, why) == 0) return;
+        bailed_ = why;
+        char b[144];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO CELL bail why=%s", why);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    void sample(const ScenarioContext& ctx) {
+        EntityState sq[MAX_SQUAD];
+        unsigned int nSq = engine::captureSquad(ctx.gw, /*leaderOnly*/ false, sq, MAX_SQUAD);
+        if (nSq == 0) { bail("no-squad"); return; }
+
+        engine::CellProbe self;
+        if (!engine::cellProbe(ctx.gw, sq[0].x, sq[0].y, sq[0].z, &self)) {
+            bail("no-cellprobe"); return;
+        }
+        ++samples_;
+        if (!swept_) {
+            swept_ = true;
+            sweepAxis(ctx, /*axisX*/ true,  sq[0].z, sq[0].x, &sizeX_);
+            sweepAxis(ctx, /*axisX*/ false, sq[0].x, sq[0].z, &sizeZ_);
+        }
+
+        // Per-TAB cells. Both clients hold local copies of every player character,
+        // so this reports where each squad tab is from either side - and one tab per
+        // player means "are the two players in different cells" is answerable here
+        // rather than needing a peer round trip.
+        unsigned int tabC[MAX_TABS][2];   // hand container identity of the tab
+        int          tabCell[MAX_TABS][2];
+        unsigned int nTabs = 0;
+        for (unsigned int i = 0; i < nSq && nTabs < MAX_TABS; ++i) {
+            bool seen = false;
+            for (unsigned int t = 0; t < nTabs; ++t)
+                if (tabC[t][0] == sq[i].hContainer && tabC[t][1] == sq[i].hContainerSerial) {
+                    seen = true; break;
+                }
+            if (seen) continue;
+            engine::CellProbe p;
+            if (!engine::cellProbe(ctx.gw, sq[i].x, sq[i].y, sq[i].z, &p)) continue;
+            tabC[nTabs][0] = sq[i].hContainer;
+            tabC[nTabs][1] = sq[i].hContainerSerial;
+            tabCell[nTabs][0] = p.mapX;
+            tabCell[nTabs][1] = p.mapY;
+            ++nTabs;
+        }
+        unsigned int distinct = 0;
+        for (unsigned int a = 0; a < nTabs; ++a) {
+            bool dup = false;
+            for (unsigned int b2 = 0; b2 < a; ++b2)
+                if (tabCell[a][0] == tabCell[b2][0] && tabCell[a][1] == tabCell[b2][1]) {
+                    dup = true; break;
+                }
+            if (!dup) ++distinct;
+        }
+        tabs_ = (int)nTabs;
+        tabsDistinct_ = (int)distinct;
+
+        // SPAN: how many distinct cells the bodies around us occupy, and how many
+        // of them share OUR cell. A town that fits in one cell reports span=1 with
+        // inside == the whole local population.
+        Character*  chars[MAX_NPC];
+        EntityState states[MAX_NPC];
+        unsigned int nN = engine::listNpcsWide(ctx.gw, TOWN_R, chars, states, MAX_NPC, 0);
+        int cells[MAX_NPC][2];
+        unsigned int nCells = 0, inside = 0;
+        for (unsigned int i = 0; i < nN; ++i) {
+            engine::CellProbe p;
+            if (!engine::cellProbe(ctx.gw, states[i].x, states[i].y, states[i].z, &p)) continue;
+            if (p.mapX == self.mapX && p.mapY == self.mapY) ++inside;
+            bool dup = false;
+            for (unsigned int c = 0; c < nCells; ++c)
+                if (cells[c][0] == p.mapX && cells[c][1] == p.mapY) { dup = true; break; }
+            if (!dup && nCells < MAX_NPC) {
+                cells[nCells][0] = p.mapX; cells[nCells][1] = p.mapY; ++nCells;
+            }
+        }
+        if ((int)nCells > maxSpan_) maxSpan_ = (int)nCells;
+
+        char b[416];
+        _snprintf(b, sizeof(b) - 1,
+            "SCENARIO CELL %s t=%lu pos=%.1f,%.1f,%.1f map=%d,%d sub=%d,%d res=%d,%d "
+            "size=%.1fx%.1f npc=%u span=%u inside=%u tabs=%u tabCells=%u",
+            ctx.isHost ? "HOST" : "JOIN", (unsigned long)ctx.elapsedMs,
+            sq[0].x, sq[0].y, sq[0].z,
+            self.mapX, self.mapY, self.subX, self.subY, self.resX, self.resY,
+            sizeX_, sizeZ_,
+            nN, nCells, inside, nTabs, distinct);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+
+        // Each tab's own cell, so a split run says plainly which cell each player
+        // is standing in rather than leaving it to be inferred from the count.
+        for (unsigned int t = 0; t < nTabs; ++t) {
+            char tb[176];
+            _snprintf(tb, sizeof(tb) - 1,
+                "SCENARIO CELL %s tab=%u,%u cell=%d,%d",
+                ctx.isHost ? "HOST" : "JOIN", tabC[t][0], tabC[t][1],
+                tabCell[t][0], tabCell[t][1]);
+            tb[sizeof(tb) - 1] = '\0'; coop::logLine(tb);
+        }
+    }
+
+    static const unsigned int MAX_TABS = 8;
+    bool  passed_;
+    unsigned long lastMs_;
+    int   samples_;
+    int   maxSpan_;
+    int   tabs_, tabsDistinct_;
+    float sizeX_, sizeZ_;
+    bool  swept_;
+    const char* bailed_;
+};
+const float CellProbeScenario::TOWN_R = 1200.0f;
+
 Scenario* makeProbeScenario(const std::string& name) {
     if (name == "spike")        return new SpikeScenario();
+    if (name == "cell_probe")   return new CellProbeScenario();
     if (name == "shop_probe")   return new ShopProbeScenario(/*probe=*/true);
     if (name == "money_sync")   return new ShopProbeScenario(/*probe=*/false);
     if (name == "vendor_trade") return new VendorTradeScenario();

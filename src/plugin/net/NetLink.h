@@ -92,6 +92,10 @@ public:
     // relocates the real item between its own copies of the two containers.
     void queueInvXfer(const InvXferPacket& pkt);
 
+    // MAIN thread: queue the reliable VERDICT for an intent we just applied
+    // (protocol 50) - how many units actually landed here.
+    void queueInvXferAck(const InvXferAckPacket& pkt);
+
     // MAIN thread: queue a reliable owner-authoritative medical snapshot (phase 2,
     // player-squad only). Change-gated by the caller so the channel stays quiet.
     void queueMedical(const MedicalPacket& pkt);
@@ -138,6 +142,12 @@ public:
     // MAIN thread: queue an UNRELIABLE camera hint (protocol 43, either
     // direction, ~1 Hz). Latest wins; loss just delays the anchor one hint.
     void queueCamHint(const CamHintPacket& pkt);
+
+    // MAIN thread: queue a RELIABLE cell claim (protocol 49, either direction,
+    // ~1 Hz). Reliable because a dropped claim reverts the cell to host
+    // authority until the next re-assert, and that window is a duplicate-
+    // authorship window.
+    void queueCellClaim(const CellClaimPacket& pkt);
 
     // MAIN thread: queue a reliable runtime-spawn query (protocol 21, join ->
     // host). Debounced per hand by the caller.
@@ -259,6 +269,8 @@ private:
     std::vector<WorldPickupPacket> outWorldPickups_;
     // Reliable cross-owner transfer intents (protocol 37). Guarded by outCs_.
     std::vector<InvXferPacket>   outInvXfers_;
+    // Reliable transfer verdicts (protocol 50). Guarded by outCs_.
+    std::vector<InvXferAckPacket> outInvXferAcks_;
     // Reliable medical snapshots + treatment deltas (phase 2). Guarded by outCs_.
     std::vector<MedicalPacket>   outMedical_;
     std::vector<TreatmentPacket> outTreatments_;
@@ -284,6 +296,8 @@ private:
     std::vector<StealthPacket>   outStealth_;
     // Unreliable camera hints (protocol 43, ~1 Hz latest-wins). Guarded by outCs_.
     std::vector<CamHintPacket>   outCamHint_;
+    // Reliable cell claims (protocol 49, ~1 Hz on change + re-assert). Guarded by outCs_.
+    std::vector<CellClaimPacket> outCellClaim_;
     // Reliable runtime-spawn query/description packets (protocol 21). Guarded by outCs_.
     std::vector<SpawnReqPacket>  outSpawnReq_;
     std::vector<SpawnInfoPacket> outSpawnInfo_;

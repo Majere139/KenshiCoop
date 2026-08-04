@@ -106,6 +106,15 @@ struct InboundInvXfer {
     InvXferPacket pkt;
 };
 
+// One received transfer VERDICT (protocol 50): the answer to an intent WE
+// authored, saying how many units actually landed on the receiver. World-state:
+// a verdict for a world that no longer exists is meaningless, and the author's
+// latches were dropped by the same reset.
+struct InboundInvXferAck {
+    u32              ownerId;
+    InvXferAckPacket pkt;
+};
+
 // One received owner-authoritative medical snapshot (phase 2): the subject's
 // owner streams its local-only medical model; the receiver writes it onto its
 // driven copy of that body.
@@ -314,6 +323,14 @@ struct InboundCamHint {
     CamHintPacket pkt;
 };
 
+// One received cell claim (protocol 49, both directions): the peer's tab is
+// standing in this zone cell. World-state - the claims describe where bodies
+// are in THIS world, so a reload drops them and the next second re-publishes.
+struct InboundCellClaim {
+    u32             ownerId;
+    CellClaimPacket pkt;
+};
+
 // --- Structural world-state classification (Phase 4) -------------------------
 // Every inbound queue is exactly one of two kinds, chosen at its DECLARATION:
 //   WorldQ<T>   - describes the CURRENT world; dropped on a session-reset edge
@@ -382,14 +399,16 @@ public:
         ent_(worldReset_, 4096),  evt_(worldReset_),        inv_(worldReset_),
         wi_(worldReset_),         wir_(worldReset_),        wic_(worldReset_),
         npcCensus_(worldReset_),
-        wd_(worldReset_),         invXfer_(worldReset_),    wp_(worldReset_),
+        wd_(worldReset_),         invXfer_(worldReset_),    invXferAck_(worldReset_),
+        wp_(worldReset_),
         med_(worldReset_),        treat_(worldReset_),      combatHit_(worldReset_),
         speed_(worldReset_),
         stats_(worldReset_),      money_(worldReset_),      faction_(worldReset_),
         time_(worldReset_),       door_(worldReset_),       prod_(worldReset_),
         research_(worldReset_),   buildPlace_(worldReset_), buildState_(worldReset_),
         buildDoor_(worldReset_),  buildRemove_(worldReset_), stealth_(worldReset_, 512),
-        spawnReq_(worldReset_),   spawnInfo_(worldReset_),  camHint_(worldReset_, 64) {
+        spawnReq_(worldReset_),   spawnInfo_(worldReset_),  camHint_(worldReset_, 64),
+        cellClaim_(worldReset_, 64) {
         InitializeCriticalSection(&cs_);
     }
     ~Inbound() { DeleteCriticalSection(&cs_); }
@@ -485,6 +504,11 @@ public:
     void pushInvXfer(u32 ownerId, const InvXferPacket& pkt) {
         InboundInvXfer ix; ix.ownerId = ownerId; ix.pkt = pkt;
         EnterCriticalSection(&cs_); invXfer_.push_back(ix); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received transfer verdict (protocol 50), owner-tagged.
+    void pushInvXferAck(u32 ownerId, const InvXferAckPacket& pkt) {
+        InboundInvXferAck ia; ia.ownerId = ownerId; ia.pkt = pkt;
+        EnterCriticalSection(&cs_); invXferAck_.push_back(ia); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received medical snapshot, owner-tagged.
     void pushMedical(u32 ownerId, const MedicalPacket& pkt) {
@@ -623,6 +647,11 @@ public:
         InboundCamHint ch; ch.ownerId = ownerId; ch.pkt = pkt;
         EnterCriticalSection(&cs_); camHint_.push_back(ch); LeaveCriticalSection(&cs_);
     }
+    // NET thread: one received cell claim (protocol 49), owner-tagged.
+    void pushCellClaim(u32 ownerId, const CellClaimPacket& pkt) {
+        InboundCellClaim cc; cc.ownerId = ownerId; cc.pkt = pkt;
+        EnterCriticalSection(&cs_); cellClaim_.push_back(cc); LeaveCriticalSection(&cs_);
+    }
 
     // MAIN thread: move all pending items into 'out' (empty on entry).
     void drainConnects(std::deque<u32>& out) {
@@ -660,6 +689,9 @@ public:
     }
     void drainInvXfers(std::deque<InboundInvXfer>& out) {
         EnterCriticalSection(&cs_); out.swap(invXfer_); LeaveCriticalSection(&cs_);
+    }
+    void drainInvXferAcks(std::deque<InboundInvXferAck>& out) {
+        EnterCriticalSection(&cs_); out.swap(invXferAck_); LeaveCriticalSection(&cs_);
     }
     void drainMedical(std::deque<InboundMedical>& out) {
         EnterCriticalSection(&cs_); out.swap(med_); LeaveCriticalSection(&cs_);
@@ -742,6 +774,9 @@ public:
     void drainCamHints(std::deque<InboundCamHint>& out) {
         EnterCriticalSection(&cs_); out.swap(camHint_); LeaveCriticalSection(&cs_);
     }
+    void drainCellClaims(std::deque<InboundCellClaim>& out) {
+        EnterCriticalSection(&cs_); out.swap(cellClaim_); LeaveCriticalSection(&cs_);
+    }
 
     // MAIN thread, session reset (protocol 32): drop every queued packet that
     // describes the OLD world after a reload / reconnect / disconnect edge, and
@@ -790,6 +825,7 @@ private:
     WorldQ<InboundNpcCensus>       npcCensus_;
     WorldQ<InboundWorldDrop>       wd_;
     WorldQ<InboundInvXfer>         invXfer_;
+    WorldQ<InboundInvXferAck>      invXferAck_;
     WorldQ<InboundWorldPickup>     wp_;
     WorldQ<InboundMedical>         med_;
     WorldQ<InboundTreatment>       treat_;
@@ -810,6 +846,7 @@ private:
     WorldQ<InboundSpawnReq>        spawnReq_;
     WorldQ<InboundSpawnInfo>       spawnInfo_;
     WorldQ<InboundCamHint>         camHint_;
+    WorldQ<InboundCellClaim>       cellClaim_;
 
     // SESSION-PRESERVING: coordinated save (protocol 31) + load (protocol 32)
     // handshake - a GO/NACK/chunk arriving mid-swap must survive the reset.

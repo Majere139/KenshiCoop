@@ -150,6 +150,23 @@ typedef void (__fastcall* SaveMgrLoadInfoFn)(SaveManager* self, const SaveInfo* 
                                              bool resetPos);
 SaveMgrLoadInfoFn g_loadInfoHookOrig = 0;
 
+// Adopt the name a load just took as SaveManager::currentGame. The engine does
+// NOT do this itself on either load entry, so currentGame keeps naming whatever
+// was last SAVED, and the host connect-push (armConnectPush -> saveGameAs of
+// saveInfo's answer) then writes the freshly loaded world into that unrelated
+// folder. loadSave() has done this since the pole1 clobber, but only for the
+// mod's own programmatic load - a human loading from the title screen or the
+// in-game menu never went through it. Field evidence 2026-08-03: a manual
+// session loaded 'buff1' from the menu, and on the join's connect the host baked
+// its live world over the squad1 FIXTURE, which a previous regression had left
+// as the last-saved name. Doing it here covers both overloads at the one point
+// they share, and only when the load is really proceeding - a SUPPRESSED load
+// (the join under load-sync) changes no world, so it must not rename one.
+static void adoptLoadedName(const char* nm) {
+    if (!nm || !nm[0]) return;
+    setCurrentGameName(std::string(nm));
+}
+
 // Shared edge/suppression body. Returns true when the original must run
 // (i.e. the load was NOT suppressed). 'via' tags the log with the entry.
 static bool loadDetourEdge(const char* nm, const char* via) {
@@ -185,6 +202,7 @@ void __fastcall saveMgrLoad_hook(SaveManager* self, const std::string* name) {
         g_inLoadDetour = true;
         g_loadHookOrig(self, name);
         g_inLoadDetour = false;
+        adoptLoadedName(nm);
     }
 }
 
@@ -204,6 +222,7 @@ void __fastcall saveMgrLoadInfo_hook(SaveManager* self, const SaveInfo* info,
         g_inLoadDetour = true;
         g_loadInfoHookOrig(self, info, resetPos);
         g_inLoadDetour = false;
+        adoptLoadedName(nm);
     }
 }
 

@@ -28,6 +28,7 @@
 
 #include "CoopLog.h"
 #include "core/Config.h"
+#include "core/CrashDump.h"
 #include "core/OwnRanks.h"
 #include "core/Inbound.h"
 #include "net/NetLink.h"
@@ -1294,8 +1295,15 @@ void tickReplicateApply(GameWorld* gw, bool worldLive) {
         // two containers BEFORE the inventory reconcile, so the conservation move
         // beats the stale-snapshot dupe/wipe (and traded gear survives - no
         // fabrication on this path).
-        if (g_cfg.xferSync)
-            g_repl.applyTransfers(gw, g_inbound, g_net.localId());
+        if (g_cfg.xferSync) {
+            g_repl.applyTransfers(gw, g_inbound, g_net, g_net.localId());
+            // Protocol 50: settle our own outstanding intents on the receiver's
+            // verdict. Before the reconcile, because a rejected transfer works
+            // by DROPPING our latch and letting applyInventories restore the
+            // owner's version - one tick later and the reconcile would run once
+            // more while still defending a move that was refused.
+            g_repl.applyXferAcks(gw, g_inbound, g_net.localId());
+        }
         // Phase 4a: reconcile any peer-owned container we received a fresh snapshot
         // for (the join applies the host's container; the host skips its own).
         g_repl.applyInventories(gw);
@@ -1315,10 +1323,15 @@ void tickReplicateApply(GameWorld* gw, bool worldLive) {
         // NPC existence census (protocol 36): the host broadcasts its 1 Hz
         // wide-radius hand list; the join drains it and lets the wide-radius
         // pass in enforceHostAuthority cull local-only ghosts at render range.
-        if (!g_cfg.isHost) {
+        // Under presence authority both halves run on BOTH sides: each client
+        // authors the cells it stands in and judges its local copies of the
+        // other's. With cellAuth off the two conditions collapse to today's
+        // exclusive split, which is what makes the fail-open A/B meaningful.
+        if (!g_cfg.isHost || g_cfg.cellAuth) {
             g_repl.applyNpcCensus(g_inbound);
-            g_repl.enforceHostAuthority(gw);
-        } else {
+            g_repl.enforceHostAuthority(gw, g_net.localId());
+        }
+        if (g_cfg.isHost || g_cfg.cellAuth) {
             g_repl.publishNpcCensus(gw, g_net, g_net.localId());
         }
         // Camera-anchored interest (protocol 43): both sides publish their
@@ -1328,6 +1341,7 @@ void tickReplicateApply(GameWorld* gw, bool worldLive) {
         // interestCenters ignore the anchors) so an A/B toggle needs no
         // session restart logic.
         g_repl.syncCamHint(gw, g_inbound, g_net, g_net.localId());
+        g_repl.syncCellClaims(gw, g_inbound, g_net, g_net.localId());
     }
 }
 
@@ -1397,6 +1411,26 @@ void tickScenarioTick(GameWorld* gw) {
 void mainLoop_hook(GameWorld* gw, float dt) {
     ++g_tick;
     g_lastGw = gw; // cache for the argument-less F2 UI callbacks
+
+#ifdef KENSHICOOP_HARNESS
+    // TEST-ONLY (KENSHICOOP_TEST_CRASH=<seconds>): fault on purpose, to prove the
+    // crash-dump filter actually produces a dump with our frames in it. A crash
+    // handler nobody has ever seen fire is a coin flip, and the run it would waste
+    // is a human reproducing a rare bug. Deliberately NOT wrapped in SEH.
+    {
+        static int crashAfter = -1;
+        if (crashAfter < 0) {
+            const char* e = getenv("KENSHICOOP_TEST_CRASH");
+            crashAfter = e ? atoi(e) : 0;
+        }
+        if (crashAfter > 0 && g_gameStarted &&
+            (GetTickCount() - g_gameStartTick) >= (DWORD)(crashAfter * 1000)) {
+            coopLog("[crash] TEST-CRASH: faulting on purpose now");
+            volatile int* p = (int*)0x80; // same shape as the 2026-08-03 fault
+            *p = 1;
+        }
+    }
+#endif
 
     coopPanelDrive(gw);
 
@@ -1714,7 +1748,9 @@ void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
     // normal flow is Copy my Steam ID -> friend Pastes it -> Connect, with no file
     // editing. peerId is 0 when nothing was pasted, so the config value stands.
     if (peerId != 0) g_cfg.steamPeer = peerId;
-    g_repl.setStreamNpcs(isHost);            // host streams world NPCs; join drives
+    // Host streams world NPCs; join drives. Under presence authority both do,
+    // each for the cells it claims.
+    g_repl.setStreamNpcs(isHost || g_cfg.cellAuth);
     // Ownership ranks must follow the role chosen in the panel. Only an explicit
     // KENSHICOOP_OWN_SQUAD override is preserved; otherwise recompute the default
     // (host owns {0}, join owns {1}). Without this, a session launched as HOST
@@ -1817,7 +1853,7 @@ void configureReplicator() {
 
     // Stage 4: the host streams nearby world NPCs (host-authoritative) in addition
     // to its squad; the join resolves each by hand and drives it like a squad body.
-    if (g_cfg.isHost) g_repl.setStreamNpcs(true);
+    if (g_cfg.isHost || g_cfg.cellAuth) g_repl.setStreamNpcs(true);
 
     // Bidirectional presence: this client owns (controls + streams) a disjoint set of
     // the shared squad chosen by save-stable hand-rank; it drives the peer's owned
@@ -1856,6 +1892,7 @@ void configureReplicator() {
         g_repl.setCensusParkDist(g_cfg.censusParkDist);
         g_repl.setCensusFreezeAi(g_cfg.censusFreezeAi);
         g_repl.setAttentionRadius(g_cfg.attentionRadius);
+        g_repl.setCellAuth(g_cfg.cellAuth);
         g_repl.setStarveHold(g_cfg.starveHoldMs);
         // Camera-anchored interest (protocol 43): engine-side master enable
         // for the camera anchors in interestCenters.
@@ -2170,6 +2207,17 @@ __declspec(dllexport) void startPlugin() {
     // timestamp in this run (and every time-sync packet) shares the skewed clock.
     coop::logSetFakeSkewMs(g_cfg.fakeClockSkewMs);
     coop::logInit(g_cfg.logPath.c_str(), g_cfg.isHost ? "HOST" : "JOIN");
+
+    // Fault-time crash dumps, installed before anything else can fault. RE_Kenshi's
+    // own dump is written from a late filter and carries no usable frames, which is
+    // where the 2026-08-03 crash investigation dead-ended; ours chains to RE_Kenshi's
+    // filter afterwards, so its emergency save is unaffected. See core/CrashDump.h.
+    {
+        std::string dir = g_cfg.logPath;
+        size_t cut = dir.find_last_of("\\/");
+        dir = (cut == std::string::npos) ? std::string(".") : dir.substr(0, cut);
+        coop::crashdump::install(dir.c_str(), g_cfg.isHost ? "host" : "join");
+    }
 
     logStartupBanner();
 

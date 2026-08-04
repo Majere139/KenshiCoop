@@ -2380,3 +2380,61 @@ function Test-VendorTrade {
                 -Metrics @{ walletCrossed = $crossed } -Detail $detail)
 }
 
+
+# cell_probe: report the engine's sector grid. This is a MEASUREMENT oracle - it
+# exists to print numbers a design decision rests on, not to guard a behaviour,
+# so it fails only when the measurement itself did not happen (no rows, or the
+# bounds call never resolved, which would mean the sector mapping is unusable).
+#
+# The two numbers that decide whether a cell can be an authority key at all:
+#   cellX/cellZ  the cell's world size. A town is roughly 500-1000 u across, so a
+#                cell far below that changes hands inside one settlement.
+#   span         distinct cells occupied by the NPCs within 1200 u. span=1 means a
+#                settlement sits in one cell, which is what ownership wants.
+# tabCells reports whether the two player squads are in DIFFERENT cells, which on
+# a split save is the other half of the same question - if they share a cell,
+# authority can never move between them.
+function Test-CellProbe {
+    param([string]$HostFile, [string]$JoinFile)
+    $rx = 'SCENARIO CELL verdict role=(\w+) pass=(\d+) samples=(-?\d+) cellX=(-?[\d.]+) cellZ=(-?[\d.]+) maxSpan=(-?\d+) tabs=(-?\d+) tabCells=(-?\d+)'
+    $read = {
+        param($file)
+        $r = [pscustomobject]@{ found = $false; samples = 0; cellX = 0.0; cellZ = 0.0
+                                span = 0; tabs = 0; tabCells = 0 }
+        if (-not (Test-Path $file)) { return $r }
+        $ln = Select-String -Path $file -Pattern $rx -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -eq $ln) { return $r }
+        $g = $ln.Matches[0].Groups
+        $r.found = $true; $r.samples = [int]$g[3].Value
+        $r.cellX = [double]$g[4].Value; $r.cellZ = [double]$g[5].Value
+        $r.span = [int]$g[6].Value; $r.tabs = [int]$g[7].Value; $r.tabCells = [int]$g[8].Value
+        return $r
+    }
+    $h = & $read $HostFile
+    $j = & $read $JoinFile
+    if (-not $h.found -and -not $j.found) {
+        Write-Host "  CELL-PROBE SKIP - no verdict row on either client"
+        return (Add-GateResult -Name "cell_probe" -Status SKIP -Detail "no rows")
+    }
+    $m = if ($h.found) { $h } else { $j }
+    $ok = ($m.samples -gt 0) -and ($m.cellX -gt 0)
+    Write-Host ("  CELL-PROBE " + $(if ($ok) { "PASS" } else { "FAIL" }) +
+                " - cell=$($m.cellX)x$($m.cellZ) u  maxSpan=$($m.span) cells  tabs=$($m.tabs) in $($m.tabCells) cell(s)  samples=$($m.samples)")
+    if (-not $ok) {
+        Write-Host "    NOTE: getZoneBoundsT never returned a rect - the sector mapping did not resolve"
+    }
+    # Both clients must agree on the grid, or a cell id cannot be a shared key.
+    if ($h.found -and $j.found -and ($h.cellX -ne $j.cellX)) {
+        Write-Host "    NOTE: clients disagree on cell size (host $($h.cellX), join $($j.cellX))"
+    }
+    if ($ok -and $m.span -gt 1) {
+        Write-Host "    FINDING: the local population spans $($m.span) cells - ownership would change hands inside it"
+    }
+    if ($ok -and $m.tabs -gt 1 -and $m.tabCells -le 1) {
+        Write-Host "    FINDING: both squads share one cell here - this save cannot exercise a handoff"
+    }
+    return (Add-GateResult -Name "cell_probe" -Status $(if ($ok) { "PASS" } else { "FAIL" }) `
+                -Metrics @{ cellX = $m.cellX; cellZ = $m.cellZ; maxSpan = $m.span
+                            tabs = $m.tabs; tabCells = $m.tabCells; samples = $m.samples
+                            hostCellX = $h.cellX; joinCellX = $j.cellX })
+}

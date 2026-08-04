@@ -555,9 +555,16 @@ void Replicator::publishMoney(const SyncContext& ctx) {
     unsigned int rankHand[MAX_RANKS][5];
     unsigned int nRanks = tabRepresentatives(gw, rankHand, MAX_RANKS);
     for (unsigned int r = 0; r < nRanks; ++r) {
+        if (rankHand[r][0] == 0xFFFFFFFFu) continue;
         // Own-tabs only (the same partition rule as publishOwned's entity filter).
-        bool owned = ownRanks_.empty() ? (r == 0u) : (ownRanks_.count(r) != 0);
-        if (!owned || rankHand[r][0] == 0xFFFFFFFFu) continue;
+        if (!ownsTab(std::make_pair(rankHand[r][1], rankHand[r][2]), r)) continue;
+        // This channel's WIRE key is the rank, and ranks past the session-start
+        // seeding are assigned in local first-seen order, so the same number can
+        // name different tabs on the two clients. Now that an appended tab has a
+        // real owner it would otherwise start publishing, and land on whatever
+        // squad happens to hold that rank over there. Wallets stay on the prefix
+        // both sides agree about.
+        if (!rankIsShared(r)) continue;
         int money = -1;
         if (!engine::readWalletByHand(rankHand[r], &money) || money < 0) continue;
         MoneyPub& mp = moneyPub_[r];
@@ -596,14 +603,18 @@ void Replicator::applyMoney(const SyncContext& ctx) {
     for (std::deque<InboundMoney>::iterator it = got.begin(); it != got.end(); ++it) {
         const MoneyPacket& p = it->pkt;
         unsigned int r = p.tabRank;
-        // Never write a tab we own - our engine is that wallet's authority.
-        bool owned = ownRanks_.empty() ? (r == 0u) : (ownRanks_.count(r) != 0);
-        if (owned || p.money < 0) continue;
+        if (p.money < 0) continue;
+        // Ranks outside the seeded prefix name different tabs on each client
+        // (see publishMoney) - the sender should not have sent one, and applying
+        // it would write a stranger's wallet.
+        if (!rankIsShared(r)) continue;
         if (!haveRanks) { // one census per drain (cheap; usually 1 packet anyway)
             nRanks = tabRepresentatives(gw, rankHand, MAX_RANKS);
             haveRanks = true;
         }
         if (r >= nRanks || rankHand[r][0] == 0xFFFFFFFFu) continue;
+        // Never write a tab we own - our engine is that wallet's authority.
+        if (ownsTab(std::make_pair(rankHand[r][1], rankHand[r][2]), r)) continue;
         int cur = -1;
         engine::readWalletByHand(rankHand[r], &cur);
         if (cur == p.money) continue; // already converged (resend or echo)
@@ -1599,7 +1610,32 @@ void Replicator::publishSquadMoves(GameWorld* gw, NetLink& net, u32 ownerId) {
     engine::pollSquadRoster(gw);
     engine::SquadMoveEdge edges[8];
     unsigned int n = engine::drainSquadMoveEdges(edges, 8);
+    unsigned long nowSq = nowMs();
+    // Retire hands we already announced as gone (bounded; see exitedOwn_).
+    for (std::map<Key, unsigned long>::iterator xt = exitedOwn_.begin();
+         xt != exitedOwn_.end(); ) {
+        if ((nowSq - xt->second) > (unsigned long)SQUAD_EXIT_GRACE_MS) exitedOwn_.erase(xt++);
+        else ++xt;
+    }
     for (unsigned int i = 0; i < n; ++i) {
+        // Our own insertPeerMember re-container, not a user action: publishing
+        // it would claim the peer's character as ours (see moveEcho_).
+        u32 serial = edges[i].before[4] ? edges[i].before[4] : edges[i].after[4];
+        std::map<u32, unsigned long>::iterator me = moveEcho_.find(serial);
+        if (me != moveEcho_.end()) {
+            bool fresh = (nowSq - me->second) <= (unsigned long)SQUAD_ECHO_MS;
+            moveEcho_.erase(me);
+            if (fresh) {
+                char eb[176]; _snprintf(eb, sizeof(eb) - 1,
+                    "[squad] EVT skip echo old=%u,%u,%u,%u,%u new=%u,%u,%u,%u,%u",
+                    edges[i].before[0], edges[i].before[1], edges[i].before[2],
+                    edges[i].before[3], edges[i].before[4],
+                    edges[i].after[0], edges[i].after[1], edges[i].after[2],
+                    edges[i].after[3], edges[i].after[4]);
+                eb[sizeof(eb) - 1] = '\0'; coop::logLine(eb);
+                continue;
+            }
+        }
         Key ok; ok.t = edges[i].before[0]; ok.c = edges[i].before[1];
         ok.cs = edges[i].before[2]; ok.i = edges[i].before[3]; ok.s = edges[i].before[4];
         Key nk; nk.t = edges[i].after[0]; nk.c = edges[i].after[1];
@@ -1614,6 +1650,9 @@ void Replicator::publishSquadMoves(GameWorld* gw, NetLink& net, u32 ownerId) {
         // publishes from this side no matter which rank its container latched
         // to (an appended tab inherits our ownership through this pin).
         if (!exited) pinOwned_.insert(nk);
+        // ...and if it LEFT, retire the hand so the peer's in-flight tail cannot
+        // turn our departed body into a driven one (see exitedOwn_).
+        else exitedOwn_[ok] = nowSq;
         EventPacket ev;
         memset(&ev, 0, sizeof(ev));
         ev.type    = (u8)PKT_EVENT;

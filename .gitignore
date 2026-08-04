@@ -33,6 +33,10 @@ tools/_*.png
 # Scratch dirs follow the same underscore convention as the scratch scripts
 # (extracted crash dumps, one-off captures).
 tools/_*/
+# Minidumps taken out-of-process by tools/_dumplive.ps1. Named after the pid, so
+# they never collide and never stop accumulating; they are megabytes of machine
+# state that means nothing on another checkout.
+tools/*.dmp
 # Kenshi's own emergency save after a crash lands here.
 tools/save-backups/
 tools/_wip_*.dll

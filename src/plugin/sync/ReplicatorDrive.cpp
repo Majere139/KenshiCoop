@@ -89,6 +89,15 @@ void Replicator::applyTargets(GameWorld* gw) {
         // body moved to a new local index), REQ, and mint a phantom proxy that
         // chases the real body (manual 2026-07-17: Squint following Adi).
         if (pinOwned_.find(it->first) != pinOwned_.end()) continue;
+        // Nor a hand we just announced as having LEFT our squad. Both guards
+        // above go quiet the instant captureSquad drops the body, which is
+        // usually the instant it DIED - and driving it here would run the death
+        // veto below and un-kill a body the engine is already tearing down.
+        {
+            std::map<Key, unsigned long>::const_iterator xt = exitedOwn_.find(it->first);
+            if (xt != exitedOwn_.end() &&
+                (now - xt->second) <= (unsigned long)SQUAD_EXIT_GRACE_MS) continue;
+        }
         Driven& d = it->second;
         EntityState out;
         if (!d.interp.sample(now, cfg_, &out)) {

@@ -64,7 +64,8 @@ Replicator::Replicator()
       spawnSync_(false), spawnPosLogMs_(0),
       spawnMintRadius_(0.0f), censusScanMs_(0),
       moneySync_(true), recruitSync_(true),
-      squadSync_(true),
+      squadSync_(true), tabsSeeded_(0),
+      cellAuth_(false), claimSendMs_(0), claimAssertMs_(0), claimMapMs_(0),
       facSeqOut_(1), facSampleMs_(0), factionSync_(true),
       doorSeqOut_(1), doorSampleMs_(0), doorSync_(true),
       buildSeqOut_(1), buildSampleMs_(0), buildSync_(true),
@@ -198,6 +199,15 @@ void Replicator::resetSession() {
     peerCamMs_ = 0;
     // Attention latches are per-hand state about the OLD world's geometry.
     attnObs_.clear();
+    attnObsPeer_.clear();
+    // Claims describe where bodies stand in the OLD world.
+    claimSlots_.clear();
+    claimedCells_.clear();
+    cellLastOwner_.clear();
+    claimDwell_.clear();
+    claimSendMs_   = 0;
+    claimAssertMs_ = 0;
+    claimMapMs_    = 0;
     attnFlips_ = 0;
     attnWinMs_ = 0;
     // The zone verdict describes the OLD world's streaming state.
@@ -234,6 +244,7 @@ void Replicator::resetSession() {
     xferPend_.clear();
     xferLatch_.clear();
     xferDefer_.clear();
+    xferOut_.clear();
     appliedXfers_.clear();
     wdSuppress_.clear();
     xferScanMs_ = 0;
@@ -245,10 +256,14 @@ void Replicator::resetSession() {
     stealthPub_.clear();
     pinOwned_.clear();
     pinPeer_.clear();
+    moveEcho_.clear();
+    exitedOwn_.clear();
     // Protocol 35: the rank latch + the engine's pointer->hand baseline both
     // describe the OLD world (containers and Character* dangle after a swap);
     // the reloaded save re-seeds them at first census/poll.
     tabRank_.clear();
+    tabOwned_.clear();
+    tabsSeeded_ = 0;
     rekeyedOld_.clear();
     engine::clearSquadRoster();
     probed_.clear();
@@ -415,6 +430,60 @@ void Replicator::latchTabs(const std::vector<std::pair<u32, u32> >& ctnrs) {
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
     }
+}
+
+void Replicator::decideTabs(const EntityState* raw, unsigned int nSquad,
+                            const std::vector<std::pair<u32, u32> >& ctnrs) {
+    if (!squadSync_) return;   // legacy per-tick ranking owns nothing durably
+    bool seeding = (tabsSeeded_ == 0);
+    for (unsigned int i = 0; i < ctnrs.size(); ++i) {
+        if (tabOwned_.find(ctnrs[i]) != tabOwned_.end()) continue;
+        unsigned int rank = tabRankFor(ctnrs[i], ctnrs);
+        bool owned;
+        const char* why;
+        if (seeding) {
+            // The save's own tabs, ranked identically on both clients: the
+            // historical rule, so nothing about a normal session changes.
+            owned = ownRanks_.empty() ? (rank == 0u) : (ownRanks_.count(rank) != 0);
+            why = "seed";
+        } else {
+            // A tab that did not exist at session start. Its rank is a local
+            // number the peer does not share, so the rank rule cannot answer -
+            // ask who authored the bodies standing in it. The pins are still
+            // present at this moment (the move/recruit that created the tab is
+            // what put them there); capturing the answer HERE is what makes it
+            // survive the later EXIT that clears them.
+            int verdict = 0;   // +1 ours, -1 peer's, 0 nobody claims it
+            for (unsigned int m = 0; m < nSquad; ++m) {
+                if (raw[m].hContainer != ctnrs[i].first ||
+                    raw[m].hContainerSerial != ctnrs[i].second) continue;
+                Key k = keyOf(raw[m]);
+                if (pinOwned_.count(k)) { verdict = 1; break; }
+                if (pinPeer_.count(k))  verdict = -1;
+            }
+            owned = (verdict == 1) ? true
+                                   : ((verdict == -1) ? false : isHostRole());
+            why = (verdict == 1) ? "pin-own"
+                                 : ((verdict == -1) ? "pin-peer" : "host-fallback");
+        }
+        tabOwned_[ctnrs[i]] = owned;
+        if (!seeding) {
+            char b[128];
+            _snprintf(b, sizeof(b) - 1, "[squad] TABOWN cont=%u,%u rank=%u own=%d via=%s",
+                      ctnrs[i].first, ctnrs[i].second, rank, owned ? 1 : 0, why);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+    // Freeze the shared-rank prefix at the end of the seeding pass.
+    if (seeding && !ctnrs.empty()) tabsSeeded_ = (unsigned int)tabRank_.size();
+}
+
+bool Replicator::ownsTab(const std::pair<u32, u32>& key, unsigned int rank) const {
+    std::map<std::pair<u32, u32>, bool>::const_iterator it = tabOwned_.find(key);
+    if (it != tabOwned_.end()) return it->second;
+    // Not yet decided (squadSync_ off, or the first tick of a fresh container):
+    // the historical rule, so this is never MORE permissive than before.
+    return ownRanks_.empty() ? (rank == 0u) : (ownRanks_.count(rank) != 0);
 }
 
 unsigned int Replicator::tabRankFor(const std::pair<u32, u32>& key,

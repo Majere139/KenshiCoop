@@ -218,6 +218,66 @@
             Tier = 'probe'; WanVariant = $false
         }
 
+        # split_far2: the presence-authority scenario. split_far asks whether
+        # the two clients AGREE about a far region; this one asks WHO SHOULD
+        # AUTHOR it, which is a question that only exists once authority can
+        # move. It is the only scenario that runs with KENSHICOOP_CELL_AUTH on
+        # - every other entry runs with it clear, which is what makes the rest
+        # of the tier a fail-open proof rather than a co-test.
+        #
+        # Same splitfar1 fixture (tab 0 in one populated place, tab 1 ~5200 u
+        # away in another; cell_probe measured those as cells 21,32 and 21,31,
+        # so they are genuinely separate authority regions). The difference is
+        # the APPROACH: each side parks its own tab 600 u out and WALKS it back
+        # in, because the reported symptom is a transient - "NPCs disappear as I
+        # get close, then get replaced by the host's" - and a scenario that
+        # teleported into position would skip the only moment it happens.
+        # Walking the full 5200 u between the towns would take ~9 minutes at
+        # Kenshi locomotion speed, so 600 u of real approach is the honest
+        # compromise; what it buys is live zone streaming and a census that
+        # first covers the region while somebody is watching.
+        #
+        # PHASES (walk 60 s, then 40 s each on the SPLITFAR2 row's phase=):
+        #   walk       each -> own       approach; claims settle (3 s dwell)
+        #   own        each -> own       steady state, disjoint attention
+        #   both_join  both -> join tab  HOST attends a cell the JOIN authors
+        #   both_host  both -> host tab  JOIN attends a cell the HOST authors
+        #   back       each -> own       does the peer's population SURVIVE
+        #
+        # The gate reads three things, none of which any existing oracle can:
+        # that the two tabs are in different cells at all (else the run proves
+        # nothing and it SKIPs); that both logs' [cell] MAP dumps resolve the
+        # same owner for the same cell (disagreement means two authors or none);
+        # and that the both_* phases cost no attach pop, from the [attn] attach
+        # counters. Seconds/KillGraceSec outlive the 230 s host window.
+        split_far2 = @{
+            Save = 'splitfar1'; Setup = ''; Tolerance = 18.0
+            Seconds = 290; KillGraceSec = 260
+            PrimaryGate = 'split_far2'
+            Gating   = @('split_far2', 'clock_sync')
+            Advisory = @('existence_parity', 'lifecycle', 'suppress_churn',
+                         'anti_zombie', 'mint_dist', 'smoothness')
+            DiagEnv = @{ KENSHICOOP_CELL_AUTH = '1' }
+            Tier = 'probe'; WanVariant = $false
+        }
+
+        # cell_probe: measure ZoneManager's sector grid before any authority is
+        # keyed on it. Read-only - no park, no mutation - so the SAVE is the
+        # experiment: on 'sync' (a live town, both tabs together) it answers
+        # whether a settlement fits in one cell; run it again with
+        # -Save splitfar1 and it answers whether two squads 5200 u apart land in
+        # different cells. Both must be true for a cell to work as an authority
+        # key, and neither is knowable from the vendored headers, which expose
+        # three position->coord mappings with no stated resolution.
+        # No advisory gates: nothing moves, so motion oracles have nothing to say.
+        cell_probe = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'cell_probe'
+            Gating   = @('cell_probe')
+            Advisory = @()
+            Tier = 'probe'; WanVariant = $false
+        }
+
         # ---- interest-managed NPCs + pose ----------------------------------------
         npc_sync = @{
             Save = 'sync'; Setup = ''; Tolerance = 3.0

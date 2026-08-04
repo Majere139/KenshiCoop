@@ -272,7 +272,15 @@ public:
     // fabricate-into-dst if our src copy is missing). Idempotent by
     // (ownerId, xferId); skips intents we authored. Runs BEFORE applyInventories
     // so the relocation beats the reconcile.
-    void applyTransfers(GameWorld* gw, Inbound& in, u32 localId);
+    void applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 localId);
+
+    // AFTER applyTransfers (protocol 50): drain verdicts for intents WE authored
+    // and settle them on the receiver's word instead of on a deadline. Accept
+    // clears our latches now; reject clears them too, which is what lets the
+    // owner's next snapshot reconcile our optimistic local move away. Unanswered
+    // intents are swept on the old wall clock, so a peer that never replies
+    // behaves exactly as before.
+    void applyXferAcks(GameWorld* gw, Inbound& in, u32 localId);
 
     // BEFORE engine, after publishOwned (phase 2 vitals sync): stream each OWNED
     // player-squad member's medical model (blood, bleed, limb flesh/bandaging,
@@ -588,12 +596,18 @@ public:
     // for to its desired contents. Skips containers we own (we author those).
     void applyInventories(GameWorld* gw);
 
-    // AFTER applyTargets (join only): make the host authoritative for world NPCs.
-    // Any nearby NPC the host is NOT streaming this tick is hidden + frozen so the
-    // join's local AI can't run a divergent copy (the standing-on-a-host-seat
-    // double / extra-NPC problem). Suppressed NPCs are restored if the host later
-    // streams them.
-    void enforceHostAuthority(GameWorld* gw);
+    // AFTER applyTargets: make the region's AUTHOR authoritative for world NPCs.
+    // Any nearby NPC the author is NOT streaming this tick is hidden + frozen so
+    // our local AI can't run a divergent copy (the standing-on-a-host-seat
+    // double / extra-NPC problem). Suppressed NPCs are restored if the author
+    // later streams them.
+    //
+    // Without cellAuth_ the author is always the host, so this stays what it
+    // was: a join-only pass judging everything against the host's census. With
+    // it on, both sides run it and each skips the cells IT owns - judging your
+    // own authored bodies against a peer that never claimed them is exactly the
+    // "NPCs vanish as I walk up to them" report.
+    void enforceHostAuthority(GameWorld* gw, u32 localId);
 
     // HOST, ~1 Hz (protocol 36): publish the wide-radius NPC existence census
     // (hands only) so the join can cull local-only ghosts far beyond the
@@ -947,6 +961,10 @@ private:
     float                     peerCam_[3];    // host: latest peer camera center
     unsigned long             peerCamMs_;     // host: its arrival time (0 = none)
     std::set<Key>             censusHands_;   // join: latest existence set
+    // Whose claim censusHands_ is. Under presence authority a census only
+    // speaks for the cells its sender owns, so enforcement has to know who
+    // sent it. Defaults to the host, which is who it always was.
+    u32                       censusOwner_;
     unsigned long             censusCulls_;   // join: wide-radius suppress count
     // Phase 0.5 census diagnostics (2026-08-02 field report: "join sees local
     // NPCs the host does not, worsening over long travel"). Four mechanisms in
@@ -1006,6 +1024,60 @@ private:
     // enumeration.
     float                     attentionRadius_; // 0 = gate off (all observed)
     std::map<Key, bool>       attnObs_;         // per-hand observed latch
+    // The publish-side latch, for the same predicate asked about the PEER.
+    // Separate from attnObs_ because two predicates over one latch would fight
+    // each other's hysteresis every tick.
+    std::map<Key, bool>       attnObsPeer_;
+
+    // --- Presence authority (protocol 49) --------------------------------
+    // WHO authors a region, as opposed to WHEN it is reconciled. Attention is
+    // distance-shaped because it models what a player can see; authority is
+    // CELL-shaped because it needs an exhaustive, mutually exclusive partition.
+    // Two owners means two clients drive the same body and zero owners means
+    // nobody authors it, and "whoever is closest wins" compares two continuous
+    // values derived from drifting inputs (interp error, tick skew, a camera
+    // hint up to 3 s old) - near the midpoint that comparison flips
+    // independently on each side. A discrete label has no such window, and a
+    // published claim needs a small enumerable token to key a map on anyway.
+    bool cellAuth_;   // off => authorityFor is always the host (fail-open)
+    struct CellClaim {
+        int          cx, cz;
+        u32          seq;
+        unsigned long recvMs;
+    };
+    // (ownerId, tabRank) -> that slot's current claim. A tab walking into a new
+    // cell supersedes its own claim, which is why there is no release message.
+    std::map<std::pair<u32, u32>, CellClaim> claimSlots_;
+    // Derived from claimSlots_ every time one changes: cell -> owning player.
+    // Host wins a contested cell (two tabs in one cell is the players standing
+    // together, where host-wins is the right answer anyway).
+    std::map<std::pair<int, int>, u32> claimedCells_;
+    // Cells that have EVER been claimed, and by whom last. A claim is a tab's
+    // current position, so a tab walking out of a town drops that cell out of
+    // claimedCells_ entirely - and an unclaimed cell fail-opens to the host.
+    // That turns "the join walked out of its own town" into "the host abruptly
+    // authors that town", over bodies the host had spent the last half-minute
+    // driving from the join's stream. Measured 2026-08-03: the join's tab left
+    // cell 21,32, the map went {21,31=join, 21,33=host} with 21,32 unowned, and
+    // the host faulted 241 ms later. Authorship follows PRESENCE, and the last
+    // client present is still the better author of a region neither is standing
+    // in, so a vacated cell keeps its owner until somebody else claims it.
+    // Fail-open to host survives for cells nobody has ever been to.
+    std::map<std::pair<int, int>, u32> cellLastOwner_;
+    // Publisher-side dwell: a tab must read the same NEW cell this many
+    // consecutive samples before we claim it, so a body walking the boundary
+    // does not hand authority back and forth once a second.
+    struct CellDwell { int cx, cz; unsigned int n; };
+    std::map<u32, CellDwell> claimDwell_;   // our tabRank -> pending cell
+    std::map<u32, u32>       claimSeqOut_;  // our tabRank -> last seq sent
+    unsigned long            claimSendMs_;  // 1 Hz sample throttle
+    unsigned long            claimAssertMs_; // periodic re-assert
+    unsigned long            claimMapMs_;    // [cell] MAP dump cadence
+    enum {
+        CELL_OWNER_HOST   = 0,    // NetLink gives the host id 0
+        CELL_DWELL_N      = 3,    // samples at 1 Hz
+        CELL_ASSERT_MS    = 5000  // re-assert cadence (reconnect insurance)
+    };
     // Phase B attach measurement. A dormant -> observed transition forces a
     // reconciliation burst: everything the gate had been leaving alone gets
     // judged in one frame, and the mints deferred past mintR fire together as
@@ -1311,6 +1383,23 @@ private:
     std::map<Key, unsigned long>              xferDefer_;
     u32                                       nextXferId_;
     std::set<std::pair<u32, u32> >            appliedXfers_;
+    // Protocol 50: intents we authored and are still waiting on a verdict for,
+    // keyed by our own xferId. Holds exactly what the verdict has to undo - the
+    // two peer ends and the item key - because by the time the answer arrives
+    // the detector has long since rebased and cannot reconstruct it.
+    struct XferOut {
+        Key           src;
+        Key           dst;
+        XKey          key;
+        int           qty;
+        bool          srcPeer;   // we latched src (it is peer-authored)
+        bool          dstPeer;
+        unsigned long sentMs;
+    };
+    std::map<u32, XferOut>                    xferOut_;
+    // Undo one intent's contribution to a peer end's reconcile-suppression
+    // latch (protocol 50). See the definition for why every verdict does this.
+    void releaseXferLatch(const Key& k, const XKey& key, int delta);
     std::map<std::pair<Key, std::string>, unsigned long> wdSuppress_;
     unsigned long                             xferScanMs_; // last detector scan
     // Recapture `k`'s container and overwrite its baseline (clears its pends): call
@@ -1672,6 +1761,25 @@ private:
     // (mid-session) tab inherits its authoring side's ownership.
     std::set<Key> pinOwned_;
     std::set<Key> pinPeer_;
+    // Roster edges WE caused. insertPeerMember re-containers a peer's body into
+    // our squad so we can drive it, and the engine cannot tell that apart from
+    // the user dragging a member between tabs - so publishSquadMoves echoed the
+    // insertion back as OUR move and pinned the peer's character owned.
+    // Measured 2026-08-03: the host inserted the join's character, published the
+    // insertion, and the join then pinned its own character peer-owned, drove it
+    // from our stream, vetoed its death mid-tick and faulted the engine twenty
+    // times in 230 ms. Keyed on the character SERIAL - the one hand field a
+    // re-container preserves - and consumed on the first matching edge.
+    std::map<u32, unsigned long> moveEcho_;
+    // Hands we published as having LEFT our squad. The exit clears the pins and
+    // captureSquad stops returning the body, so both drive guards (ownHands_,
+    // pinOwned_) go quiet at once and the peer's in-flight tail for that hand
+    // can start driving our own just-dead body - which then un-kills it.
+    std::map<Key, unsigned long> exitedOwn_;
+    enum {
+        SQUAD_ECHO_MS      = 2000,  // an insertion echoes on the very next poll
+        SQUAD_EXIT_GRACE_MS = 30000 // matches the targets_ prune
+    };
     // Protocol 35 squad management sync state. tabRank_ is the container ->
     // rank LATCH: seeded from the first census in sorted order (identical to
     // the legacy ranking at session start), then newly-seen containers append
@@ -1682,12 +1790,47 @@ private:
     bool          squadSync_;
     std::map<std::pair<u32, u32>, unsigned int> tabRank_;
     std::map<Key, unsigned long> rekeyedOld_;
+    // Per-TAB ownership verdict, keyed on the container hand and decided ONCE
+    // when the tab is first seen. The rank latch above stops ranks reshuffling,
+    // but ownership was still read as "is my rank in ownRanks_", and ownRanks_
+    // only ever holds 0 (host) or 1 (join) - so a tab appended mid-session got
+    // rank 2+ and belonged to NOBODY. Measured 2026-08-03: the join latched
+    // rank 2 and rank 3, published neither, and was left with no controllable
+    // character. The per-hand pins were supposed to cover this ("an appended tab
+    // inherits its authoring side's ownership"), but a pin is per HAND and an
+    // EVT_SQUAD_MOVE exit CLEARS it - after which the body fell back to the
+    // rank rule and was orphaned. A verdict on the CONTAINER outlives the pins.
+    std::map<std::pair<u32, u32>, bool> tabOwned_;
+    // Number of tabs present at session-start seeding, i.e. the length of the
+    // rank prefix that means the same thing on both clients. Ranks past it are
+    // assigned in local first-seen order and DIVERGE (measured: host rank 2 =
+    // container 237, join rank 2 = container 443), so rank-keyed WIRE channels
+    // must stay inside the prefix even though ownership no longer needs it.
+    unsigned int  tabsSeeded_;
     // Fold this tick's distinct sorted containers into the latch (append-only;
     // no-op when squadSync_ is off) and rank one container: latched rank when
     // the gate is on, the legacy per-tick sorted rank otherwise.
     void latchTabs(const std::vector<std::pair<u32, u32> >& ctnrs);
     unsigned int tabRankFor(const std::pair<u32, u32>& key,
                             const std::vector<std::pair<u32, u32> >& ctnrs) const;
+    // Decide (once per container) who owns each tab in this tick's census.
+    // Session-start tabs use the historical rank rule so the standard two-tab
+    // save behaves exactly as before; a tab that appears LATER is attributed to
+    // whichever side authored the bodies in it, and falls back to the host so
+    // that no tab is ever ownerless.
+    void decideTabs(const EntityState* raw, unsigned int nSquad,
+                    const std::vector<std::pair<u32, u32> >& ctnrs);
+    bool ownsTab(const std::pair<u32, u32>& key, unsigned int rank) const;
+    // Is this rank the same tab on both clients? Only true inside the seeded
+    // prefix (see tabsSeeded_).
+    bool rankIsShared(unsigned int rank) const {
+        return tabsSeeded_ != 0 && rank < tabsSeeded_;
+    }
+    // Replicator carries no role flag - the role IS the ownership partition
+    // Plugin.cpp installs (host {0}, join {1}), so owning rank 0 is being host.
+    bool isHostRole() const {
+        return ownRanks_.empty() || ownRanks_.count(0u) != 0;
+    }
     // Squad-tab census for the rank-keyed channels (money, tab-leader
     // inventories): ONE representative member hand per tab rank, using the
     // same latch-aware ranking publishOwned partitions ownership by.
@@ -1768,14 +1911,26 @@ private:
     // LOC = local-sim copy that exists in the host census. No-op (single env
     // check) unless the flag is set. Labels are created once per body and
     // re-captioned only on state change.
-    struct DebugMarker { void* label; int color; };
+    // hand carries the identity the KEY cannot: the engine frees Characters and
+    // recycles the addresses, so an entry found at a given Character* may belong
+    // to an entirely different body, and re-captioning it would drive the
+    // previous occupant's label. index/serial name the body the label was made
+    // for, and a mismatch means start over.
+    struct DebugMarker { void* label; int color; u32 index; u32 serial; };
     std::map<Character*, DebugMarker> debugMarkers_;
     void debugMark(Character* c, int colorId, const char* tag);
     // Lifetime guard (2026-07-11 join crash): the map is keyed by raw
     // Character* the engine can free (and REUSE for a new body, silently
     // stealing the old label). enforceHostAuthority prunes entries whose
     // pointer wasn't vouched live this pass (enumerations / driven / proxy /
-    // validated suppressed); the label object is ours to destroy safely.
+    // validated suppressed).
+    //
+    // Pruning alone is NOT sufficient and 2026-08-03 proved it: it runs on the
+    // slow authority cadence, so between a body despawning and the next pass the
+    // stale entry sits there as bait for the next allocation at that address -
+    // which a mint burst supplies within milliseconds. debugMark therefore checks
+    // BOTH halves per use (hand identity here, engine::markerAlive for the label
+    // itself, since the label is the GUI's object to destroy, not ours).
     void pruneDebugMarkers(const std::set<Character*>& live);
     // world_parity roster rows: one "SCENARIO WNPC" line for a body, with the
     // task/pelvis/mv parity fields appended (world_parity oracle) after the
@@ -1846,6 +2001,47 @@ private:
     // attentionRadius_ <= 0 returns true for everything: gate off.
     bool observedAt(const Key& k, const float* anchors, unsigned int nAnchor,
                     float x, float y, float z);
+    // The same predicate asked about the PEER rather than about us, over
+    // peerAnchors() and its own latch. A census row exists for the peer's
+    // benefit, so whether to write one is the peer's attention question - our
+    // own verdict is not evidence about what they can see.
+    bool observedByPeer(const Key& k, const float* anchors, unsigned int nAnchor,
+                        float x, float y, float z);
+    bool observedIn(std::map<Key, bool>& obs, bool countFlips, const Key& k,
+                    const float* anchors, unsigned int nAnchor,
+                    float x, float y, float z);
+    // Where the PEER is: one center per squad tab we do NOT own, plus their
+    // camera hint. No zone veto - the veto asks "can I enumerate here", and by
+    // the time this is consulted we have already enumerated the body. Writes up
+    // to four centers into out[12]; returns the count. Zero means we know
+    // nothing about the peer, and every caller must fail OPEN on that.
+    unsigned int peerAnchors(GameWorld* gw, float* out);
+public:
+    // Presence authority (protocol 49). Publish a claim for each cell our own
+    // tabs stand in and drain the peer's, both at ~1 Hz on the reliable
+    // channel. No-op with cellAuth_ off, so nothing is on the wire until the
+    // feature is armed.
+    void syncCellClaims(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId);
+    void setCellAuth(bool on) { cellAuth_ = on; }
+    // Who authors the region containing (x,z)? The claimant, or the HOST when
+    // the feature is off, the cell is unclaimed, or the mapping is unavailable.
+    // Never returns "nobody" - an unowned region is the case this exists to
+    // eliminate.
+    u32 authorityFor(GameWorld* gw, float x, float z) const;
+    // Do WE author it? localId comes from the caller because the Replicator has
+    // no NetLink handle of its own.
+    bool weAuthor(GameWorld* gw, u32 localId, float x, float z) const {
+        return authorityFor(gw, x, z) == localId;
+    }
+private:
+    // Recompute claimedCells_ from claimSlots_. Host wins a contested cell.
+    void rebuildClaimedCells();
+    // Should enforcement leave this body alone? True when we author its cell,
+    // or when its author has sent us no census to judge against. Restores the
+    // body first if a previous author's verdict had it hidden. Always false
+    // with cellAuth_ off, which is what keeps the pass bit-identical.
+    bool authorHoldsBody(GameWorld* gw, u32 localId, const Key& k,
+                         Character* c, float x, float z);
     // Drop attnObs_ latches for hands this tick's enumeration no longer sees,
     // so a long session's map cannot grow without bound.
     void pruneAttention(const std::set<Key>& seen);

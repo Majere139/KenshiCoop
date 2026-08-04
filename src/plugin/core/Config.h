@@ -110,6 +110,14 @@ struct Config {
     // (fail-open A/B hatch).
     float        attentionRadius;   // KENSHICOOP_ATTENTION_RADIUS     (1000 u)
 
+    // Presence authority (protocol 49): each side claims the zone cells its own
+    // squad tabs stand in and authors NPC existence there, instead of the host
+    // authoring everywhere. DEFAULT OFF while it lands - with it off,
+    // authorityFor returns the host unconditionally and every gate that
+    // consults it collapses to the previous isHost branch, so the whole
+    // scenario tier must be bit-identical either way.
+    bool         cellAuth;          // KENSHICOOP_CELL_AUTH            (off)
+
     // Census-band AI freeze (KENSHICOOP_CENSUS_FREEZE_AI, DEFAULT ON): the join
     // suspends the local AI of a census-band body (census-present, unstreamed)
     // that diverges past censusParkDist_, so a captive/working slave can't flee
@@ -216,6 +224,10 @@ struct Config {
     // author reliable PKT_INV_XFER intents for moves that cross the single-writer
     // ownership boundary; receivers relocate the real item between their own copies
     // (conservation: no fabrication or destruction, so traded gear survives).
+    // Protocol 50 completes the round trip: the receiver answers each intent with
+    // PKT_INV_XFER_ACK, so the author settles on the verdict (measured ~100 ms)
+    // instead of waiting out XFER_GRACE_MS, which is now only the backstop for a
+    // peer that never answers.
     // SUPERSEDED by blockXfer: when blockXfer is on, cross-owner drags are refused
     // at the engine (nothing to replicate), so xferSync is forced OFF.
     bool          xferSync;
