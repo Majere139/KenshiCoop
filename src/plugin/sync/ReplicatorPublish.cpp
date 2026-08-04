@@ -778,11 +778,26 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
     // that settled it.
     float rawAnch[12];
     unsigned int nRawAnch = engine::interestAnchors(gw, rawAnch);
+    // A proxy's own hand is one WE minted and no other client has ever heard of,
+    // so censusing it under that hand vouches for nothing: the peer looks for the
+    // body it knows, does not find it, and hides its own real copy. That is how a
+    // body ends up visible on one client and suppressed on the other - measured
+    // 2026-08-04 on hand 1,321,597290048,1,3427978496, which the host displayed as
+    // a driven proxy while the join had the original culled, and it is why the pair
+    // saw different populations after travelling together. The body a proxy STANDS
+    // FOR is the hand it was bound to, so that is the hand it is vouched for under.
+    std::map<Character*, Key> proxyKeyOf;
+    for (std::map<Key, Character*>::const_iterator pi = proxyByKey_.begin();
+         pi != proxyByKey_.end(); ++pi)
+        if (pi->second) proxyKeyOf[pi->second] = pi->first;
     std::set<Key> censusKeys;
     unsigned int m = 0;          // rows that survived the gate
     unsigned int nNotMine = 0;   // omitted because another client authors them
+    unsigned int nProxyRow = 0;  // rows published under a bound key, not a local one
     for (unsigned int i = 0; i < n; ++i) {
         Key k = keyOf(states[i]);
+        std::map<Character*, Key>::const_iterator px = proxyKeyOf.find(chars[i]);
+        if (px != proxyKeyOf.end()) { k = px->second; ++nProxyRow; }
         censusKeys.insert(k);
         // The attention gate USED to sit here, and it was the wrong channel for
         // it. A census row is a statement that a body EXISTS, and existence
@@ -806,11 +821,14 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
             ++nNotMine;
             continue;
         }
-        hands[m * 5 + 0] = states[i].hType;
-        hands[m * 5 + 1] = states[i].hContainer;
-        hands[m * 5 + 2] = states[i].hContainerSerial;
-        hands[m * 5 + 3] = states[i].hIndex;
-        hands[m * 5 + 4] = states[i].hSerial;
+        // k, not states[i]: identical for an ordinary body, and the bound hand for
+        // a proxy (above). Position stays local - that is where the body actually
+        // is, whichever hand names it.
+        hands[m * 5 + 0] = k.t;
+        hands[m * 5 + 1] = k.c;
+        hands[m * 5 + 2] = k.cs;
+        hands[m * 5 + 3] = k.i;
+        hands[m * 5 + 4] = k.s;
         poss[m * 3 + 0]  = states[i].x;
         poss[m * 3 + 1]  = states[i].y;
         poss[m * 3 + 2]  = states[i].z;
@@ -940,9 +958,9 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
         char b[320];
         _snprintf(b, sizeof(b) - 1,
                   "[census] sent n=%u radius=%.0f mid=%u anchors=%u%s"
-                  " enum=%u notmine=%u attnR=%.0f",
+                  " enum=%u notmine=%u proxyrow=%u attnR=%.0f",
                   m, censusRadius_, (unsigned)midBand_.size(), na, det,
-                  n, nNotMine, attentionRadius_);
+                  n, nNotMine, nProxyRow, attentionRadius_);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         // KENSHICOOP_DEBUG_CENSUS=1: dump every census row (hand + name) at the
         // same 10 s cadence, so a join-side cull can be classified against the
