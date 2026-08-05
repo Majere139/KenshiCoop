@@ -117,6 +117,29 @@ unsigned int raiseAllStats(GameWorld* gw, const unsigned int subjHand[5], float 
     }
 }
 
+// Does any player-squad member (all tabs) come from the GameData template `sid`?
+// The template stringID is baked in by the game start and survives a rename (the
+// player renames the CHARACTER, not its template), which is what makes it usable
+// as a "this world came from that game start" marker.
+bool playerSquadHasTemplate(GameWorld* gw, const char* sid) {
+    if (!gw || !sid || !sid[0]) return false;
+    __try {
+        if (!gw->player) return false;
+        unsigned int size = (unsigned int)gw->player->playerCharacters.size();
+        for (unsigned int i = 0; i < size; ++i) {
+            Character* c = gw->player->playerCharacters[i];
+            if (!c) continue;
+            GameData* gd = c->getGameData();
+            if (!gd) continue;
+            const char* csid = gd->stringID.c_str();
+            if (csid && strcmp(csid, sid) == 0) return true;
+        }
+        return false;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 // Raise EVERY player-squad member (all tabs) to at least 'value' in every stat.
 // Returns the count of members buffed. Used by the "buffpc" setup scene to bake a
 // maxed-out save on a single client (no coop peer needed).

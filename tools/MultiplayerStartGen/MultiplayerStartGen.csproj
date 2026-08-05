@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Generator for the KenshiCoop game starts. Build-time tool only: it emits the
+       FCS data mod (dist/mods/KenshiCoop/KenshiCoop.mod) and is not part of the C++ plugin. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- OpenConstructionSet 4.1.0 targets net9.0; anything older will not restore. -->
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>MultiplayerStartGen</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- OpenConstructionSet: reads/writes Kenshi .mod/.base data files -->
+    <PackageReference Include="OpenConstructionSet" Version="4.1.0" />
+  </ItemGroup>
+</Project>

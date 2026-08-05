@@ -165,6 +165,16 @@ DWORD           g_scenarioDoneTick = 0; // !=0 once RESULT logged; begins captur
 const DWORD     SCENARIO_HOLD_MS  = 4000; // hold synced state on screen for capture
 #endif
 
+// "Wanderer+ x2" game start (dist/mods/KenshiCoop/KenshiCoop.mod). The FCS record
+// sets the 500k shared wallet, but a Kenshi Character record only carries the
+// GROUPED stat fields ("combat stats", "ranged stats", "stealth stats", "strength",
+// "unarmed stats") and randomises them - there is no way to say "50 in everything"
+// in data. So the start marks itself with the template below and the plugin writes
+// the stat line at gameplay start. Keep the id in sync with Sid(4) in
+// tools/MultiplayerStartGen/Program.cs.
+const char* const WPX2_MARKER_SID = "4-KenshiCoop-MultiplayerStart.mod";
+const float       WPX2_STAT_LEVEL = 50.0f;
+
 // Test-scene setup (host-only): one-shot world spawn the user then saves.
 bool            g_setupDone     = false;
 const DWORD     SETUP_DELAY_MS  = 4000; // let the world settle before spawning
@@ -1509,6 +1519,24 @@ void mainLoop_hook(GameWorld* gw, float dt) {
             coopLog("[speed] intent hooks installed (setGameSpeed/userPause/togglePause)");
         else
             coopLog("[speed] FAILED to install intent hooks (vote capture degraded)");
+        // "Wanderer+ x2" start: give both wanderers the stat line the start
+        // promises. Raise-only, so it is a FLOOR at 50 - it re-runs on every load
+        // of such a world and is a no-op once the characters have trained past it.
+        //
+        // Gated on having no peer: buffAllPlayerStats walks EVERY squad tab, which
+        // on a connected join includes the host's bodies, and writing those fights
+        // the owner-authoritative stats channel (protocol 17). Solo at gameplay
+        // start the write is purely local, and the join receives it as part of the
+        // host's world through the connect-push below.
+        if (!g_peerPresent &&
+            coop::engine::playerSquadHasTemplate(gw, WPX2_MARKER_SID)) {
+            unsigned int nb = coop::engine::buffAllPlayerStats(gw, WPX2_STAT_LEVEL);
+            char b[128];
+            _snprintf(b, sizeof(b) - 1,
+                      "[start] Wanderer+ x2: raised %u PC(s) to %d in every stat",
+                      nb, (int)WPX2_STAT_LEVEL);
+            b[sizeof(b) - 1] = '\0'; coopLog(b);
+        }
         // Push-save-on-connect ordering: if a peer connected while we were still
         // at the menu / loading, its connect edge could not bake a save (no live
         // world yet). Now that gameplay is live, arm the connect-push so the

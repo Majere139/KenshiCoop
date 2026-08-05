@@ -1251,6 +1251,11 @@ unsigned int raiseAllStats(GameWorld* gw, const unsigned int subjHand[5], float 
 // Raise EVERY player-squad member (all tabs) to 'value' in every stat; returns the
 // count of members buffed. The "buffpc" setup scene uses it to bake a maxed save.
 unsigned int buffAllPlayerStats(GameWorld* gw, float value);
+// SEH-guarded: is any player-squad member (all tabs) an instance of the GameData
+// template `sid`? The template stringID comes from the game start and a rename
+// cannot change it, so it identifies WHICH start this world came from. Used to
+// recognise the "Wanderer+ x2" start (see WPX2_MARKER_SID in Plugin.cpp).
+bool playerSquadHasTemplate(GameWorld* gw, const char* sid);
 
 // ---- Protocol 18: carried-body sync --------------------------------------
 // Snapshot of a body's LOCAL carry relationship: is it carrying someone

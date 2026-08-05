@@ -108,11 +108,17 @@ is needed after an edit.
   runs squad 1 and the joining player squad 2. Your friend's squad is visible
   and synced on your screen, but answers only to them. If your save has only
   one squad, move some units into a second squad tab in-game to give them a crew.
-- **Two-player start included.** The KenshiCoop mod ships a **"Multiplayer
-  (Wanderer x2)"** game start (New Game -> pick it from the list): the vanilla
-  Wanderer start, but with two wanderers already split into separate squads, so
-  the host gets squad 1 and the joining player squad 2 with no manual tab-splitting.
-  The start was authored by [zeroit789](https://github.com/zeroit789).
+- **Two-player starts included.** The KenshiCoop mod ships two game starts (New
+  Game -> pick one from the list), both the vanilla Wanderer start with two
+  wanderers already split into separate squads, so the host gets squad 1 and the
+  joining player squad 2 with no manual tab-splitting:
+  - **"Multiplayer (Wanderer x2)"** - the plain version, vanilla in every other
+    way. Authored by [zeroit789](https://github.com/zeroit789).
+  - **"Wanderer+ x2"** - the same start with **500,000 cats** and both
+    characters at **50 in every stat**, for skipping the early grind. Kenshi has
+    a single player wallet and co-op shares it, so the 500,000 is the pair's
+    combined purse, not 500,000 each. The stats are a floor applied when the
+    world loads, so training past 50 sticks normally.
 - **The joining player doesn't need the host's save.** The host picks the save
   (or starts a new game); when the join connects from the menu, the host's world
   is streamed over automatically. Already having an identical copy on disk just
