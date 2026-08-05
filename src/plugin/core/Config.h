@@ -114,11 +114,12 @@ struct Config {
 
     // Presence authority (protocol 49): each side claims the zone cells its own
     // squad tabs stand in and authors NPC existence there, instead of the host
-    // authoring everywhere. DEFAULT OFF while it lands - with it off,
-    // authorityFor returns the host unconditionally and every gate that
-    // consults it collapses to the previous isHost branch, so the whole
-    // scenario tier must be bit-identical either way.
-    bool         cellAuth;          // KENSHICOOP_CELL_AUTH            (off)
+    // authoring everywhere. DEFAULT ON as of v0.47. Set to "0" and authorityFor
+    // returns the host unconditionally, every gate that consults it collapses to
+    // the previous isHost branch, and the build behaves exactly as v0.46 did -
+    // which is the shape the scenario tier still runs in, since the harness pins
+    // the flag clear for every scenario that does not ask for it.
+    bool         cellAuth;          // KENSHICOOP_CELL_AUTH            (on)
 
     // Census-band AI freeze (KENSHICOOP_CENSUS_FREEZE_AI, DEFAULT ON): the join
     // suspends the local AI of a census-band body (census-present, unstreamed)

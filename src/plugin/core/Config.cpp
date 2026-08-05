@@ -318,8 +318,17 @@ void loadConfig(Config& c) {
         std::string ar = envOr("KENSHICOOP_ATTENTION_RADIUS", "");
         c.attentionRadius = ar.empty() ? 1000.0f : (float)std::atof(ar.c_str());
         if (c.attentionRadius < 0.0f) c.attentionRadius = 0.0f;
-        // Presence authority (protocol 49). Opt-in until it has run the tier.
-        c.cellAuth = envOr("KENSHICOOP_CELL_AUTH", "0") != "0";
+        // Presence authority (protocol 49). DEFAULT ON as of v0.47: it has run
+        // split_far2 and run_apart green and a long manual session, and with it
+        // off the join drives a whole town's population off the host's stream
+        // instead of authoring the bodies it is standing next to. "0" restores
+        // unconditional host authority.
+        //
+        // The scenario tier does NOT inherit this default. Set-CoopDiagEnv
+        // (scripts/CoopHarness.psm1) pins KENSHICOOP_CELL_AUTH=0 for every
+        // scenario that does not ask for it, which is what keeps the tier a
+        // fail-open proof rather than a co-test of this flag.
+        c.cellAuth = envOr("KENSHICOOP_CELL_AUTH", "1") != "0";
         // Census-band AI freeze: quiesce a diverging census-band body's local
         // AI so it can't flee/aggro the join's guards. DEFAULT ON; the A/B
         // escape hatch restores the position-park-only behavior.

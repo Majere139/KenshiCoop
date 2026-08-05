@@ -79,9 +79,9 @@ $script:CoopDiagEnvKeys = @(
     # every tick), so it cannot be reached by scheduling a scenario into it.
     'KENSHICOOP_WI_TEST_STALE'
     # --- presence authority (Config.cpp) ----------------------------------------
-    # Off everywhere except split_far2 and run_apart. Every other scenario runs
-    # with it clear, which is what makes the tier a fail-open proof rather than a
-    # co-test.
+    # Off everywhere except split_far2 and run_apart, which is what makes the tier
+    # a fail-open proof rather than a co-test. Note this one is not merely cleared
+    # but pinned to "0" below: the DLL default is ON, so clearing would OPT IN.
     'KENSHICOOP_CELL_AUTH'
     # --- combat speed cap (Config.cpp) ------------------------------------------
     # The speed arbiter pins the sim to 1x while either player squad fights, which
@@ -115,6 +115,14 @@ function Set-CoopDiagEnv {
     param($Entry)
 
     foreach ($k in $script:CoopDiagEnvKeys) { Set-Item -Path "env:$k" -Value "" }
+
+    # Presence authority ships ON (Config.cpp, v0.47), and clearing an env var on
+    # Windows DELETES it, so a cleared keyset would hand every scenario the SHIPPED
+    # default and quietly turn the whole tier into a co-test of that flag. Pin it
+    # clear as the harness baseline instead: the tier's job is to prove the feature
+    # is additive, which it can only do from the isHost branch. DiagEnv still wins,
+    # which is how split_far2 and run_apart ask for it.
+    Set-Item -Path "env:KENSHICOOP_CELL_AUTH" -Value "0"
 
     $applied = @{}
     if ($null -ne $Entry -and ($Entry -is [hashtable]) -and $Entry.ContainsKey('DiagEnv')) {
