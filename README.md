@@ -48,8 +48,7 @@ panel, so there's no config file to edit and no launcher scripts to run. (A tiny
 
 ### Before you start (both players)
 
-1. **Kenshi 1.0.65 (Steam)**, set to windowed mode: launch Kenshi once, then
-   Options > Video > un-check **Full Screen**.
+1. **Kenshi 1.0.65 (Steam)**.
 2. **[RE_Kenshi 0.3.1+](https://www.nexusmods.com/kenshi/mods/847)** installed
    (free Nexus mod - it loads the co-op plugin into the game).
 3. **Steam running and online** on both machines. That's the whole network
@@ -91,8 +90,10 @@ in-game, so the joining player doesn't need to load anything first.
    world to you on connect and you load right into it. (If you already have an
    identical copy of the host's save on disk, it's used as-is instead of
    transferring.)
-6. The white status line shows live state (and a banner over your leader shows
-   it too, in-game). Toggle **Connection** to **OFFLINE** to leave.
+6. The white status line shows live state, and a status banner in the **top-left
+   corner** shows it too - at the main menu as well as in-game, so a joining
+   player can watch the transfer before the world loads. Toggle **Connection** to
+   **OFFLINE** to leave.
 
 **LAN / direct-UDP (advanced):** skip the Steam ID swap. Open
 `<Kenshi>\mods\KenshiCoop\coop_config.json`, set `"transport": "udp"`, and put

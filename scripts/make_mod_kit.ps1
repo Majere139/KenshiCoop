@@ -122,8 +122,7 @@ INSTALL (both players)
 
 PREREQUISITES (both players)
 ----------------------------
-  1. Kenshi 1.0.65 (Steam), set to WINDOWED mode:
-     launch Kenshi once, Options > Video > un-check Full Screen.
+  1. Kenshi 1.0.65 (Steam).
   2. RE_Kenshi 0.3.1+ (free mod that loads the plugin):
      https://www.nexusmods.com/kenshi/mods/847
   3. For the Steam transport (recommended): Steam RUNNING and ONLINE on both
@@ -145,8 +144,10 @@ PLAY (Steam - recommended)
      world to you on connect and you load right into it. (You do NOT need the
      host's save beforehand. If you already have an identical copy on disk it is
      used as-is instead of transferring.)
-  5. The white status line shows live state (and a banner over your leader shows
-     it too, in-game). Toggle Connection to OFFLINE to leave.
+  5. The white status line shows live state, and a status banner in the TOP-LEFT
+     corner shows it too - at the main menu as well as in-game, so a joining
+     player can watch the transfer before the world loads. Toggle Connection to
+     OFFLINE to leave.
 
 PLAY (LAN / direct UDP - advanced)
 ----------------------------------
