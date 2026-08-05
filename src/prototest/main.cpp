@@ -77,7 +77,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(EventPacket)",             sizeof(EventPacket),             54);
     CHECK_EQ("sizeof(EntityState)",             sizeof(EntityState),             79);
     CHECK_EQ("sizeof(EntityBatchHeader)",       sizeof(EntityBatchHeader),       14); // v35: +sendMs; v44: +epoch
-    CHECK_EQ("sizeof(InvItemEntry)",            sizeof(InvItemEntry),            158); // v42: +locked, v48: reserved byte became parentIdx (size unchanged)
+    CHECK_EQ("sizeof(InvItemEntry)",            sizeof(InvItemEntry),            159); // v42: +locked, v48: reserved byte became parentIdx (size unchanged), v51: +level (craft grade)
     CHECK_EQ("sizeof(InvSnapshotHeader)",       sizeof(InvSnapshotHeader),       28); // v33: +keyKind; v46: +flags
     CHECK_EQ("sizeof(WorldItemEntry)",          sizeof(WorldItemEntry),          73);
     CHECK_EQ("sizeof(WorldItemSnapshotHeader)", sizeof(WorldItemSnapshotHeader), 6);
@@ -85,7 +85,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(WorldItemClaimHeader)",    sizeof(WorldItemClaimHeader),    10); // v47
     CHECK_EQ("sizeof(WorldDropPacket)",         sizeof(WorldDropPacket),         191);
     CHECK_EQ("sizeof(WorldPickupPacket)",       sizeof(WorldPickupPacket),       91); // v40: +item identity
-    CHECK_EQ("sizeof(InvXferPacket)",           sizeof(InvXferPacket),           201); // v36
+    CHECK_EQ("sizeof(InvXferPacket)",           sizeof(InvXferPacket),           202); // v36; v51: +level
 
     CHECK_EQ("sizeof(MedPartEntry)",            sizeof(MedPartEntry),            19);
     CHECK_EQ("sizeof(MedicalPacket)",           sizeof(MedicalPacket),           467);
@@ -223,8 +223,8 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v50: transfer verdicts)",
-             (int)PROTOCOL_VERSION, 50);
+    CHECK_EQ("PROTOCOL_VERSION (v51: item craft grade)",
+             (int)PROTOCOL_VERSION, 51);
 
     // Protocol 48: the parent reference. A worn backpack owns a PRIVATE inventory, so a bagged
     // item is described by no snapshot unless it can name its container. The byte was already
@@ -234,6 +234,40 @@ static void testSizes() {
         InvItemEntry pe; std::memset(&pe, 0, sizeof(pe));
         CHECK_EQ("parentIdx defaults to top-level (0)", (int)pe.parentIdx, 0);
         CHECK("parentIdx addresses every entry INV_ITEMS_MAX allows", INV_ITEMS_MAX < 256);
+    }
+
+    // Protocol 51: the craft GRADE. Kenshi's named grades (Prototype 5 ... Masterwork 95)
+    // are points on a 1..100 craft level held in Gear, and `quality` is CONDITION on a
+    // different scale entirely - so the grade needs its own field, must be able to express
+    // the whole range, and must have a not-applicable value distinct from every real level
+    // (level 0 would otherwise read as "mint this at the worst possible grade").
+    {
+        CHECK_EQ("GRADE_NA is out of the 0..100 craft-level range", (int)GRADE_NA, 255);
+        CHECK("GRADE_NA cannot collide with a real craft level", (int)GRADE_NA > 100);
+        InvItemEntry a; std::memset(&a, 0, sizeof(a));
+        InvItemEntry b = a;
+        a.level = 95; b.level = 20;                  // Masterwork vs Shoddy, all else equal
+        CHECK("a re-graded item is a CONTENT change (fingerprint moves)",
+              invEntryHash(a) != invEntryHash(b));
+        // Items with no craft level must hash exactly as they did before the field existed,
+        // or protocol 51 would republish every stack of food in the game once.
+        InvItemEntry na = a; na.level = GRADE_NA;
+        InvItemEntry zero = a; zero.level = 0;
+        CHECK("GRADE_NA folds in as 0 (no spurious resend for non-gear)",
+              invEntryHash(na) == invEntryHash(zero));
+        // The grade must survive a wire round-trip in the same bytes it was written to.
+        InvItemEntry rt; std::memset(&rt, 0, sizeof(rt));
+        rt.level = 95;
+        unsigned char buf[sizeof(InvItemEntry)];
+        std::memcpy(buf, &rt, sizeof(rt));
+        InvItemEntry back; std::memcpy(&back, buf, sizeof(back));
+        CHECK_EQ("InvItemEntry::level round-trips", (int)back.level, 95);
+        InvXferPacket xp; std::memset(&xp, 0, sizeof(xp));
+        xp.level = 80;
+        unsigned char xbuf[sizeof(InvXferPacket)];
+        std::memcpy(xbuf, &xp, sizeof(xp));
+        InvXferPacket xback; std::memcpy(&xback, xbuf, sizeof(xback));
+        CHECK_EQ("InvXferPacket::level round-trips", (int)xback.level, 80);
     }
 
     // Protocol 46 (inventory item-loss fixes). The entry cap must match the receiver's

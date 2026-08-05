@@ -599,6 +599,31 @@ Character* findWorkerNear(GameWorld* gw, RootObject* fixture);
 unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
                           unsigned int maxOut, bool* outTruncated = 0,
                           bool includeNested = false);
+
+// Item::quality - CONDITION, a 0..100 float, NOT the craft grade (see gradeLevelOf and
+// InvItemEntry::level) - as the wire's integer hundredths, so a pristine item is 10000.
+// The ONE conversion every capture site shares, so a bucket means the same thing on every
+// packet. ROUNDS rather than truncates: a float a hair under its decimal value otherwise
+// loses a hundredth of condition on every hop, and rounding costs an add.
+inline unsigned short qualityBucketOf(float quality) {
+    if (quality <= 0.0f) return 0;
+    float b = quality * 100.0f + 0.5f;
+    if (b > 65535.0f) return (unsigned short)65535;
+    return (unsigned short)b;
+}
+
+// An item's craft GRADE for the wire (protocol 51): Gear::getLevel() clamped into a byte,
+// GRADE_NA for anything that is not Gear. Caller must already be inside an SEH frame -
+// isGear() and getLevel() are virtual calls on an engine object.
+inline unsigned char gradeLevelOf(Item* it) {
+    if (!it) return GRADE_NA;
+    Gear* g = it->isGear();              // virtual: null for non-gear (stacks, food, ore)
+    if (!g) return GRADE_NA;
+    int lv = it->getLevel();             // virtual
+    if (lv < 0) return GRADE_NA;
+    if (lv > 254) lv = 254;              // 255 is the not-applicable marker
+    return (unsigned char)lv;
+}
 // Item template by stringID within its itemType category.
 GameData* findItemTemplateImpl(GameWorld* gw, const char* sid, unsigned int typeCat);
 // Spawn a character from a random template into the given faction.
@@ -612,9 +637,13 @@ GameData* fallbackWeaponManufacturer(GameWorld* gw);
 // recipe for WEAPONs; blank-handle fabricate for the rest). Externalised (Phase
 // 5e) so probeFabricateWeaponLoose in EngineProbe.cpp can reuse it; the definition
 // stays in EngineInventory.cpp.
+// `level` is the wire's craft GRADE (protocol 51); GRADE_NA (the default) means the author
+// had none to report, so the engine's own levelOverride default stands and callers that
+// know nothing about grades keep their previous behaviour.
 bool createItemAndAdd(GameWorld* gw, Inventory* inv, const char* sid,
                       unsigned int typeCat, int qty, int qualityBucket, bool equip,
-                      const char* manufacturer = 0, const char* material = 0);
+                      const char* manufacturer = 0, const char* material = 0,
+                      unsigned char level = GRADE_NA);
 
 // EngineSpawnCombat.cpp:
 

@@ -630,16 +630,37 @@ int removeTestItemsFromContainer(GameWorld* gw, const unsigned int cHand[5], int
 int commonTestItemSid(GameWorld* gw, char* outSid, unsigned int outLen,
                       unsigned int* outType);
 
+// SEH-guarded: read the two numbers people conflate, off the first (sid, typeCat) the
+// container at cHand holds. They are DIFFERENT AXES and a test that wants the grade must
+// read the second:
+//   *outBucket   = Item::quality * 100 - CONDITION, not grade, on a 0..100 scale (a
+//                  brand-new item reads 100.0, so this is 10000). Replicated and hashed
+//                  since the start, so it agrees across clients even when the item is
+//                  visibly the wrong grade - which is why asserting on it proved nothing.
+//   *outLevel    = getLevel() - Kenshi's 1..100 craft level (Prototype 5 ... Masterwork
+//                  95), what the item's stats and its grade label derive from. Set at
+//                  construction from the factory's levelOverride and never written
+//                  afterwards, so this is the number a lost grade shows up in.
+//   *outLevel100 = Gear::level_0_100, the raw member behind getLevel() (diagnostic).
+// Level outputs stay -1 for a non-Gear item - a stack of food has no craft level, and so
+// does a piece of gear the peer rebuilt badly enough that isGear() returns null.
+// Returns 1 when a matching item was found, else 0.
+int readGearGradeBySid(GameWorld* gw, const unsigned int cHand[5], const char* sid,
+                       unsigned int typeCat, int* outBucket, int* outLevel,
+                       int* outLevel100 = 0);
+
 // SEH-guarded (protocol 37 fallback): create `qty` of the template (sid, typeCat) and
 // add it to the container at cHand - the fabricate path for a transfer whose local
 // source copy is missing (desync). Weapons need the manufacturer (and optionally the
 // material) sid - the spike-451 recipe inside createItemAndAdd consumes them; other
 // types ignore both. KENSHICOOP_WEAPON_FAB=0 disables the weapon branch entirely.
+// `level` is the wire's craft GRADE (protocol 51); GRADE_NA means the author had none to
+// report, so the rebuilt item keeps the factory default.
 // Returns the number added.
 int addItemsToContainerBySid(GameWorld* gw, const unsigned int cHand[5],
                              const char* sid, unsigned int typeCat, int qty,
                              int qualityBucket, const char* manufacturer,
-                             const char* material);
+                             const char* material, unsigned char level = GRADE_NA);
 
 // SEH-guarded (trade_probe / cross-owner transfers): move up to `qty` of (sid, typeCat)
 // from the container at srcHand into the container at dstHand by RELOCATING the real

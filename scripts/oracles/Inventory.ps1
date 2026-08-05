@@ -388,7 +388,7 @@ function Test-TradeProbe {
 # actually carried it ([xfer] SEND on the dragger, [xfer] APPLY on the peer).
 function Test-TradePeer {
     param([string]$HostFile, [string]$JoinFile)
-    $rx = "SCENARIO TRDE r=(\d+) (OWN|PEER) t=(\d+) count=(\d+) hash=(\d+) probe=(-?\d+) wpn=(-?\d+)"
+    $rx = "SCENARIO TRDE r=(\d+) (OWN|PEER) t=(\d+) count=(\d+) hash=(\d+) probe=(-?\d+) wpn=(-?\d+) arm=(-?\d+) aq=(-?\d+) alv=(-?\d+)"
     $series = {
         param($file)
         $arr = @()
@@ -398,6 +398,9 @@ function Test-TradePeer {
                     $arr += [pscustomobject]@{
                         rank = [int]$matches[1]; t = [int]$matches[3]
                         count = [int]$matches[4]; probe = [int]$matches[6]; wpn = [int]$matches[7]
+                        # arm = tracked-armour count; aq = its wire quality bucket;
+                        # alv = its getLevel() craft level (both -1 when absent here).
+                        arm = [int]$matches[8]; aq = [int]$matches[9]; alv = [int]$matches[10]
                     }
                 }
             }
@@ -411,9 +414,9 @@ function Test-TradePeer {
         return (Add-GateResult -Name "trade_peer" -Status FAIL `
                     -Metrics @{ host = $H.Count; join = $J.Count } -Detail "insufficient samples")
     }
-    # The three cross-owner drags must have MOVED something locally on the host.
+    # The four cross-owner drags must have MOVED something locally on the host.
     $moves = @{}
-    foreach ($m in @("TAKE", "GIVE", "WTAKE")) {
+    foreach ($m in @("TAKE", "GIVE", "WTAKE", "ATAKE")) {
         $l = Select-String -Path $HostFile -Pattern "SCENARIO TRDE $m n=(-?\d+) sid='([^']*)'" |
              Select-Object -Last 1
         if ($l -and $l.Line -match "n=(-?\d+) sid='([^']*)'") {
@@ -459,6 +462,10 @@ function Test-TradePeer {
             }
         }
         if (-not ($first.ContainsKey(0) -and $first.ContainsKey(1))) { return $null }
+        $armPre   = @($S | Where-Object { $_.rank -eq 1 -and $_.alv -ge 0 })
+        $armPost  = @($S | Where-Object { $_.rank -eq 0 -and $_.alv -ge 0 })
+        $armR0Rows = @($S | Where-Object { $_.rank -eq 0 -and $_.arm -gt 0 })
+        $armR1Rows = @($S | Where-Object { $_.rank -eq 1 -and $_.arm -gt 0 })
         [pscustomobject]@{
             probeFirst = $first[0].probe + $first[1].probe
             probeFinal = $final[0].probe + $final[1].probe
@@ -466,6 +473,23 @@ function Test-TradePeer {
             wpnFirst = $first[0].wpn + $first[1].wpn
             wpnFinal = $final[0].wpn + $final[1].wpn
             wpnR0 = $final[0].wpn; wpnR1 = $final[1].wpn
+            # The armour is MINTED mid-run, so its baseline is the first sample in which it
+            # exists, not the series' first row (which predates the mint and would score
+            # the mint itself as a duplication). Peaks are per rank, which is enough to
+            # catch a dupe without pairing the two ranks' samples by timestamp.
+            armFinal = $final[0].arm + $final[1].arm
+            armR0 = $final[0].arm; armR1 = $final[1].arm
+            armPeakR0 = $(if ($armR0Rows.Count -gt 0) { ($armR0Rows | Measure-Object -Property arm -Maximum).Maximum } else { 0 })
+            armPeakR1 = $(if ($armR1Rows.Count -gt 0) { ($armR1Rows | Measure-Object -Property arm -Maximum).Maximum } else { 0 })
+            armEverSeen = ($armR0Rows.Count + $armR1Rows.Count) -gt 0
+            # The tracked armour's grade BEFORE the drag is read from rank 1 (where it
+            # starts) and AFTER from rank 0 (where it lands). alv = -1 means "this
+            # container does not hold the piece", so those samples say nothing about its
+            # grade and are excluded rather than counted as a demotion.
+            armPreLvl  = $(if ($armPre.Count  -gt 0) { $armPre[0].alv }  else { -1 })
+            armPreQ    = $(if ($armPre.Count  -gt 0) { $armPre[0].aq }   else { -1 })
+            armPostLvl = $(if ($armPost.Count -gt 0) { $armPost[$armPost.Count - 1].alv } else { -1 })
+            armPostQ   = $(if ($armPost.Count -gt 0) { $armPost[$armPost.Count - 1].aq }  else { -1 })
         }
     }
     $hs = & $summar $H
@@ -517,33 +541,109 @@ function Test-TradePeer {
               elseif (-not ($wpnConsH -and $wpnConsJ)) { "VANISH(host $($hs.wpnFirst)->$($hs.wpnFinal) join $($js.wpnFirst)->$($js.wpnFinal))" }
               elseif (-not $wpnAgree) { "DIVERGED(host r0=$($hs.wpnR0)/r1=$($hs.wpnR1) vs join r0=$($js.wpnR0)/r1=$($js.wpnR1))" }
               else { "NO-MOVE(weapon never landed in r0)" }
+    # ATAKE: exactly ONE reference piece is minted, so at REST each client must hold it once,
+    # in rank 0. Judged on the SETTLED state - the same bar as the WTAKE gate beside it, and
+    # deliberately so: the receiver transiently over-counts EVERY leg of this scenario for
+    # ~14 s after a drag (the real item is relocated while a copy is fabricated from the
+    # owner's still-stale snapshot, which reconcile then removes). The weapon leg peaks at 3
+    # and the probe leg at 4 in exactly the same window, so that transient is pre-existing
+    # and unrelated to grades; gating on peaks here would fail this scenario for a different
+    # defect. It is surfaced as a FINDING below rather than silently dropped.
+    $armConsH = ($hs.armFinal -eq 1)
+    $armConsJ = ($js.armFinal -eq 1)
+    $armAgree = ($hs.armR0 -eq $js.armR0) -and ($hs.armR1 -eq $js.armR1)
+    $armMoved = ($hs.armR0 -ge 1) -and ($hs.armR1 -eq 0)
+    $armSeen  = $hs.armEverSeen -and $js.armEverSeen
+    $armOk  = $armSeen -and $armConsH -and $armConsJ -and $armAgree -and $armMoved
+    $armSig = if ($armOk) { "CLEAN" }
+              elseif (-not $armSeen) { "ABSENT(the seeded armour never reached both clients)" }
+              elseif (-not ($armConsH -and $armConsJ)) { "NOT-CONSERVED(host final=$($hs.armFinal) join final=$($js.armFinal) - expected exactly 1 each)" }
+              elseif (-not $armAgree) { "DIVERGED(host r0=$($hs.armR0)/r1=$($hs.armR1) vs join r0=$($js.armR0)/r1=$($js.armR1))" }
+              else { "NO-MOVE(armour never landed in r0)" }
+    $armPeak = [Math]::Max([Math]::Max($hs.armPeakR0, $hs.armPeakR1),
+                           [Math]::Max($js.armPeakR0, $js.armPeakR1))
+    # THE GRADE GATE. Kenshi's named grades (Prototype 5 ... Masterwork 95) are points on a
+    # 1-100 craft level, so the number that must survive is alv (getLevel()), NOT aq (the
+    # Item::quality bucket the wire carries and the fabricate path writes back - it agrees
+    # across clients by construction, which is why weapon_loot's qual= assertion never
+    # caught a demoted item).
+    #
+    # The REFERENCE is the level the join's own mint actually produced, read from its seed
+    # line rather than hardcoded here - that keeps the expected value owned by the scenario
+    # and, more importantly, states the assumption the whole fix rests on as its own gate:
+    # if the engine ignored levelOverride, mintHonoured fails and the run says so instead of
+    # blaming the sync.
+    $LVL_TOL = 2      # levels; getLevel() is integral, so this only absorbs rounding
+    $Q_TOL   = 5      # buckets; the tolerance Test-WeaponLoot already uses for quality
+    $seedRx = "SCENARIO TRDE arm seeded ok=(-?\d+) sid='([^']*)' wantLvl=(-?\d+) gotLvl=(-?\d+) gotQ=(-?\d+)"
+    $seedLine = Select-String -Path $JoinFile -Pattern $seedRx | Select-Object -Last 1
+    $seedOk = $false; $wantLvl = -1; $refLvl = -1; $refQ = -1
+    if ($seedLine -and ($seedLine.Line -match $seedRx)) {
+        $seedOk  = ([int]$matches[1] -eq 1)
+        $wantLvl = [int]$matches[3]
+        $refLvl  = [int]$matches[4]
+        $refQ    = [int]$matches[5]
+    }
+    $mintHonoured = $seedOk -and ($refLvl -ge 0) -and ([Math]::Abs($refLvl - $wantLvl) -le $LVL_TOL)
+    $gradeKnown = $mintHonoured -and ($hs.armPostLvl -ge 0) -and ($js.armPostLvl -ge 0)
+    $gradeAgree = $gradeKnown -and ([Math]::Abs($hs.armPostLvl - $js.armPostLvl) -le $LVL_TOL)
+    # Against the reference on BOTH sides: the join must not lose the grade of the piece it
+    # minted, and the host's copy - which it could only get by fabricating from the wire -
+    # must carry the same grade.
+    $gradeKept  = $gradeKnown -and ([Math]::Abs($js.armPostLvl - $refLvl) -le $LVL_TOL) -and
+                                   ([Math]::Abs($hs.armPostLvl - $refLvl) -le $LVL_TOL)
+    $qAgree     = $gradeKnown -and ([Math]::Abs($hs.armPostQ - $js.armPostQ) -le $Q_TOL)
+    $gradeOk    = $gradeAgree -and $gradeKept -and $qAgree
+    $gradeSig = if ($gradeOk) { "CLEAN" }
+                elseif (-not $seedOk) { "NO-SEED(the join never minted the reference armour)" }
+                elseif (-not $mintHonoured) { "MINT-IGNORED(asked for lvl=$wantLvl, engine produced $refLvl - levelOverride is not the craft level)" }
+                elseif (-not $gradeKnown) { "UNREAD(the piece was never readable in r0 on both clients)" }
+                elseif (-not $gradeKept) { "DEMOTED(reference alv=$refLvl -> host $($hs.armPostLvl) join $($js.armPostLvl))" }
+                elseif (-not $gradeAgree) { "DIVERGED(host alv=$($hs.armPostLvl) vs join alv=$($js.armPostLvl))" }
+                else { "QUALITY-DIVERGED(host aq=$($hs.armPostQ) vs join aq=$($js.armPostQ))" }
     # Probe-item conservation: cross-owner moves conserve; the seeds add +5 globally.
     $consH = $hs.probeFinal -eq ($hs.probeFirst + 5)
     $consJ = $js.probeFinal -eq ($js.probeFirst + 5)
     $probeAgree = ($hR0end -eq $jR0end) -and ($hR1end -eq $jR1end)
     $mv = { param($m) if ($moves.ContainsKey($m)) { "n=$($moves[$m].n) sid='$($moves[$m].sid)'" } else { "(missing)" } }
-    Write-Host "  TRADE-PEER moves: TAKE $(& $mv 'TAKE')  GIVE $(& $mv 'GIVE')  WTAKE $(& $mv 'WTAKE')  seeds host=$seedH join=$seedJ  xfer sent=$sends applied=$applies acked=$($ackIds.Count) (reject=$rejects partial=$partials missing=$ackMissing slowestMs=$maxWait)"
+    Write-Host "  TRADE-PEER moves: TAKE $(& $mv 'TAKE')  GIVE $(& $mv 'GIVE')  WTAKE $(& $mv 'WTAKE')  ATAKE $(& $mv 'ATAKE')  seeds host=$seedH join=$seedJ  xfer sent=$sends applied=$applies acked=$($ackIds.Count) (reject=$rejects partial=$partials missing=$ackMissing slowestMs=$maxWait)"
     Write-Host "  TRADE-PEER probe totals: host $($hs.probeFirst)->$($hs.probeFinal) (r0=$hR0end r1=$hR1end)  join $($js.probeFirst)->$($js.probeFinal) (r0=$jR0end r1=$jR1end)  conserve host=$consH join=$consJ agree=$probeAgree"
     Write-Host "  TRADE-PEER wpn   totals: host $($hs.wpnFirst)->$($hs.wpnFinal) (r0=$($hs.wpnR0) r1=$($hs.wpnR1))  join $($js.wpnFirst)->$($js.wpnFinal) (r0=$($js.wpnR0) r1=$($js.wpnR1))"
+    Write-Host "  TRADE-PEER arm   totals: host final=$($hs.armFinal) (r0=$($hs.armR0) r1=$($hs.armR1) peak r0/r1=$($hs.armPeakR0)/$($hs.armPeakR1))  join final=$($js.armFinal) (r0=$($js.armR0) r1=$($js.armR1) peak r0/r1=$($js.armPeakR0)/$($js.armPeakR1))"
+    Write-Host "  TRADE-PEER arm   grade: minted lvl=$refLvl (want $wantLvl) q=$refQ  pre-drag host alv=$($hs.armPreLvl) join alv=$($js.armPreLvl)  post-drag host alv=$($hs.armPostLvl) aq=$($hs.armPostQ)  join alv=$($js.armPostLvl) aq=$($js.armPostQ)"
     Write-Host "  TRADE-PEER TAKE : landed=$takeLanded removalPropagated=$takePropagated noDupe=$takeNoDupe => $takeSig"
     Write-Host "  TRADE-PEER GIVE : sent=$giveSent arrived=$giveArrived keptOnDragger=$giveKeptH => $giveSig"
     Write-Host "  TRADE-PEER WTAKE: conserveH=$wpnConsH conserveJ=$wpnConsJ agree=$wpnAgree moved=$wpnMoved => $wpnSig"
+    Write-Host "  TRADE-PEER ATAKE: conserveH=$armConsH conserveJ=$armConsJ agree=$armAgree moved=$armMoved => $armSig"
+    if ($armPeak -gt 1) {
+        Write-Host "  FINDING: the traded armour was transiently DOUBLED on a client (peak=$armPeak) before reconcile settled it to 1 - the same post-drag transient the weapon and probe legs show, so not grade-related; advisory here, gated on the settled state"
+    }
+    Write-Host "  TRADE-PEER GRADE: seeded=$seedOk mintHonoured=$mintHonoured known=$gradeKnown agree=$gradeAgree kept=$gradeKept qualAgree=$qAgree => $gradeSig"
+    if (-not $gradeKnown) {
+        Write-Host "    NOTE: the grade gate needs the join's minted Masterwork armour to reach rank 0 on both clients; without it a demotion cannot be observed"
+    }
     $executed = $moves.ContainsKey("TAKE") -and $moves["TAKE"].n -ge 1 -and `
                 $moves.ContainsKey("GIVE") -and $moves["GIVE"].n -ge 1 -and `
                 $moves.ContainsKey("WTAKE") -and $moves["WTAKE"].n -ge 1 -and `
+                $moves.ContainsKey("ATAKE") -and $moves["ATAKE"].n -ge 1 -and `
                 $seedH -and $seedJ
-    $channel = ($sends -ge 3) -and ($applies -ge 3) -and $ackOk
+    $channel = ($sends -ge 4) -and ($applies -ge 4) -and $ackOk
     $ok = $executed -and $channel -and $takeOk -and $giveOk -and $wpnOk -and `
-          $consH -and $consJ -and $probeAgree
+          $armOk -and $gradeOk -and $consH -and $consJ -and $probeAgree
     $v = if ($ok) { "PASS" } else { "FAIL" }
-    Write-Host "  TRADE-PEER $v - executed=$executed channel=$channel (ack=$ackOk) take=$takeOk give=$giveOk wpn=$wpnOk conserve=$($consH -and $consJ) agree=$probeAgree"
+    Write-Host "  TRADE-PEER $v - executed=$executed channel=$channel (ack=$ackOk) take=$takeOk give=$giveOk wpn=$wpnOk arm=$armOk grade=$gradeOk conserve=$($consH -and $consJ) agree=$probeAgree"
     return (Add-GateResult -Name "trade_peer" -Status $v -Metrics @{
         hostProbe = "$($hs.probeFirst)->$($hs.probeFinal)"; joinProbe = "$($js.probeFirst)->$($js.probeFinal)"
         hostWpn = "$($hs.wpnFirst)->$($hs.wpnFinal)"; joinWpn = "$($js.wpnFirst)->$($js.wpnFinal)"
+        hostArm = "final=$($hs.armFinal) peak=$($hs.armPeakR0)/$($hs.armPeakR1)"
+        joinArm = "final=$($js.armFinal) peak=$($js.armPeakR0)/$($js.armPeakR1)"
+        armRefLvl = $refLvl; armHostLvl = $hs.armPostLvl; armJoinLvl = $js.armPostLvl
+        armRefQ = $refQ; armHostQ = $hs.armPostQ; armJoinQ = $js.armPostQ
         sends = $sends; applies = $applies; acked = $ackIds.Count
         ackReject = $rejects; ackPartial = $partials; ackMissing = $ackMissing
         ackSlowestMs = $maxWait
-        takeSig = $takeSig; giveSig = $giveSig; wpnSig = $wpnSig })
+        takeSig = $takeSig; giveSig = $giveSig; wpnSig = $wpnSig
+        armSig = $armSig; gradeSig = $gradeSig })
 }
 
 # drop_probe (W0 diagnostic): assert the probe EXECUTED and surface the evidence.

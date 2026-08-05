@@ -1676,14 +1676,16 @@ void Replicator::detectAndPublishTransfers(GameWorld* gw, NetLink& net, u32 owne
             strncpy(pkt.stringID, f.key.first.c_str(), sizeof(pkt.stringID) - 1);
             pkt.itemType = f.key.second;
             pkt.quantity = (u16)((f.qty > 65535) ? 65535 : f.qty);
-            // Provenance/quality off the moved stack (it lives in dst now) - a peer
+            // Provenance/quality/grade off the moved stack (it lives in dst now) - a peer
             // may need them if it has to fabricate a missing non-gear copy.
+            pkt.level = GRADE_NA;
             unsigned int dHand[5] = { f.dst.t, f.dst.c, f.dst.cs, f.dst.i, f.dst.s };
             unsigned int nd = engine::captureContainerContents(gw, dHand, items, 64, 0);
             for (unsigned int j = 0; j < nd; ++j) {
                 if (items[j].itemType != f.key.second) continue;
                 if (strcmp(items[j].stringID, f.key.first.c_str()) != 0) continue;
                 pkt.quality = items[j].quality;
+                pkt.level   = items[j].level;
                 strncpy(pkt.manufacturer, items[j].manufacturer, sizeof(pkt.manufacturer) - 1);
                 strncpy(pkt.material,     items[j].material,     sizeof(pkt.material) - 1);
                 break;
@@ -1768,7 +1770,7 @@ void Replicator::applyTransfers(GameWorld* gw, Inbound& in, NetLink& net, u32 lo
             if ((!isGearType(p.itemType) || gearFab) && !engine::isContainerItemType(p.itemType))
                 fab = engine::addItemsToContainerBySid(gw, dHand, p.stringID, p.itemType,
                                                        (int)p.quantity - moved, (int)p.quality,
-                                                       p.manufacturer, p.material);
+                                                       p.manufacturer, p.material, p.level);
         }
         XKey key(std::string(p.stringID), p.itemType);
         // Latch OUR peer end(s) too: an in-flight stale snapshot (captured by its

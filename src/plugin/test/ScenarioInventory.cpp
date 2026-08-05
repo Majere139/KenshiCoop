@@ -272,23 +272,45 @@ private:
 //   TAKE  @16s: 1 common item  rank1 -> rank0  (drag OUT of the peer's bag)
 //   GIVE  @26s: 1 common item  rank0 -> rank1  (drag INTO the peer's bag)
 //   WTAKE @36s: 1 WEAPON       rank1 -> rank0  (the vanish case: no fabrication path)
+//   ATAKE @46s: 1 ARMOUR       rank1 -> rank0  (the GRADE case, below)
 // Both clients seed their OWN container @6s (join +3 / host +2 commons) so material
 // exists, and sample BOTH containers every 500 ms, logging per-container count/hash
-// plus the tracked probe-item and weapon quantities. The runner's Test-TradeProbe
+// plus the tracked probe-item, weapon and armour quantities. The runner's Test-TradeProbe
 // reads the series from both logs and reports the conservation outcome per move
 // (dupe / loss / clean) - the log IS the deliverable; nothing here gates sync quality.
+// GRADE: the armour leg exists because a traded item was arriving on the peer at the wrong
+// quality - Masterwork landing as something plainer. Kenshi's named grades are points on a
+// 1-100 craft level baked into Gear at construction, while the inventory wire carries only
+// the Item::quality float, which the fabricate path writes back verbatim. So a rebuilt copy
+// agreed on quality and disagreed on the grade the player actually reads, and the existing
+// qual= assertions (weapon_loot) could not see it because they compare the same field the
+// fabricate path patches. The leg therefore samples BOTH numbers per container - aq (the
+// wire's bucket) and alv (getLevel(), the grade source) - and Test-TradePeer gates alv
+// across clients and against its pre-drag baseline:
+//   pick   @first sample: a NOVEL armour template, held by neither tab
+//   seed   @12s (JOIN):   mint it into the join's OWN tab at level 95 (Masterwork),
+//                         through the engine factory rather than the sync's fabricate
+//                         path, so the reference is graded correctly even with the fix off
+//   ATAKE  @46s (HOST):   drag it rank1 -> rank0
+// The host can only obtain its copy through the inventory snapshot channel, so a grade
+// dropped on fabricate shows up as host and join disagreeing on alv. Armour rather than a
+// weapon because armour is also the case whose material spec has to resolve for the
+// rebuilt piece to keep its stats.
 class TradeScenario : public TimedScenario {
 public:
     explicit TradeScenario(bool peer)
         : TimedScenario(peer ? "trade_peer" : "trade_probe", 0),
           peer_(peer), tag_(peer ? "TRDE" : "TRDP"),
-          hostDur_(peer ? 70000UL : 68000UL), joinDur_(peer ? 56000UL : 52000UL),
+          hostDur_(peer ? 78000UL : 68000UL), joinDur_(peer ? 64000UL : 52000UL),
           lastLogMs_(0), samples_(0),
           seedDone_(false), takeDone_(false), giveDone_(false), wpnDone_(false),
-          probeType_(0), wpnType_(0), wpnLatched_(false),
+          armDone_(false),
+          probeType_(0), wpnType_(0), wpnLatched_(false), armLatched_(false),
+          armSeeded_(false), armBaseDone_(false),
           firstDone_(false), firstWpn0_(0), firstWpn1_(0),
-          lastWpn0_(0), lastWpn1_(0) {
-        probeSid_[0] = '\0'; wpnSid_[0] = '\0';
+          lastWpn0_(0), lastWpn1_(0),
+          firstArm0_(0), firstArm1_(0), lastArm0_(0), lastArm1_(0) {
+        probeSid_[0] = '\0'; wpnSid_[0] = '\0'; armSid_[0] = '\0';
         for (int r = 0; r < 2; ++r) { rankHave_[r] = false; for (int k = 0; k < 5; ++k) rankHand_[r][k] = 0; }
     }
 
@@ -312,7 +334,11 @@ public:
             // container at first sample. Same save -> same pick on each side, so
             // the two logs track the same item without exchanging anything.
             if (!wpnLatched_ && rankHave_[1]) latchWeapon(ctx.gw);
+            // Armour tracking is trade_peer's (the grade gate); trade_probe is a frozen
+            // baseline and keeps its three drags, logging arm=0 aq=-1 alv=-1 throughout.
+            if (peer_ && !armLatched_ && rankHave_[0] && rankHave_[1]) pickArmour(ctx.gw);
             int wpnNow[2] = { 0, 0 };
+            int armNow[2] = { 0, 0 };
             bool sampledBoth = true;
             for (unsigned int rank = 0; rank < 2; ++rank) {
                 if (!rankHave_[rank]) { sampledBoth = false; continue; }
@@ -321,7 +347,7 @@ public:
                 unsigned int n = engine::captureContainerContents(
                     ctx.gw, rankHand_[rank], items, INV_ITEMS_MAX, &hash);
                 if (n == 0) sampledBoth = false;
-                int probeQty = 0, wpnQty = 0;
+                int probeQty = 0, wpnQty = 0, armQty = 0;
                 for (unsigned int i = 0; i < n; ++i) {
                     if (probeSid_[0] && items[i].itemType == probeType_ &&
                         strcmp(items[i].stringID, probeSid_) == 0)
@@ -329,13 +355,27 @@ public:
                     if (wpnSid_[0] && items[i].itemType == WEAPON_CAT &&
                         strcmp(items[i].stringID, wpnSid_) == 0)
                         wpnQty += (int)items[i].quantity;
+                    if (armSid_[0] && items[i].itemType == ARMOUR_CAT &&
+                        strcmp(items[i].stringID, armSid_) == 0)
+                        armQty += (int)items[i].quantity;
                 }
                 wpnNow[rank] = wpnQty;
-                char b[200];
+                armNow[rank] = armQty;
+                // The tracked armour's GRADE, both ways of reading it, so the oracle can
+                // see them diverge: aq is the wire's bucket (Item::quality * 100), alv is
+                // getLevel() - the craft level the displayed grade comes from. Both -1
+                // when this container does not hold the piece.
+                int armQual = -1, armLvl = -1;
+                if (armSid_[0] && armQty > 0)
+                    engine::readGearGradeBySid(ctx.gw, rankHand_[rank], armSid_,
+                                               ARMOUR_CAT, &armQual, &armLvl);
+                char b[260];
                 _snprintf(b, sizeof(b) - 1,
-                    "SCENARIO %s r=%u %s t=%lu count=%u hash=%u probe=%d wpn=%d",
+                    "SCENARIO %s r=%u %s t=%lu count=%u hash=%u probe=%d wpn=%d "
+                    "arm=%d aq=%d alv=%d",
                     tag_, rank, (ctx.isHost == (rank == 0)) ? "OWN" : "PEER",
-                    (unsigned long)ctx.elapsedMs, n, hash, probeQty, wpnQty);
+                    (unsigned long)ctx.elapsedMs, n, hash, probeQty, wpnQty,
+                    armQty, armQual, armLvl);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
                 ++samples_;
             }
@@ -345,7 +385,15 @@ public:
                     firstDone_ = true;
                     firstWpn0_ = wpnNow[0]; firstWpn1_ = wpnNow[1];
                 }
+                // The armour baseline waits for the seeded piece to EXIST. It is minted
+                // mid-run, so a baseline taken at the first sample would read 0 and the
+                // conservation check would score the mint itself as a duplication.
+                if (!armBaseDone_ && (armNow[0] + armNow[1]) > 0) {
+                    armBaseDone_ = true;
+                    firstArm0_ = armNow[0]; firstArm1_ = armNow[1];
+                }
                 lastWpn0_ = wpnNow[0]; lastWpn1_ = wpnNow[1];
+                lastArm0_ = armNow[0]; lastArm1_ = armNow[1];
             }
 
             // Seed material into the container each side OWNS (ordinary, supported
@@ -362,6 +410,12 @@ public:
                               tag_, ownRank, got, sid[0] ? sid : "(none)");
                     m[sizeof(m) - 1] = '\0'; coop::logLine(m);
                 }
+            }
+
+            // The graded reference piece, minted by its OWNER (the join) into rank 1.
+            if (peer_ && !ctx.isHost && !armSeeded_ && armLatched_ &&
+                ctx.elapsedMs >= ARM_SEED_MS && rankHave_[1]) {
+                seedArmour(ctx.gw);
             }
 
             // The cross-owner drags: HOST only (the "player A" of the field report).
@@ -386,13 +440,22 @@ public:
                         : -1; // no weapon found in the join-owned container
                     logMove("WTAKE", got, wpnSid_[0] ? wpnSid_ : "(none)");
                 }
+                if (peer_ && !armDone_ && ctx.elapsedMs >= ARM_MS) {
+                    armDone_ = true;
+                    int got = armSid_[0]
+                        ? engine::moveItemBetweenContainers(
+                              ctx.gw, rankHand_[1], rankHand_[0], armSid_, ARMOUR_CAT, 1)
+                        : -1; // no reference armour was picked/seeded
+                    logMove("ATAKE", got, armSid_[0] ? armSid_ : "(none)");
+                }
             }
         }
 
         unsigned long dur = ctx.isHost ? hostDur_ : joinDur_;
         if (ctx.elapsedMs >= dur) {
             bool executed = rankHave_[0] && rankHave_[1] && samples_ > 0 && seedDone_ &&
-                            (!ctx.isHost || (takeDone_ && giveDone_ && wpnDone_));
+                            (!ctx.isHost || (takeDone_ && giveDone_ && wpnDone_ &&
+                                             (!peer_ || armDone_)));
             if (!peer_) {
                 // trade_probe: verdict = the probe EXECUTED (containers resolved,
                 // sampled, and - on the host - all three cross-owner drags fired). The
@@ -408,13 +471,24 @@ public:
                 wpnOk = (lastWpn0_ + lastWpn1_) == (firstWpn0_ + firstWpn1_) &&
                         lastWpn0_ == firstWpn0_ + 1 && lastWpn1_ == firstWpn1_ - 1;
             }
-            char m[220];
+            // Armour CONSERVATION only. Whether the grade survived is a cross-client
+            // comparison, and neither client can see the other's alv - that judgement is
+            // Test-TradePeer's, from both logs.
+            bool armOk = true;
+            if (armBaseDone_ && armSid_[0]) {
+                armOk = (lastArm0_ + lastArm1_) == (firstArm0_ + firstArm1_) &&
+                        lastArm0_ == firstArm0_ + 1 && lastArm1_ == firstArm1_ - 1;
+            }
+            char m[320];
             _snprintf(m, sizeof(m) - 1,
-                "SCENARIO TRDE verdict executed=%d wpnOk=%d wpn r0 %d->%d r1 %d->%d sid='%s'",
+                "SCENARIO TRDE verdict executed=%d wpnOk=%d wpn r0 %d->%d r1 %d->%d sid='%s'"
+                " armOk=%d arm r0 %d->%d r1 %d->%d armSid='%s'",
                 executed ? 1 : 0, wpnOk ? 1 : 0, firstWpn0_, lastWpn0_,
-                firstWpn1_, lastWpn1_, wpnSid_[0] ? wpnSid_ : "(none)");
+                firstWpn1_, lastWpn1_, wpnSid_[0] ? wpnSid_ : "(none)",
+                armOk ? 1 : 0, firstArm0_, lastArm0_, firstArm1_, lastArm1_,
+                armSid_[0] ? armSid_ : "(none)");
             m[sizeof(m) - 1] = '\0'; coop::logLine(m);
-            passed_ = executed && wpnOk;
+            passed_ = executed && wpnOk && armOk;
             return true;
         }
         return false;
@@ -439,6 +513,47 @@ private:
         char b[160];
         _snprintf(b, sizeof(b) - 1, "SCENARIO %s wpn latched sid='%s'",
                   tag_, wpnSid_[0] ? wpnSid_ : "(none)");
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    // The tracked ARMOUR template. NOVEL - held by neither tab - because the grade read
+    // matches on (sid, itemType) and returns the first hit, so a pre-existing copy in
+    // either container would leave it describing the wrong object. The shared save cannot
+    // supply the piece: both starting characters wear the SAME trousers at the SAME grade,
+    // which can neither be told apart nor demoted. So the join MINTS one (below) instead.
+    // Both clients pick the sid from the shared gamedata in the same enumeration order, as
+    // weapon_loot does, and therefore agree on it without exchanging anything.
+    void pickArmour(GameWorld* gw) {
+        armLatched_ = true;
+        if (engine::commonNovelArmourSid(gw, rankHand_[1], rankHand_[0],
+                                         armSid_, sizeof(armSid_)) == 0)
+            armSid_[0] = '\0';
+        char b[200];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO %s arm picked sid='%s'",
+                  tag_, armSid_[0] ? armSid_ : "(none)");
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // Put the graded reference piece into the JOIN-owned tab, minted by the JOIN. Two
+    // things make this the honest way round:
+    //  * OWNERSHIP - rank 1 is the join's, and a host-authored item there would be a
+    //    cross-owner write the reconcile is entitled to undo.
+    //  * INDEPENDENCE - the mint goes straight to the engine factory at an explicit level,
+    //    not through the sync's fabricate path, so it is graded correctly even in a run
+    //    with KENSHICOOP_GEAR_LEVEL=0. The host's copy, by contrast, can only arrive
+    //    through the inventory snapshot channel - the path under test. If that path drops
+    //    the grade, host and join disagree before the drag even happens, and ATAKE then
+    //    shows whether the trade itself preserves what each side has.
+    void seedArmour(GameWorld* gw) {
+        armSeeded_ = true;
+        int lvl = -1, q = -1;
+        int ok = armSid_[0]
+            ? engine::mintGradedGearForTest(gw, rankHand_[1], armSid_, ARMOUR_CAT,
+                                            ARM_LEVEL, &lvl, &q)
+            : 0;
+        char b[240];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO %s arm seeded ok=%d sid='%s' wantLvl=%d gotLvl=%d gotQ=%d",
+                  tag_, ok, armSid_[0] ? armSid_ : "(none)", (int)ARM_LEVEL, lvl, q);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
     void logMove(const char* what, int got, const char* sid) {
@@ -501,9 +616,20 @@ private:
     static const unsigned long TAKE_MS          = 16000;
     static const unsigned long GIVE_MS          = 26000;
     static const unsigned long WPN_MS           = 36000;
+    // The graded reference piece is minted early so it has ~34 s to reach the host through
+    // the inventory snapshot channel before the drag. The armour drag itself needs the same
+    // downstream settle the weapon one gets, so it sits a full 10 s after WTAKE, and both
+    // windows grew by 8 s to keep it. run_test.ps1 gives a named scenario a 150 s backstop,
+    // so no manifest change.
+    static const unsigned long ARM_SEED_MS      = 12000;
+    static const unsigned long ARM_MS           = 46000;
+    // Masterwork - the top named grade, and the one the field report lost. Any demotion
+    // moves DOWN from here, so a wrong grade cannot coincidentally match.
+    static const int           ARM_LEVEL        = 95;
 
     static const unsigned int  MAX_SQUAD  = 32;
     static const unsigned int  WEAPON_CAT = 2;
+    static const unsigned int  ARMOUR_CAT = 3;
 
     bool          peer_;      // false = trade_probe (baseline), true = trade_peer (xfer)
     const char*   tag_;       // "TRDP" (probe) / "TRDE" (peer) - the oracle log tag
@@ -515,14 +641,21 @@ private:
     bool          takeDone_;
     bool          giveDone_;
     bool          wpnDone_;
+    bool          armDone_;
     char          probeSid_[48];
     unsigned int  probeType_;
     char          wpnSid_[48];
     unsigned int  wpnType_;
     bool          wpnLatched_;
+    char          armSid_[48];            // trade_peer: the tracked (graded) armour
+    bool          armLatched_;            // sid picked
+    bool          armSeeded_;             // join minted the reference piece
+    bool          armBaseDone_;           // conservation baseline taken (piece exists)
     bool          firstDone_;             // trade_peer: conservation baseline latched
     int           firstWpn0_, firstWpn1_; // trade_peer: tracked-weapon counts at baseline
     int           lastWpn0_,  lastWpn1_;  // trade_peer: latest tracked-weapon counts
+    int           firstArm0_, firstArm1_; // trade_peer: tracked-armour counts at baseline
+    int           lastArm0_,  lastArm1_;  // trade_peer: latest tracked-armour counts
     bool          rankHave_[2];
     unsigned int  rankHand_[2][5];
 };

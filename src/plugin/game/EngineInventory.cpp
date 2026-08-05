@@ -111,8 +111,8 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
                     out[n].itemType = (unsigned int)gd->type;
                     int q = it->quantity; if (q < 1) q = 1;
                     out[n].quantity = (q > 65535) ? (unsigned short)65535 : (unsigned short)q;
-                    float ql = it->quality; if (ql < 0.0f) ql = 0.0f;
-                    out[n].quality = (unsigned short)(ql * 100.0f);
+                    out[n].quality = qualityBucketOf(it->quality);
+                    out[n].level    = gradeLevelOf(it);
                     out[n].equipped = 1;
                     out[n].slot     = (unsigned char)((unsigned int)sec->limitedSlot & 0xFFu);
                     // Phase 6b: locked shackle bit on the equipped LockedArmour.
@@ -166,8 +166,8 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
                 out[n].itemType = (unsigned int)gd->type;
                 int q = it->quantity; if (q < 1) q = 1;
                 out[n].quantity = (q > 65535) ? (unsigned short)65535 : (unsigned short)q;
-                float ql = it->quality; if (ql < 0.0f) ql = 0.0f;
-                out[n].quality = (unsigned short)(ql * 100.0f);
+                out[n].quality = qualityBucketOf(it->quality);
+                out[n].level    = gradeLevelOf(it);
                 out[n].equipped = 1;
                 out[n].slot     = (unsigned char)((unsigned int)it->slotType & 0xFFu);
                 // A pointer-only weapon isn't in a getAllSections() section, so there is
@@ -201,8 +201,8 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
             out[n].itemType = (unsigned int)gd->type;
             int q = it->quantity; if (q < 1) q = 1;
             out[n].quantity = (q > 65535) ? (unsigned short)65535 : (unsigned short)q;
-            float ql = it->quality; if (ql < 0.0f) ql = 0.0f;
-            out[n].quality = (unsigned short)(ql * 100.0f);
+            out[n].quality = qualityBucketOf(it->quality);
+            out[n].level    = gradeLevelOf(it);
             out[n].equipped = 0;
             out[n].slot     = (unsigned char)((unsigned int)it->slotType & 0xFFu);
             out[n].section  = 0; // loose: no equip section
@@ -271,8 +271,8 @@ unsigned int readInvItems(Inventory* inv, InvItemEntry* out, Item** outItems,
                         out[n].itemType = (unsigned int)gd->type;
                         int q = it->quantity; if (q < 1) q = 1;
                         out[n].quantity = (q > 65535) ? (unsigned short)65535 : (unsigned short)q;
-                        float ql = it->quality; if (ql < 0.0f) ql = 0.0f;
-                        out[n].quality = (unsigned short)(ql * 100.0f);
+                        out[n].quality = qualityBucketOf(it->quality);
+                        out[n].level     = gradeLevelOf(it);
                         out[n].equipped  = 0;
                         out[n].slot      = (unsigned char)((unsigned int)it->slotType & 0xFFu);
                         out[n].section   = 0;
@@ -318,6 +318,21 @@ GameData* findItemTemplateImpl(GameWorld* gw, const char* sid, unsigned int type
     return 0;
 }
 
+// The material spec is a WEAPON-ONLY argument, and MEASURED to be so. Because
+// fillItemProvenance captures materialData for every item type while this lookup only ever
+// searched MATERIAL_SPECS_WEAPON, it looked like armour was being rebuilt material-less by
+// a category bug. Resolving armour materials under MATERIAL_SPECS_CLOTHING / MATERIAL_SPEC
+// and passing them here does resolve them - and produces an item for which isGear() returns
+// NULL, i.e. not gear at all, so the rebuilt piece has no craft level, no resistances and
+// cannot be worn. The same call with a null material and an explicit level yields a proper
+// Gear (that is how mintGradedGearForTest works). So this slot is not "the material" in the
+// non-weapon shape, null is the correct value for it, and there was no category bug.
+static GameData* findMaterialSpec(GameWorld* gw, const char* sid, unsigned int typeCat) {
+    if (!sid || !sid[0]) return 0;
+    if ((itemType)typeCat != WEAPON) return 0;
+    return findItemTemplateImpl(gw, sid, (unsigned int)MATERIAL_SPECS_WEAPON);
+}
+
 // SEH-guarded: a generic WEAPON_MANUFACTURER GameData for weapon fabrication when the
 // wire carried no manufacturer sid (spike 451: the manufacturer record is the REQUIRED
 // first arg of a weapon createItem - without one the weapon cannot fabricate at all,
@@ -345,7 +360,8 @@ GameData* fallbackWeaponManufacturer(GameWorld* gw) {
 // that declaration) so probeFabricateWeaponLoose (now in EngineProbe.cpp) can reuse it.
 bool createItemAndAdd(GameWorld* gw, Inventory* inv, const char* sid,
                       unsigned int typeCat, int qty, int qualityBucket, bool equip,
-                      const char* manufacturer, const char* material) {
+                      const char* manufacturer, const char* material,
+                      unsigned char level) {
     if (!gw || !gw->theFactory || !g_createItemFn || !inv || !sid || qty <= 0) return false;
     static int dbg = -1;
     if (dbg < 0) { const char* e = getenv("KENSHICOOP_INV_DUMP"); dbg = (e && e[0] == '1') ? 1 : 0; }
@@ -357,8 +373,24 @@ bool createItemAndAdd(GameWorld* gw, Inventory* inv, const char* sid,
         // templates instantiate directly).
         GameData* man = (manufacturer && manufacturer[0])
                         ? findItemTemplateImpl(gw, manufacturer, (unsigned int)WEAPON_MANUFACTURER) : 0;
-        GameData* mat = (material && material[0])
-                        ? findItemTemplateImpl(gw, material, (unsigned int)MATERIAL_SPECS_WEAPON) : 0;
+        GameData* mat = findMaterialSpec(gw, material, typeCat);
+        // THE GRADE. Kenshi's named grades (Prototype 5, Shoddy 20, Standard 40, High 60,
+        // Specialist 80, Masterwork 95) are points on a 1-100 craft level that the factory
+        // bakes into Gear::level / level_0_100 at construction, from THIS argument, and that
+        // nothing writes afterwards. So a hardcoded override rebuilt every piece at the
+        // factory's default grade no matter what the author had - and the quality patch
+        // further down could not repair it, because quality is CONDITION, a different axis:
+        // a pristine Shoddy and a pristine Masterwork both read 100. That is the reported
+        // bug, and the reason the grade needed its own wire field (protocol 51).
+        //
+        // GRADE_NA means the author had no craft level to report (a non-Gear stack), so the
+        // engine's own per-branch default stands. KENSHICOOP_GEAR_LEVEL=0 forces that path
+        // for everything, restoring the pre-fix constants: this argument sits INSIDE the
+        // spike-451 weapon recipe, which is delicate enough to want a one-env rollback.
+        static int lvlOn = -1;
+        if (lvlOn < 0) { const char* e = getenv("KENSHICOOP_GEAR_LEVEL"); lvlOn = (e && e[0] == '0') ? 0 : 1; }
+        int gradeLevel = -1; // -1 = "no wire grade": use the per-branch engine default
+        if (lvlOn && level != GRADE_NA) gradeLevel = (int)level;
         Item* it = 0;
         if ((itemType)typeCat == WEAPON) {
             // KENSHICOOP_WEAPON_FAB=0: escape hatch back to the pre-spike-451 behaviour
@@ -382,7 +414,8 @@ bool createItemAndAdd(GameWorld* gw, Inventory* inv, const char* sid,
                 memset(wb, 0, sizeof(wb));
                 hand* wh = reinterpret_cast<hand*>(wb);
                 g_handCtorFn(wh, 0, 0, NULL_ITEM, 0, 0);
-                it = g_createItemFn(gw->theFactory, man, wh, tmpl, mat, 0, 0);
+                it = g_createItemFn(gw->theFactory, man, wh, tmpl, mat,
+                                    (gradeLevel >= 0) ? gradeLevel : 0, 0);
             } else if (dbg) {
                 coop::logLine("[mk] weapon manufacturer unresolved (no provenance, no fallback)");
             }
@@ -391,14 +424,25 @@ bool createItemAndAdd(GameWorld* gw, Inventory* inv, const char* sid,
             memset(buf, 0, sizeof(buf));
             hand* h = reinterpret_cast<hand*>(buf);
             g_handCtorFn(h, 0, 0, (itemType)typeCat, 0, 0); // blank handle (factory owns id)
-            it = g_createItemFn(gw->theFactory, tmpl, h, man, mat, -1, 0);
+            it = g_createItemFn(gw->theFactory, tmpl, h, man, mat, gradeLevel, 0);
         }
         if (!it) { if (dbg) { char b[140]; _snprintf(b,sizeof(b)-1,"[mk] createItem-null sid='%s' type=%u man=%d mat=%d",sid,typeCat,man?1:0,mat?1:0); b[sizeof(b)-1]='\0'; coop::logLine(b);} return false; }
         if (qualityBucket > 0) it->quality = (float)qualityBucket / 100.0f;
         if (!inv->tryAddItem(it, qty)) { if (dbg) { char b[120]; _snprintf(b,sizeof(b)-1,"[mk] tryAddItem-fail sid='%s' type=%u equip=%d",sid,typeCat,equip?1:0); b[sizeof(b)-1]='\0'; coop::logLine(b);} return false; } // virtual
         // Equipment is non-stackable (qty 1); move the just-added item into its slot.
         if (equip && g_equipItemFn) g_equipItemFn(inv, it);
-        if (dbg) { char b[120]; _snprintf(b,sizeof(b)-1,"[mk] OK sid='%s' type=%u equip=%d qty=%d",sid,typeCat,equip?1:0,qty); b[sizeof(b)-1]='\0'; coop::logLine(b); }
+        // gotLvl is what the factory actually baked in; when it disagrees with the wire's
+        // want= the grade did not survive the rebuild, which is the whole failure mode.
+        if (dbg) {
+            int gotLvl = -1;
+            Gear* g = it->isGear();                              // virtual
+            if (g) gotLvl = it->getLevel();                      // virtual
+            char b[200];
+            _snprintf(b,sizeof(b)-1,
+                "[mk] OK sid='%s' type=%u equip=%d qty=%d qual=%d wantLvl=%d gotLvl=%d mat=%d",
+                sid,typeCat,equip?1:0,qty,qualityBucket,gradeLevel,gotLvl,mat?1:0);
+            b[sizeof(b)-1]='\0'; coop::logLine(b);
+        }
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         if (dbg) coop::logLine("[mk] SEH-except");
@@ -574,6 +618,9 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
     struct Grp {
         char sid[48]; unsigned int type;
         int desiredEq, desiredLoose, curEq, curLoose; int qualEq, qualLoose;
+        // Craft grade per equip state (protocol 51), so a rebuilt piece is minted at the
+        // author's grade instead of the factory default. GRADE_NA = the author had none.
+        unsigned char lvlEq, lvlLoose;
         char manufacturer[48]; char material[48]; // weapon provenance (needed to recreate)
     };
     Grp g[128];
@@ -584,13 +631,14 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
             if (g[j].type == items[i].itemType && strcmp(g[j].sid, items[i].stringID) == 0) break;
         if (j == ng && ng < 128) {
             memset(&g[ng], 0, sizeof(Grp));
+            g[ng].lvlEq = g[ng].lvlLoose = GRADE_NA; // 0 would mean "mint at level 0"
             strncpy(g[ng].sid, items[i].stringID, sizeof(g[ng].sid) - 1);
             g[ng].type = items[i].itemType; j = ng; ++ng;
         }
         if (j < ng) {
             int q = (items[i].quantity < 1) ? 1 : items[i].quantity;
-            if (items[i].equipped) { g[j].desiredEq += q; g[j].qualEq = items[i].quality; }
-            else                   { g[j].desiredLoose += q; g[j].qualLoose = items[i].quality; }
+            if (items[i].equipped) { g[j].desiredEq += q; g[j].qualEq = items[i].quality; g[j].lvlEq = items[i].level; }
+            else                   { g[j].desiredLoose += q; g[j].qualLoose = items[i].quality; g[j].lvlLoose = items[i].level; }
             // Carry the weapon's manufacturer/material (first desired entry of the group);
             // empty for non-weapons. Needed when the create path fabricates the item.
             if (!g[j].manufacturer[0] && items[i].manufacturer[0])
@@ -605,6 +653,7 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
             if (g[j].type == cur[i].itemType && strcmp(g[j].sid, cur[i].stringID) == 0) break;
         if (j == ng && ng < 128) {
             memset(&g[ng], 0, sizeof(Grp));
+            g[ng].lvlEq = g[ng].lvlLoose = GRADE_NA; // 0 would mean "mint at level 0"
             strncpy(g[ng].sid, cur[i].stringID, sizeof(g[ng].sid) - 1);
             g[ng].type = cur[i].itemType; j = ng; ++ng;
         }
@@ -694,9 +743,11 @@ static bool applyToInventory(GameWorld* gw, Inventory* inv,
             createLoose = 0;
         }
         if (createLoose > 0) {
-            int qb = (g[k].desiredEq > g[k].curEq) ? g[k].qualEq : g[k].qualLoose;
+            bool fromEq = (g[k].desiredEq > g[k].curEq);
+            int qb = fromEq ? g[k].qualEq : g[k].qualLoose;
+            unsigned char lv = fromEq ? g[k].lvlEq : g[k].lvlLoose;
             bool ok = createItemAndAdd(gw, inv, g[k].sid, g[k].type, createLoose, qb, false,
-                                       g[k].manufacturer, g[k].material);
+                                       g[k].manufacturer, g[k].material, lv);
             if (dbg) { char b[120]; _snprintf(b, sizeof(b)-1, "[recon]   CREATE-LOOSE n=%d (loose+eqDefer) ok=%d", createLoose, ok?1:0); b[sizeof(b)-1]='\0'; coop::logLine(b); }
             if (ok) changed = true;
         }
@@ -1171,17 +1222,55 @@ int commonTestItemSid(GameWorld* gw, char* outSid, unsigned int outLen,
     return 1;
 }
 
+int readGearGradeBySid(GameWorld* gw, const unsigned int cHand[5], const char* sid,
+                       unsigned int typeCat, int* outBucket, int* outLevel,
+                       int* outLevel100) {
+    if (outBucket)   *outBucket   = -1;
+    if (outLevel)    *outLevel    = -1;
+    if (outLevel100) *outLevel100 = -1;
+    if (!gw || !sid || !sid[0]) return 0;
+    RootObject* ro = resolveObjectByHand(cHand);
+    if (!ro) return 0;
+    Inventory* inv = invOf(ro);
+    if (!inv) return 0;
+    const unsigned int MAXC = 64;
+    InvItemEntry cur[64];
+    Item* curItems[64];
+    unsigned int ncur = readInvItems(inv, cur, curItems, MAXC);
+    __try {
+        for (unsigned int i = 0; i < ncur; ++i) {
+            if (!curItems[i]) continue;
+            if (cur[i].itemType != typeCat) continue;
+            if (strcmp(cur[i].stringID, sid) != 0) continue;
+            if (outBucket) *outBucket = (int)cur[i].quality;
+            // The craft LEVEL, not the quality float: the wire carries quality and the
+            // fabricate path writes it back, so quality agrees across clients by
+            // construction. Only getLevel() reveals a copy that was minted at the
+            // factory's default grade.
+            Gear* g = curItems[i]->isGear();                            // virtual
+            if (g) {
+                if (outLevel)    *outLevel    = curItems[i]->getLevel(); // virtual
+                if (outLevel100) *outLevel100 = g->level_0_100;
+            }
+            return 1;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+    return 0;
+}
+
 int addItemsToContainerBySid(GameWorld* gw, const unsigned int cHand[5],
                              const char* sid, unsigned int typeCat, int qty,
                              int qualityBucket, const char* manufacturer,
-                             const char* material) {
+                             const char* material, unsigned char level) {
     if (!gw || !sid || !sid[0] || qty <= 0) return 0;
     RootObject* ro = resolveObjectByHand(cHand);
     if (!ro) return 0;
     Inventory* inv = invOf(ro);
     if (!inv) return 0;
     bool ok = createItemAndAdd(gw, inv, sid, typeCat, qty, qualityBucket,
-                               /*equip=*/false, manufacturer, material);
+                               /*equip=*/false, manufacturer, material, level);
     return ok ? qty : 0;
 }
 
@@ -1505,7 +1594,7 @@ unsigned int captureWorldItems(GameWorld* gw, WorldItemRaw* out, unsigned int ma
                 w.stringID[sizeof(w.stringID) - 1] = '\0';
                 w.itemType = (unsigned int)gd->type;
                 w.quantity = (unsigned short)(qty > 0xFFFF ? 0xFFFF : qty);
-                w.quality  = (unsigned short)(ql > 0.0f ? (int)(ql * 100.0f) : 0);
+                w.quality  = qualityBucketOf(ql);
                 w.x = p.x; w.y = p.y; w.z = p.z;
                 w.hash = worldItemHash(w.stringID, w.itemType, w.quantity, w.quality);
                 ++n;

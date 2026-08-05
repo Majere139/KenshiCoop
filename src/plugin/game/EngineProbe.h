@@ -53,6 +53,28 @@ int probeFabricateWeaponLoose(GameWorld* gw, const unsigned int cHand[5],
 int commonNovelWeaponSid(GameWorld* gw, const unsigned int cHand[5],
                          char* outSid, unsigned int outLen);
 
+// SEH-guarded (trade_peer grade gate): the same deterministic novel pick for ARMOUR,
+// excluding BOTH containers' current contents. Two containers because the grade gate drags
+// the piece from one to the other and reads it back by (sid, itemType): a copy already
+// sitting in either tab would make that read ambiguous. Returns 1 and writes the sid.
+int commonNovelArmourSid(GameWorld* gw, const unsigned int cHandA[5],
+                         const unsigned int cHandB[5],
+                         char* outSid, unsigned int outLen);
+
+// SEH-guarded (trade_peer grade gate): mint ONE piece of gear at an explicit craft LEVEL
+// straight through the engine factory (levelOverride = level) and add it to cHand's
+// inventory. Deliberately NOT the sync's createItemAndAdd and deliberately NOT subject to
+// KENSHICOOP_GEAR_LEVEL: this is the REFERENCE item a grade test compares against, so it
+// has to be graded correctly even in the run that has the fix turned off - otherwise the
+// peer's copy would match a reference that was equally wrong and the gate would pass
+// vacuously. Quality is NOT patched afterwards: whatever the engine derives from the level
+// is what the wire should carry, and the test wants to observe that rather than fake it.
+// *outLevel / *outQual receive getLevel() and quality*100 of the minted item, so a caller
+// can assert the engine honoured the override at all. Returns 1 minted+added / 0 failure.
+int mintGradedGearForTest(GameWorld* gw, const unsigned int cHand[5], const char* sid,
+                          unsigned int typeCat, int level,
+                          int* outLevel, int* outQual);
+
 // NOTE: the spike-401 research tech-tree store surface stays in Engine.h for now
 // - three of those entry points (researchEnumKnown / researchQueryBySid /
 // researchStartBySid) are load-bearing protocol-38 SYNC calls, so the block is

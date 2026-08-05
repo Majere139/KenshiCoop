@@ -25,7 +25,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 50;
+const u16 PROTOCOL_VERSION = 51;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -378,14 +378,24 @@ const unsigned int ENTITY_BATCH_MAX_STEAM = 14;
 // Sent on the RELIABLE channel on content-change (doctrine 16: transitions reliable),
 // with a periodic safety resend.
 
+// Stands in for InvItemEntry::level / InvXferPacket::level when an item has no craft level
+// to speak of. 0xFF rather than 0 because 0 is a legible level and would read as the worst
+// possible grade, quietly demoting every stack of food that crossed the wire.
+const u8 GRADE_NA = 0xFF;
+
 // One item line in a container snapshot: the template identity (stringID) + its
-// itemType category (for the template lookup) + stack quantity + a quality bucket.
+// itemType category (for the template lookup) + stack quantity + condition + craft grade.
 // stringID is a fixed buffer (no STL on the wire); longer ids are truncated (the
-// lookup tolerates a name fallback). quality is quality*100 (0 if not applicable).
+// lookup tolerates a name fallback). quality is condition*100 (0 if not applicable).
+
 struct InvItemEntry {
     char stringID[48];
     u32  itemType;   // GameData::type of the template (itemType enum)
     u16  quantity;
+    // CONDITION, not grade. Item::quality is a 0..100 float (a brand-new item reads
+    // 100.0), carried here as hundredths - so a pristine item is 10000, not 100. It was
+    // mistaken for the craft grade for a long time, which is why a traded Masterwork
+    // arrived looking plainer while this field agreed perfectly on both clients.
     u16  quality;
     u8   equipped;   // 1 if worn in an equipment slot (armour/weapon), else 0 (loose)
     u8   slot;       // AttachSlot the item occupies (advisory; equipItem auto-routes)
@@ -409,6 +419,24 @@ struct InvItemEntry {
                      // the two weapon slots ('hip' vs 'back'), which share AttachSlot
                      // ATTACH_WEAPON and so are identical in `slot`; lets the peer place
                      // a worn weapon in the SAME slot (Weapon I vs II) as the author.
+    // THE GRADE (protocol 51). Kenshi's named item grades - Prototype 5, Shoddy 20,
+    // Standard 40, High 60, Specialist 80, Masterwork 95 - are preset points on a 1..100
+    // craft level, held in Gear::level / level_0_100 and read back as getLevel(). Per-template
+    // level bonuses shift the presets and crafted items land on arbitrary values, so a grade
+    // is a NUMBER here, not a tier id.
+    //
+    // It needs its own field because nothing else on this wire implies it. The factory bakes
+    // the level in at construction from createItem's levelOverride argument and nothing
+    // writes it afterwards, and `quality` above is CONDITION - a different axis on a
+    // different scale (a pristine Shoddy item and a pristine Masterwork one both read
+    // 10000). Until this field existed a peer rebuilding an item had no way to know its
+    // grade and minted it at the factory default, which is the reported bug: a traded
+    // Masterwork arriving plainer while every field the oracles compared agreed.
+    //
+    // GRADE_NA = not applicable - a non-Gear item (a stack of food has no craft level) or an
+    // author that could not read one. The peer then keeps the factory default rather than
+    // minting at level 255.
+    u8   level;
     // A WEAPON is generated from a base def PLUS a manufacturer (mesh/company) and a
     // material spec; the engine factory (RootObjectFactory::createItem) REQUIRES the
     // manufacturer GameData (the `weaponMesh` arg) or it returns null, so without these
@@ -633,7 +661,10 @@ struct InvXferPacket {
     char stringID[48];
     u32  itemType;   // GameData::type category
     u16  quantity;   // units moved
-    u16  quality;    // quality*100 of the moved stack (advisory)
+    u16  quality;    // condition*100 of the moved stack (advisory; see InvItemEntry::quality)
+    u8   level;      // craft grade (protocol 51), GRADE_NA when not applicable. Only used if
+                     // the receiver has to FABRICATE - a transfer normally relocates the real
+                     // Item*, which carries its own grade and needs nothing from the wire.
     char manufacturer[48];
     char material[48];
 };

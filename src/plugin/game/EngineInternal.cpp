@@ -889,8 +889,7 @@ void __fastcall dropItem_hook(Inventory* self, Item* it) {
             }
             int qty = it->quantity; if (qty < 1) qty = 1;
             e.quantity = (unsigned short)(qty > 0xFFFF ? 0xFFFF : qty);
-            float ql = it->quality;
-            e.quality = (unsigned short)(ql > 0.0f ? (int)(ql * 100.0f) : 0);
+            e.quality = qualityBucketOf(it->quality);
             float p[3] = { 0, 0, 0 };
             bool haveP = itemWorldPos(it, p) &&
                          !(p[0] == 0.0f && p[1] == 0.0f && p[2] == 0.0f);

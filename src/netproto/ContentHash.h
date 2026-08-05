@@ -58,6 +58,11 @@ inline unsigned int invEntryHash(const InvItemEntry& e) {
     // is invisible, no snapshot is published, and the peer's bag stays empty. XOR keeps the
     // canonical hash of a top-level entry (parentIdx = 0) exactly as it was.
     h ^= (unsigned int)e.parentIdx * 2129725511u;
+    // The craft GRADE is content (protocol 51): a Masterwork and a Shoddy copy of the same
+    // template are the same in every other field on this wire, so without the level in the
+    // fingerprint a re-graded item publishes no snapshot and the peer never re-learns it.
+    // GRADE_NA is folded in as 0 so items with no craft level hash exactly as they did.
+    h ^= (unsigned int)(e.level == GRADE_NA ? 0u : (unsigned int)e.level) * 2654435789u;
     // Manufacturer + material are part of a WEAPON's identity (mesh/company + grade): two
     // otherwise-identical base weapons with different manufacturers are visually distinct,
     // so they must hash differently (a swap registers as a content change + resend).

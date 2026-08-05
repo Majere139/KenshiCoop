@@ -338,6 +338,65 @@ int commonNovelWeaponSid(GameWorld* gw, const unsigned int cHand[5],
     return 0;
 }
 
+int commonNovelArmourSid(GameWorld* gw, const unsigned int cHandA[5],
+                         const unsigned int cHandB[5],
+                         char* outSid, unsigned int outLen) {
+    if (outSid && outLen) outSid[0] = '\0';
+    if (!gw || !g_getDataOfTypeFn || !outSid || outLen == 0) return 0;
+    const unsigned int MAXC = 64;
+    InvItemEntry a[64], b[64];
+    unsigned int na = captureContainerContents(gw, cHandA, a, MAXC, 0);
+    unsigned int nb = cHandB ? captureContainerContents(gw, cHandB, b, MAXC, 0) : 0;
+    __try {
+        g_dataScratch.clear();
+        g_getDataOfTypeFn(&gw->gamedata, &g_dataScratch, ARMOUR);
+        unsigned int n = g_dataScratch.size();
+        for (unsigned int i = 0; i < n; ++i) {
+            GameData* t = g_dataScratch[i];
+            if (!t) continue;
+            const char* s = t->stringID.c_str();
+            if (!s || !s[0]) continue;
+            bool held = false;
+            for (unsigned int j = 0; j < na && !held; ++j)
+                if (a[j].itemType == (unsigned int)ARMOUR && strcmp(a[j].stringID, s) == 0) held = true;
+            for (unsigned int j = 0; j < nb && !held; ++j)
+                if (b[j].itemType == (unsigned int)ARMOUR && strcmp(b[j].stringID, s) == 0) held = true;
+            if (held) continue;
+            strncpy(outSid, s, outLen - 1); outSid[outLen - 1] = '\0';
+            return 1;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    return 0;
+}
+
+int mintGradedGearForTest(GameWorld* gw, const unsigned int cHand[5], const char* sid,
+                          unsigned int typeCat, int level,
+                          int* outLevel, int* outQual) {
+    if (outLevel) *outLevel = -1;
+    if (outQual)  *outQual  = -1;
+    if (!gw || !gw->theFactory || !g_createItemFn || !g_handCtorFn || !sid || !sid[0]) return 0;
+    RootObject* ro = resolveObjectByHand(cHand);
+    Inventory* inv = invOf(ro);
+    if (!inv) return 0;
+    GameData* tmpl = findItemTemplateImpl(gw, sid, typeCat);
+    if (!tmpl) return 0;
+    __try {
+        char buf[sizeof(hand) + 16];
+        memset(buf, 0, sizeof(buf));
+        hand* h = reinterpret_cast<hand*>(buf);
+        g_handCtorFn(h, 0, 0, (itemType)typeCat, 0, 0); // blank handle (factory owns id)
+        Item* it = g_createItemFn(gw->theFactory, tmpl, h, 0, 0, level, 0);
+        if (!it) return 0;
+        if (!inv->tryAddItem(it, 1)) return 0;          // virtual
+        Gear* g = it->isGear();                         // virtual
+        if (g && outLevel) *outLevel = it->getLevel();  // virtual
+        if (outQual) *outQual = (int)qualityBucketOf(it->quality);
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
 // DIAGNOSTIC: prove weapon fabrication over the template set. Walks the first `maxTry`
 // WEAPON base templates and instantiates each with the spike-451 recipe (manufacturer
 // GameData FIRST, weapon template in the third "weaponMesh" slot, blank NULL_ITEM hand,

@@ -93,6 +93,14 @@ $script:CoopDiagEnvKeys = @(
     # 1 Hz position track per squad tab, log-only. For RECORDING a route: cell
     # claims fire once per 4608 u cell, which is far too sparse to walk between.
     'KENSHICOOP_TRACK_MOVE'
+    # --- gear GRADE on fabricate (protocol 51, EngineInventory createItemAndAdd) --
+    # Ships ON: a rebuilt piece of gear is minted at the craft level the wire carried, so a
+    # traded Masterwork stays Masterwork. Set to 0 to restore the pre-fix constant
+    # levelOverride - the rollback for the spike-451 weapon-mint recipe this argument sits
+    # inside, and how trade_peer's grade gate is shown to be able to fail (with it off the
+    # host's rebuilt armour reads alv=-1, not even Gear). Managed here rather than left
+    # ambient so a stale shell value cannot silently decide what a run measured.
+    'KENSHICOOP_GEAR_LEVEL'
 )
 
 function Get-CoopDiagEnvKeys {
