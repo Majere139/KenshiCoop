@@ -21,7 +21,8 @@ float lerpf(float a, float b, float t) { return a + (b - a) * t; }
 
 InterpConfig::InterpConfig()
     : minDelayMs(50), maxDelayMs(200), maxExtrapMs(250),
-      snapDistSq(50.0f * 50.0f), staleMs(2000) {}
+      snapDistSq(50.0f * 50.0f), staleMs(2000),
+      cadenceDelayK(2.0f), maxCadenceDelayMs(1200) {}
 
 EntityInterp::EntityInterp()
     : count_(0), head_(0), lastArrival_(0),
@@ -97,8 +98,37 @@ unsigned long EntityInterp::renderDelay(const InterpConfig& cfg) const {
     // path's queueing lag (v35: ring times are send-stamped, so late arrivals
     // no longer show up in the interval stats - lagMs_ carries them), clamped.
     float d = avgIntervalMs_ + 2.0f * jitterMs_ + lagMs_;
+
+    // The ceiling has to scale with the cadence THIS entity is sent at. A flat
+    // 200 ms is sized for the 20 Hz near band; the round-robin mid band sends
+    // every ~500 ms, and once the ceiling is below the send interval, renderTime
+    // (now - 200 ms) sits past the newest snapshot for 300 ms of every 500 ms
+    // segment, so sample() takes the dead-reckoning branch 60% of the time by
+    // arithmetic - no packet loss required. Then maxExtrapMs freezes the body
+    // partway and the next real sample lands half a segment further on, which
+    // is the drive's hard snap. That is what the remote session on 2026-08-04
+    // recorded: extrap=1018228 against lerp=844769 (55%, matching the predicted
+    // duty cycle) and pack teleports of 200-780 u once ~97 bodies were driven
+    // against a 48-slot mid band. Rendering a distant body further in the past
+    // costs it visible lateness, which is the cheaper of the two errors: nobody
+    // reads a wandering Paladin as late, everybody reads it as teleporting.
+    float cap = (float)cfg.maxDelayMs;
+    float cadence = avgIntervalMs_ * cfg.cadenceDelayK;
+    if (cadence > cap) cap = cadence;
+    if (cap > (float)cfg.maxCadenceDelayMs) cap = (float)cfg.maxCadenceDelayMs;
+
+    // Never ask for more history than the ring holds, or renderTime predates
+    // the oldest snapshot and we clamp-hold instead of interpolating. This is
+    // what carries a body across the mid->near promotion, where the cadence EMA
+    // still reads sparse while dense samples are already evicting the ring's
+    // widely-spaced entries.
+    if (count_ >= 3) {
+        float span = (float)(at(count_ - 1).t - at(0).t) * 0.9f;
+        if (span > 0.0f && cap > span) cap = span;
+    }
+
+    if (d > cap) d = cap;
     if (d < (float)cfg.minDelayMs) d = (float)cfg.minDelayMs;
-    if (d > (float)cfg.maxDelayMs) d = (float)cfg.maxDelayMs;
     return (unsigned long)d;
 }
 

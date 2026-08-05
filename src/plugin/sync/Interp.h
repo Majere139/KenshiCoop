@@ -21,10 +21,18 @@ namespace coop {
 
 struct InterpConfig {
     unsigned long minDelayMs;  // floor on render delay (low-jitter LAN)
-    unsigned long maxDelayMs;  // ceiling on render delay (high jitter)
+    unsigned long maxDelayMs;  // ceiling on render delay for a DENSE stream
     unsigned long maxExtrapMs; // dead-reckoning cap when the buffer is starved
     float         snapDistSq;  // source step^2 above which we snap (teleport)
     unsigned long staleMs;     // stop driving if newest snapshot is older than this
+    // maxDelayMs is sized for the 20 Hz near band. A body on the round-robin
+    // mid band is sampled every ~500 ms, and a delay ceiling BELOW its own send
+    // interval makes extrapolation structural rather than exceptional (see
+    // renderDelay). These raise the ceiling in proportion to the cadence the
+    // entity is actually being sent at, bounded so a pathological stream can't
+    // render minutes in the past.
+    float         cadenceDelayK;      // ceiling = avgInterval * K (dense: no-op)
+    unsigned long maxCadenceDelayMs;  // hard bound on the cadence-scaled ceiling
     InterpConfig();
 };
 

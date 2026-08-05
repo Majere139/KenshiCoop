@@ -59,6 +59,8 @@ struct Config {
     unsigned int interpMinDelayMs;  // KENSHICOOP_INTERP_MIN_DELAY_MS  (50)
     unsigned int interpMaxDelayMs;  // KENSHICOOP_INTERP_MAX_DELAY_MS  (200)
     unsigned int interpMaxExtrapMs; // KENSHICOOP_INTERP_MAX_EXTRAP_MS (250)
+    float        interpCadenceK;    // KENSHICOOP_INTERP_CADENCE_K     (2.0)
+    unsigned int interpMaxCadenceDelayMs; // KENSHICOOP_INTERP_MAX_CADENCE_DELAY_MS (1200)
     unsigned int interpStaleMs;     // KENSHICOOP_INTERP_STALE_MS      (2000)
     float        interpSnapDist;    // KENSHICOOP_INTERP_SNAP_DIST     (50 u)
     float        catchupK;          // KENSHICOOP_CATCHUP_K            (2.0)

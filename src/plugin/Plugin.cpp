@@ -1934,6 +1934,8 @@ void configureReplicator() {
         ic.maxExtrapMs = g_cfg.interpMaxExtrapMs;
         ic.staleMs     = g_cfg.interpStaleMs;
         ic.snapDistSq  = g_cfg.interpSnapDist * g_cfg.interpSnapDist;
+        ic.cadenceDelayK     = g_cfg.interpCadenceK;
+        ic.maxCadenceDelayMs = g_cfg.interpMaxCadenceDelayMs;
         g_repl.setInterpConfig(ic);
         g_repl.setDriveTuning(g_cfg.catchupK, g_cfg.snapDist, g_cfg.snapSeconds);
         g_repl.setCombatTuning(g_cfg.combatSoftDist, g_cfg.combatSnapDist,

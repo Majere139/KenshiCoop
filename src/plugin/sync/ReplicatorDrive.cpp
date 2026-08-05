@@ -1624,9 +1624,13 @@ void Replicator::logDriveTelemetry(unsigned long now) {
     }
     // Interp/drive stat line (~5 s, protocol 36 jumpiness instrumentation).
     // Cumulative counters, so two lines diff into a rate; delay/jit report the
-    // WORST live buffer (the adaptive render delay + its jitter estimate) -
-    // a delay pinned at maxDelayMs with high jitter means the buffer can no
-    // longer absorb the path's jitter and starvation (extrap/clamp) follows.
+    // WORST live buffer (the adaptive render delay + its jitter estimate).
+    // Since the ceiling became cadence-scaled, a large delay is the EXPECTED
+    // reading for a mid-band body on a ~500 ms round-robin - it is what lets it
+    // interpolate at all. The starvation signal is extrap/clamp outgrowing
+    // lerp, not delay itself; jit here is deviation in the SENDER's cadence
+    // (ring times are send-stamped), so a rotating mid band reads high by
+    // construction and says nothing about the path.
     if (!targets_.empty() && (now - interpLogTick_) > 5000) {
         interpLogTick_ = now;
         unsigned long maxDelay = 0; float maxJit = 0.0f;

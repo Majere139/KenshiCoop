@@ -271,11 +271,19 @@ void loadConfig(Config& c) {
         c.interpMaxDelayMs = (v > 0) ? (unsigned int)v : 200u;
         v = std::atoi(envOr("KENSHICOOP_INTERP_MAX_EXTRAP_MS", "0").c_str());
         c.interpMaxExtrapMs = (v > 0) ? (unsigned int)v : 250u;
+        v = std::atoi(envOr("KENSHICOOP_INTERP_MAX_CADENCE_DELAY_MS", "0").c_str());
+        c.interpMaxCadenceDelayMs = (v > 0) ? (unsigned int)v : 1200u;
         v = std::atoi(envOr("KENSHICOOP_INTERP_STALE_MS", "0").c_str());
         c.interpStaleMs = (v > 0) ? (unsigned int)v : 2000u;
         double f;
         f = std::atof(envOr("KENSHICOOP_INTERP_SNAP_DIST", "0").c_str());
         c.interpSnapDist = (f > 0.0) ? (float)f : 50.0f;
+        // The A/B control for the cadence-scaled buffer is
+        // KENSHICOOP_INTERP_MAX_CADENCE_DELAY_MS=200, which pins the ceiling
+        // back to interpMaxDelayMs for every tier. K alone cannot: the mid
+        // band's ~500 ms cadence still clears 200 ms at any K above 0.4.
+        f = std::atof(envOr("KENSHICOOP_INTERP_CADENCE_K", "0").c_str());
+        c.interpCadenceK = (f > 0.0) ? (float)f : 2.0f;
         f = std::atof(envOr("KENSHICOOP_CATCHUP_K", "0").c_str());
         c.catchupK = (f > 0.0) ? (float)f : 2.0f;
         f = std::atof(envOr("KENSHICOOP_SNAP_DIST", "0").c_str());
