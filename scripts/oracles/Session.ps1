@@ -1,7 +1,8 @@
 # oracles/Session.ps1 - session-lifecycle oracles (monolith split of
 # CoopOracles.psm1, 2026-07-12): latejoin (Get-LatejoinCensus/Mutations/
 # HealLatency, Test-LatejoinProbe/Sync), save/load (Test-SaveProbe,
-# Test-LoadProbe, Test-SaveSync, Test-SaveResume, Test-LoadSync).
+# Test-LoadProbe, Test-SaveSync, Test-SaveResume, Test-LoadSync,
+# Test-MoneyPersist).
 # Dot-sourced by CoopOracles.psm1 (module scope).
 # Must NOT: change gate names or the LJ*/SAVE/LOAD marker regexes -
 # they are the C++ log contract (resources/CODE_MAP.md).
@@ -744,5 +745,75 @@ function Test-LoadSync {
     Write-Host "  LOAD-SYNC $v - hostSites=$($hSites.Count) joinSites=$($jSites.Count) sameHand=$shared $detail"
     return (Add-GateResult -Name "load_sync" -Status $v `
                 -Metrics @{ hostSites = $hSites.Count; joinSites = $jSites.Count; sameHand = $shared } -Detail $detail)
+}
+
+# money_persist (protocol 52): does money the JOIN moved survive the save?
+# This is the regression gate for the original bug - the host's save was the only
+# one that lasted, so cats the join earned or spent were erased on the next load.
+# The join spends, the host folds that into the shared pool, saves, and loads;
+# the gate is that the reloaded world still has the post-spend total:
+#   1. the join's local spend succeeded (MPSPEND ok=1);
+#   2. the host LATCHED a total that differs from the one it started with - i.e.
+#      the join's delta really reached the authority BEFORE the save (a run that
+#      never latched proves nothing, so it fails);
+#   3. the coordinated save/ACK/load round trip ran (MPSAVE/MPACK/MPLOAD ok=1);
+#   4. BOTH sides swapped worlds and read the latched total back (MPPOST ok=1).
+#      Coming back at the PRE-spend number is the original bug reproducing.
+function Test-MoneyPersist {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+
+    $spend = Select-String -Path $JoinFile -Pattern 'SCENARIO MPSPEND amount=(-?\d+) ok=(\d) before=(-?\d+) after=(-?\d+)' -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $spend) { $why += "join never logged its MPSPEND" }
+    elseif ($spend.Matches[0].Groups[2].Value -ne '1') {
+        $b = [int]$spend.Matches[0].Groups[3].Value
+        $tail = if ($b -lt 4) { " - the pool read $b, so the fixture has no cats to spend" } else { "" }
+        $why += "join's local spend failed (nothing to persist)$tail"
+    }
+
+    $latch = Select-String -Path $HostFile -Pattern 'SCENARIO MPLATCH expect=(-?\d+) start=(-?\d+) moved=(\d)' -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $expect = -1
+    if ($null -eq $latch) { $why += "host never latched a pre-save total (MPLATCH) - the pool was unreadable" }
+    else {
+        $expect = [int]$latch.Matches[0].Groups[1].Value
+        $start = [int]$latch.Matches[0].Groups[2].Value
+        if ($latch.Matches[0].Groups[3].Value -eq '1') {
+            Write-Host "    FINDING: host pool moved $start -> $expect before the save (the join's spend folded in)"
+        } else {
+            $why += "host pool still read $start at save time - the join's spend never reached the authority, so the save cannot carry it"
+        }
+    }
+
+    foreach ($leg in @(@('MPSAVE', 'coordinated save'), @('MPACK', 'join save-commit ACK'), @('MPLOAD', 'mid-session load'))) {
+        $m = Select-String -Path $HostFile -Pattern "SCENARIO $($leg[0]) .*ok=(\d)" -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -eq $m) { $why += "host never logged its $($leg[1]) ($($leg[0]))" }
+        elseif ($m.Matches[0].Groups[1].Value -ne '1') { $why += "host $($leg[1]) failed" }
+    }
+
+    $postRegex = 'SCENARIO MPPOST money=(-?\d+) expect=(-?\d+) start=(-?\d+) ok=(\d) who=(host|join)'
+    $hostPost = -1; $joinPost = -1
+    foreach ($side in @(@($HostFile, 'host'), @($JoinFile, 'join'))) {
+        $file = $side[0]; $tag = $side[1]
+        $swap = Select-String -Path $file -Pattern 'SCENARIO MPSWAPDONE' -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -eq $swap) { $why += "$tag never completed its world swap (no MPSWAPDONE)" }
+        $p = Select-String -Path $file -Pattern $postRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+        if ($null -eq $p) { $why += "$tag never logged its post-load MPPOST"; continue }
+        $g = $p.Matches[0].Groups
+        $money = [int]$g[1].Value; $want = [int]$g[2].Value; $startVal = [int]$g[3].Value
+        if ($tag -eq 'host') { $hostPost = $money } else { $joinPost = $money }
+        if ($money -ne $want) {
+            $tail = if ($money -eq $startVal) { " - this is the pre-spend total, the original erase-the-join's-money bug" } else { "" }
+            $why += "$tag came back with $money, want $want$tail"
+        }
+    }
+    if ($hostPost -ge 0 -and $joinPost -ge 0 -and $hostPost -ne $joinPost) {
+        $why += "the two clients disagree post-load (host $hostPost, join $joinPost)"
+    }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  MONEY-PERSIST $v - expect=$expect hostPost=$hostPost joinPost=$joinPost $detail"
+    return (Add-GateResult -Name "money_persist" -Status $v `
+                -Metrics @{ expect = $expect; hostPost = $hostPost; joinPost = $joinPost } -Detail $detail)
 }
 

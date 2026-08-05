@@ -1,12 +1,15 @@
 # oracles/World.ps1 - economy / faction / time / door / build / production /
 # container oracles (monolith split of CoopOracles.psm1, 2026-07-12):
-# Get-WalletSeries, Test-ShopProbe/MoneySync/VendorTrade, Test-Recruit*,
+# Get-WalletSeries, Get-PoolSeries, Test-ShopProbe/WalletProbe/MoneySync/
+# Test-VendorTrade, Test-Recruit*,
 # Test-Squad*, Test-Faction*, Test-Time* (+ Get-SlewSummary), Test-Door*,
 # Test-Build*, Test-Bdoor*, Test-Hunger*, Test-Prod*, Test-Research*,
 # Test-Store*. Dot-sourced by CoopOracles.psm1 (module scope).
 # Must NOT: change gate names or the $script:*Regex marker patterns -
 # they are the C++ log contract (resources/CODE_MAP.md).
-# shop_probe (protocol 22 phase 0): money + vendor-trading EVIDENCE gate.
+# shop_probe (protocol 22 phase 0): vendor-trading EVIDENCE gate. The per-tab
+# wallet series it samples is a DIAGNOSTIC, not the player's purse - protocol 52
+# established that the cats live on the player faction, and these tabs read 0.
 # Gates only that the probe produced its evidence:
 #   1. the host enumerated at least one vendor (SCENARIO VENDOR),
 #   2. both sides logged a readable per-tab WALLET series (money >= 0),
@@ -122,7 +125,7 @@ function Test-ShopProbe {
         Write-Host "    FINDING: tab rank $r final wallet host-join = $tag"
     }
     if ($null -ne $crossToJoin) {
-        Write-Host ("    FINDING: host wallet sentinel " + $(if ($crossToJoin) { "CROSSED to the join (something syncs money today!)" } else { "did NOT cross to the join (the 1b gap, as predicted)" }))
+        Write-Host ("    FINDING: host per-tab wallet sentinel " + $(if ($crossToJoin) { "CROSSED to the join (unexpected - only the player POOL is replicated)" } else { "did NOT cross to the join (expected: squad wallets are not the player purse)" }))
     }
     if ($null -ne $crossToHost) {
         Write-Host ("    FINDING: join wallet sentinel " + $(if ($crossToHost) { "CROSSED to the host" } else { "did NOT cross to the host" }))
@@ -144,66 +147,145 @@ function Test-ShopProbe {
                             walletDiv = $rankDivMetric } -Detail $detail)
 }
 
-# money_sync (protocol 22, moneySync ON): the wallet-channel gate. Same script
-# as shop_probe minus the vendor legs: each side writes a side-distinct wallet
-# sentinel into the tab it OWNS (host rank0=5000, join rank1=7000) and the
-# channel must carry it across - the gate is CONVERGENCE:
-#   1. both WALLETSET writes succeeded (apply primitive works);
-#   2. the peer's WALLET series ends at the sender's sentinel for that rank
-#      (a "[money] RECV" landed and stuck);
-#   3. every rank readable on both sides ends converged (no drift elsewhere).
+# The shared money pool series (protocol 52): SCENARIO POOL money=<v> who=<side>.
+# One value per client - the player's whole purse - so unlike Get-WalletSeries
+# this is a flat ordered list, not a per-rank map.
+function Get-PoolSeries {
+    param([string]$File)
+    $out = New-Object System.Collections.ArrayList
+    if (-not (Test-Path $File)) { return $out }
+    foreach ($m in @(Select-String -Path $File -Pattern 'SCENARIO POOL money=(-?\d+) who=(host|join) t=(\d+)' -ErrorAction SilentlyContinue)) {
+        [void]$out.Add(@{ t = [long]$m.Matches[0].Groups[3].Value
+                          money = [int]$m.Matches[0].Groups[1].Value })
+    }
+    return $out
+}
+
+# wallet_probe (money sync OFF): WHICH engine field is the player's purse?
+# A save holds exactly one `player money` value, so of the two candidates the
+# scenario logs - the player-faction wallet (POOL) and the per-platoon squad
+# wallets (TABW) - at most one can be it. Gates only that the measurement
+# happened and that the pool is writable; which field holds the cats is reported
+# as a FINDING, because that is the fact the protocol-52 design rests on.
+function Test-WalletProbe {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $hp = Get-PoolSeries -File $HostFile
+    $jp = Get-PoolSeries -File $JoinFile
+    $hostPoolOk = $false; $joinPoolOk = $false
+    foreach ($s in $hp) { if ($s.money -ge 0) { $hostPoolOk = $true } }
+    foreach ($s in $jp) { if ($s.money -ge 0) { $joinPoolOk = $true } }
+    if (-not $hostPoolOk) { $why += "host pool unreadable (faction ownerships unresolved?)" }
+    if (-not $joinPoolOk) { $why += "join pool unreadable" }
+
+    # The write round-trip (host only): a field the engine lets us set and
+    # re-read is a field the trade UI can be made to agree with.
+    $wr = Select-String -Path $HostFile -Pattern 'SCENARIO POOLWRITE want=(-?\d+) ok=(\d) before=(-?\d+) after=(-?\d+)' -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $writeOk = $false
+    if ($null -eq $wr) { $why += "host never logged its POOLWRITE round-trip" }
+    else {
+        $writeOk = ($wr.Matches[0].Groups[2].Value -eq '1') -and
+                   ($wr.Matches[0].Groups[4].Value -eq $wr.Matches[0].Groups[1].Value)
+        if (-not $writeOk) { $why += "host POOLWRITE did not stick (want $($wr.Matches[0].Groups[1].Value), read back $($wr.Matches[0].Groups[4].Value))" }
+    }
+
+    # FINDING: the per-tab wallets next to the pool. All-zero tab wallets on a
+    # save that owns cats is the evidence that the squad wallet is NOT the purse.
+    $tabVals = @()
+    foreach ($m in @(Select-String -Path $HostFile -Pattern 'SCENARIO TABW rank=(\d+) money=(-?\d+)' -ErrorAction SilentlyContinue)) {
+        $tabVals += [int]$m.Matches[0].Groups[2].Value
+    }
+    $tabNonZero = @($tabVals | Where-Object { $_ -gt 0 }).Count
+    $hostFirst = if ($hp.Count -gt 0) { $hp[0].money } else { -1 }
+    $joinFirst = if ($jp.Count -gt 0) { $jp[0].money } else { -1 }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  WALLET-PROBE $v - hostPool=$hostFirst joinPool=$joinFirst writeOk=$writeOk tabNonZero=$tabNonZero/$($tabVals.Count) $detail"
+    Write-Host ("    FINDING: per-tab squad wallets " + $(if ($tabNonZero -eq 0) { "all read 0 - the player's cats are NOT there (pool confirmed)" } else { "$tabNonZero of $($tabVals.Count) reads were non-zero - re-check which field the HUD follows" }))
+    return (Add-GateResult -Name "wallet_probe" -Status $v `
+                -Metrics @{ hostPool = $hostFirst; joinPool = $joinFirst
+                            writeOk = $writeOk; tabReads = $tabVals.Count
+                            tabNonZero = $tabNonZero } -Detail $detail)
+}
+
+# money_sync (protocol 52, moneySync ON): the shared-pool CONSERVATION gate.
+# Both players spend from one purse, so the failure this gate exists to catch is
+# a LOST UPDATE - snapshot sync would let two concurrent spends overwrite each
+# other and hand one purchase over for free. The script seeds the pool on the
+# host (10000), then each side spends locally (join 250, host 1000), so the
+# arithmetic is the whole verdict:
+#   1. the host's seed and BOTH local spends succeeded;
+#   2. both sides' final pool equals base - joinSpend - hostSpend (a surplus
+#      means a spend was dropped, a deficit means one was applied twice);
+#   3. the two sides agree (no drift left at the end of the run).
 function Test-MoneySync {
     param([string]$HostFile, [string]$JoinFile)
     $why = @()
 
-    $hw = Get-WalletSeries -File $HostFile
-    $jw = Get-WalletSeries -File $JoinFile
-    if ($hw.Keys.Count -eq 0) { $why += "host logged no WALLET series" }
-    if ($jw.Keys.Count -eq 0) { $why += "join logged no WALLET series" }
+    $hp = Get-PoolSeries -File $HostFile
+    $jp = Get-PoolSeries -File $JoinFile
+    if ($hp.Count -eq 0) { $why += "host logged no POOL series" }
+    if ($jp.Count -eq 0) { $why += "join logged no POOL series" }
 
-    $setRegex = 'SCENARIO WALLETSET who=(host|join) rank=(\d+) target=(-?\d+) ok=(\d) before=(-?\d+) after=(-?\d+)'
-    $hostSet = Select-String -Path $HostFile -Pattern $setRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
-    $joinSet = Select-String -Path $JoinFile -Pattern $setRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
-    if ($null -eq $hostSet) { $why += "host never logged its WALLETSET" }
-    if ($null -eq $joinSet) { $why += "join never logged its WALLETSET" }
-    foreach ($pair in @(@('host', $hostSet), @('join', $joinSet))) {
+    $seed = Select-String -Path $HostFile -Pattern 'SCENARIO POOLSEED base=(-?\d+) ok=(\d)' -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $base = -1
+    if ($null -eq $seed) { $why += "host never logged its POOLSEED" }
+    elseif ($seed.Matches[0].Groups[2].Value -ne '1') { $why += "host POOLSEED write failed" }
+    else { $base = [int]$seed.Matches[0].Groups[1].Value }
+    # Did the seed ever reach the join? Everything downstream is scored against
+    # a base the join has to have adopted, so a join that never saw it failed
+    # BEFORE the conservation question - report that rather than the arithmetic,
+    # which would otherwise blame a "double apply" for a total that was never
+    # the same to begin with.
+    $seedSeen = ($base -ge 0 -and @($jp | Where-Object { $_.money -eq $base }).Count -gt 0)
+    if ($base -ge 0 -and -not $seedSeen) {
+        $why += "the join never saw the seeded base $base - the pool channel is not delivering"
+    }
+
+    $spendRegex = 'SCENARIO POOLSPEND who=(host|join) amount=(-?\d+) ok=(\d) before=(-?\d+) after=(-?\d+)'
+    $hostSpend = Select-String -Path $HostFile -Pattern $spendRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $joinSpend = Select-String -Path $JoinFile -Pattern $spendRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    foreach ($pair in @(@('host', $hostSpend), @('join', $joinSpend))) {
         $side = $pair[0]; $s = $pair[1]
-        if ($s -and (($s.Matches[0].Groups[4].Value -ne '1') -or
-                     ($s.Matches[0].Groups[6].Value -ne $s.Matches[0].Groups[3].Value))) {
-            $why += "$side WALLETSET write failed (ok/after mismatch)"
+        if ($null -eq $s) { $why += "$side never logged its POOLSPEND"; continue }
+        $amt = [int]$s.Matches[0].Groups[2].Value
+        $before = [int]$s.Matches[0].Groups[4].Value
+        $after = [int]$s.Matches[0].Groups[5].Value
+        if (($s.Matches[0].Groups[3].Value -ne '1') -or ($before - $after -ne $amt)) {
+            $why += "$side POOLSPEND did not debit locally (before $before, after $after, amount $amt)"
         }
     }
 
-    # Crossing: the peer's final money at the sender's rank equals the sentinel.
-    $crossed = 0; $expected = 0
-    foreach ($leg in @(@($hostSet, $jw, 'host->join'), @($joinSet, $hw, 'join->host'))) {
-        $s = $leg[0]; $peer = $leg[1]; $tag = $leg[2]
-        if ($null -eq $s) { continue }
-        $rank = [int]$s.Matches[0].Groups[2].Value
-        $tgt  = [int]$s.Matches[0].Groups[3].Value
-        $expected++
-        if (-not $peer.ContainsKey($rank)) { $why += "$tag rank $rank absent from peer WALLET series"; continue }
-        $end = $peer[$rank][$peer[$rank].Count - 1].money
-        if ($end -eq $tgt) { $crossed++ }
-        else { $why += "$tag sentinel did not cross (peer rank $rank ended $end, want $tgt)" }
+    # The conservation check itself.
+    $finalRegex = 'SCENARIO POOLFINAL money=(-?\d+) expect=(-?\d+) who=(host|join)'
+    $hostFin = Select-String -Path $HostFile -Pattern $finalRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $joinFin = Select-String -Path $JoinFile -Pattern $finalRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $hostFinal = -1; $joinFinal = -1; $expect = -1
+    foreach ($pair in @(@('host', $hostFin), @('join', $joinFin))) {
+        $side = $pair[0]; $s = $pair[1]
+        if ($null -eq $s) { $why += "$side never logged its POOLFINAL"; continue }
+        $money = [int]$s.Matches[0].Groups[1].Value
+        $expect = [int]$s.Matches[0].Groups[2].Value
+        if ($side -eq 'host') { $hostFinal = $money } else { $joinFinal = $money }
+        if ($money -ne $expect) {
+            $lost = $money - $expect
+            $tag = if (-not $seedSeen -and $side -eq 'join') { "the join was never on the same base" }
+                   elseif ($lost -gt 0) { "$lost cats were never spent (a lost update)" }
+                   else { "$([Math]::Abs($lost)) cats vanished (a spend applied twice)" }
+            $why += "$side pool ended $money, want $expect - $tag"
+        }
     }
-
-    # No drift on any co-visible rank.
-    $diverged = @()
-    foreach ($r in $hw.Keys) {
-        if (-not $jw.ContainsKey($r)) { continue }
-        $hEnd = $hw[$r][$hw[$r].Count - 1].money
-        $jEnd = $jw[$r][$jw[$r].Count - 1].money
-        if ($hEnd -ge 0 -and $jEnd -ge 0 -and $hEnd -ne $jEnd) { $diverged += "rank$r($hEnd/$jEnd)" }
+    if ($hostFinal -ge 0 -and $joinFinal -ge 0 -and $hostFinal -ne $joinFinal) {
+        $why += "the two clients disagree about the pool (host $hostFinal, join $joinFinal)"
     }
-    if ($diverged.Count -gt 0) { $why += ("final wallets diverged: " + ($diverged -join ", ")) }
 
     $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
     $detail = $why -join "; "
-    Write-Host "  MONEY-SYNC $v - crossed=$crossed/$expected $detail"
+    Write-Host "  MONEY-SYNC $v - hostFinal=$hostFinal joinFinal=$joinFinal expect=$expect $detail"
     return (Add-GateResult -Name "money_sync" -Status $v `
-                -Metrics @{ crossed = $crossed; expected = $expected
-                            diverged = $diverged.Count } -Detail $detail)
+                -Metrics @{ hostFinal = $hostFinal; joinFinal = $joinFinal
+                            expect = $expect } -Detail $detail)
 }
 
 # recruit_probe (protocol 23 phase 0): mid-session recruitment evidence.
@@ -2317,13 +2399,13 @@ function Test-StoreSync {
                 -Metrics @{ hashMatch = [int]$hashMatch; sent = $sent.Count; applied = $recv.Count } -Detail $detail)
 }
 
-# vendor_trade (protocol 22 phase 1c): the buyer-side purchase composite gate.
-# Each side performed the two buyer-side mutations of one purchase (wallet
-# debit + item into the tab leader's inventory) on the tab it OWNS; the gate is
-# that BOTH effects converged on the peer:
+# vendor_trade (protocol 52 phase 1c): the buyer-side purchase composite gate.
+# Each side performed the two buyer-side mutations of one purchase (cats out of
+# the shared pool + item into its tab leader's inventory); the gate is that BOTH
+# effects converged on the peer:
 #   1. both TRADE lines ok=1 (the local mutations succeeded);
-#   2. the peer's final WALLET for the traded rank equals the trader's wAfter
-#      (the debit crossed on PKT_MONEY);
+#   2. both purchases were paid for out of the ONE pool - each side's final pool
+#      equals the seed minus BOTH prices (the protocol-52 conservation claim);
 #   3. the final TINV content hash for the traded rank matches host-vs-join
 #      (the item crossed on the inventory snapshot channel).
 function Test-VendorTrade {
@@ -2337,8 +2419,19 @@ function Test-VendorTrade {
     if ($null -eq $joinTrade) { $why += "join never logged its TRADE" }
     elseif ($joinTrade.Matches[0].Groups[3].Value -ne '1') { $why += "join TRADE failed locally" }
 
-    $hw = Get-WalletSeries -File $HostFile
-    $jw = Get-WalletSeries -File $JoinFile
+    # Both purchases out of one purse.
+    $finRegex = 'SCENARIO TRADEFINAL money=(-?\d+) expect=(-?\d+) who=(host|join)'
+    $hostFin = Select-String -Path $HostFile -Pattern $finRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $joinFin = Select-String -Path $JoinFile -Pattern $finRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    $poolOk = 0
+    foreach ($pair in @(@('host', $hostFin), @('join', $joinFin))) {
+        $side = $pair[0]; $s = $pair[1]
+        if ($null -eq $s) { $why += "$side never logged its TRADEFINAL"; continue }
+        $money = [int]$s.Matches[0].Groups[1].Value
+        $want = [int]$s.Matches[0].Groups[2].Value
+        if ($money -eq $want) { $poolOk++ }
+        else { $why += "$side pool ended $money after both purchases, want $want" }
+    }
 
     # Final TINV hash per rank per side.
     function Get-TinvFinal([string]$File) {
@@ -2352,19 +2445,10 @@ function Test-VendorTrade {
     $hInv = Get-TinvFinal $HostFile
     $jInv = Get-TinvFinal $JoinFile
 
-    $crossed = 0
-    foreach ($leg in @(@($hostTrade, $jw, 'host->join'), @($joinTrade, $hw, 'join->host'))) {
-        $t = $leg[0]; $peerW = $leg[1]; $tag = $leg[2]
+    foreach ($leg in @(@($hostTrade, 'host->join'), @($joinTrade, 'join->host'))) {
+        $t = $leg[0]; $tag = $leg[1]
         if ($null -eq $t -or $t.Matches[0].Groups[3].Value -ne '1') { continue }
-        $rank   = [int]$t.Matches[0].Groups[2].Value
-        $wAfter = [int]$t.Matches[0].Groups[7].Value
-        # 2. wallet debit crossed.
-        if (-not $peerW.ContainsKey($rank)) { $why += "$tag rank $rank absent from peer WALLET series" }
-        else {
-            $end = $peerW[$rank][$peerW[$rank].Count - 1].money
-            if ($end -eq $wAfter) { $crossed++ }
-            else { $why += "$tag wallet debit did not cross (peer rank $rank ended $end, want $wAfter)" }
-        }
+        $rank = [int]$t.Matches[0].Groups[2].Value
         # 3. inventory content converged.
         if (-not ($hInv.ContainsKey($rank) -and $jInv.ContainsKey($rank))) {
             $why += "$tag rank $rank TINV series missing on a side"
@@ -2375,9 +2459,9 @@ function Test-VendorTrade {
 
     $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
     $detail = $why -join "; "
-    Write-Host "  VENDOR-TRADE $v - walletCrossed=$crossed/2 $detail"
+    Write-Host "  VENDOR-TRADE $v - poolOk=$poolOk/2 $detail"
     return (Add-GateResult -Name "vendor_trade" -Status $v `
-                -Metrics @{ walletCrossed = $crossed } -Detail $detail)
+                -Metrics @{ poolOk = $poolOk } -Detail $detail)
 }
 
 

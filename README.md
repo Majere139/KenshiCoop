@@ -10,8 +10,9 @@ One player hosts their world; a friend connects (LAN, direct UDP, or Steam P2P)
 and plays their own squad inside it. The plugin replicates squads, NPCs, combat,
 inventory and equipment, direct trades between the players' squads, items
 dropped on the ground (both directions), base building and container contents,
-money, game speed, and more - and saves are coordinated: any save either player
-makes becomes one shared save, streamed to both machines automatically.
+one shared money pool, game speed, and more - and saves are coordinated: any save
+either player makes becomes one shared save, streamed to both machines
+automatically.
 
 > **Status: work in progress.** This is a hobby project under active
 > development. Expect rough edges, desyncs, and crashes. Two players is the

@@ -365,3 +365,46 @@ it at the point of use, and treat an unresolvable hand as an already-destroyed
 object rather than an error. If a pointer must be cached, the question to answer
 is not "can this be null" but "what does the engine do to this object when the
 players walk away from it".
+
+## 16. One value with two writers cannot be replicated as a snapshot
+
+Every channel in this codebase publishes state and lets the newest value win,
+which is correct when each value has exactly one author. The player's money has
+two: Kenshi keeps ONE wallet per save (`Faction::factionOwnerships`), and both
+players spend from it. Exchange that as a total and concurrent spends erase each
+other — from 1000, one player buying for 200 and the other for 300 send 800 and
+700, whichever lands last is the pool, and one purchase was free. The bug is
+worst in the case players will actually create, both shopping in the same town.
+
+So the join sends the CHANGE (`PKT_MONEY_DELTA`) and the host — whose wallet *is*
+the pool — sends the total. Three things that fall out of that and are easy to
+miss:
+
+- **The delta channel must be reliable AND ordered.** A dropped or reordered
+  total is self-healing (the next one is still correct); a dropped delta mints or
+  burns cats permanently.
+- **The publisher needs an ack, or the join's own purchase visibly bounces.**
+  The host's total lags the join's local spend by a round trip, so adopting it
+  blindly reverts the purchase and then re-applies it. `MoneyPacket::ackSeq`
+  names the last delta folded in, and the join re-applies whatever is still
+  pending on top.
+- **Detection can be a sample, not a hook.** One wallet read per tick against a
+  baseline catches every path that moves money — trade UI, sale, loot, bounty,
+  hire, bar tab — with no per-path detours. The baseline must be updated on our
+  own writes too, or applying the host's total reads back as a fresh local
+  change and the pool oscillates.
+
+**Rule.** Before writing a channel, ask how many authors the value has. If the
+answer is more than one, replicate the operation rather than the state, and gate
+it on CONSERVATION (`money_sync` asserts both clients end at
+`base - joinSpend - hostSpend`) — a convergence gate cannot tell a lost update
+from agreement, because both clients agreeing on the wrong number passes.
+
+**Corollary on the negative control.** `money_persist` first waited for the
+host's pool to move before saving. That is the right assertion in the wrong
+place: with `KENSHICOOP_MONEY_SYNC=0` the fold never arrives, so the run stalled
+before the save and the A/B proved only that a scenario can fail to set itself
+up. Latching whatever the pool reads (recording `moved=0|1`) and saving anyway
+carries the unfixed build to the post-load comparison, where the erase is
+visible and named. A negative control has to REACH the assertion, so no step of
+the script may be gated on a precondition that only the fix satisfies.

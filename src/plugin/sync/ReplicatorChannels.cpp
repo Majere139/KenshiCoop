@@ -1,5 +1,5 @@
 // ReplicatorChannels.cpp - the periodic state channels (monolith split from
-// Replicator.cpp, 2026-07-12): medical (+treatments), stats, per-tab money,
+// Replicator.cpp, 2026-07-12): medical (+treatments), stats, the money pool,
 // faction relations, doors, production machines, research, placed builds
 // (+build doors), recruits, squad moves, stealth, consensus game speed,
 // game-clock sync, and onPeerConnected (the join-time snapshot burst).
@@ -507,123 +507,186 @@ void Replicator::applyStats(GameWorld* gw, Inbound& in) {
     }
 }
 
-// ---- Protocol 22: per-tab wallet sync ---------------------------------------
+// ---- Protocol 52: shared money pool -----------------------------------------
+//
+// Kenshi keeps ONE player wallet per save, so both players spend from one pool
+// and the HOST's engine wallet is the authority. Two writers on one number rule
+// out absolute snapshots (they lose concurrent spends: from 1000, a 200 and a
+// 300 purchase exchanged as totals leave 800 or 700, so one purchase is free),
+// so the join ships the CHANGE and the host ships the authoritative TOTAL.
+//
+// Detection is a single wallet read per tick against poolSeen_: whatever moved
+// the wallet - trade UI, sale, loot, bounty, hire, bar tab - shows up as a
+// delta, so no per-path hooking is needed. poolSeen_ is updated on every write
+// we make ourselves, which is what keeps our own apply from being re-detected
+// as a fresh local change (the echo guard the sampled channels all need).
 
-// Squad-tab census for the money channel: fill ranks[] with ONE representative
-// hand per distinct squad-tab container, using the same latch-aware ranking
-// publishOwned partitions ownership by (protocol 35: an appended mid-session
-// tab can therefore never shift which rank a pre-existing tab's wallet is
-// keyed under). Returns the rank-space size. rankHand[r] = a member hand of
-// the rank-r tab (readObjectHand layout); 0xFFFFFFFF type = no live member
-// (a latched rank whose tab emptied, or beyond maxRanks).
-unsigned int Replicator::tabRepresentatives(GameWorld* gw, unsigned int rankHand[][5],
-                                            unsigned int maxRanks) {
-    const unsigned int MAX_SQ = 96;
-    static EntityState raw[MAX_SQ];
-    unsigned int nSquad = engine::captureSquad(gw, /*leaderOnly*/ false, raw, MAX_SQ);
-    std::vector<std::pair<u32, u32> > ctnrs;
-    ctnrs.reserve(nSquad);
-    for (unsigned int i = 0; i < nSquad; ++i)
-        ctnrs.push_back(std::make_pair(raw[i].hContainer, raw[i].hContainerSerial));
-    std::sort(ctnrs.begin(), ctnrs.end());
-    ctnrs.erase(std::unique(ctnrs.begin(), ctnrs.end()), ctnrs.end());
-    latchTabs(ctnrs);
-    unsigned int nRanks = squadSync_ ? (unsigned int)tabRank_.size()
-                                     : (unsigned int)ctnrs.size();
-    if (nRanks > maxRanks) nRanks = maxRanks;
-    for (unsigned int r = 0; r < nRanks; ++r) rankHand[r][0] = 0xFFFFFFFFu; // unfilled
-    for (unsigned int i = 0; i < nSquad; ++i) {
-        std::pair<u32, u32> key(raw[i].hContainer, raw[i].hContainerSerial);
-        unsigned int rank = tabRankFor(key, ctnrs);
-        if (rank >= nRanks || rankHand[rank][0] != 0xFFFFFFFFu) continue;
-        rankHand[rank][0] = raw[i].hType;
-        rankHand[rank][1] = raw[i].hContainer;
-        rankHand[rank][2] = raw[i].hContainerSerial;
-        rankHand[rank][3] = raw[i].hIndex;
-        rankHand[rank][4] = raw[i].hSerial;
-    }
-    return nRanks;
-}
-
-void Replicator::publishMoney(const SyncContext& ctx) {
+void Replicator::publishMoneyPool(const SyncContext& ctx) {
     GameWorld* gw = ctx.gw; NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
     if (!moneySync_) return;
-    const unsigned long RESEND_MS   = tuning_.moneyResendMs;  // safety resend (a lost write self-heals)
-    const unsigned long MIN_SEND_MS = tuning_.moneyMinSendMs; // wallets move in bursts; ~1 Hz is plenty
-    const unsigned int  MAX_RANKS   = 8;
+    int cur = -1;
+    if (!engine::readPlayerWallet(gw, &cur) || cur < 0) return;
+    const bool hostRole = isHostRole();
     unsigned long now = nowMs();
-    unsigned int rankHand[MAX_RANKS][5];
-    unsigned int nRanks = tabRepresentatives(gw, rankHand, MAX_RANKS);
-    for (unsigned int r = 0; r < nRanks; ++r) {
-        if (rankHand[r][0] == 0xFFFFFFFFu) continue;
-        // Own-tabs only (the same partition rule as publishOwned's entity filter).
-        if (!ownsTab(std::make_pair(rankHand[r][1], rankHand[r][2]), r)) continue;
-        // This channel's WIRE key is the rank, and ranks past the session-start
-        // seeding are assigned in local first-seen order, so the same number can
-        // name different tabs on the two clients. Now that an appended tab has a
-        // real owner it would otherwise start publishing, and land on whatever
-        // squad happens to hold that rank over there. Wallets stay on the prefix
-        // both sides agree about.
-        if (!rankIsShared(r)) continue;
-        int money = -1;
-        if (!engine::readWalletByHand(rankHand[r], &money) || money < 0) continue;
-        MoneyPub& mp = moneyPub_[r];
-        bool changed = (money != mp.lastSent);
-        // Money has no silent seed step, so a never-sent row is resend-due: a
-        // fresh wallet still streams once. (resendUnsent = true.)
-        if (!sync::gateShouldSend(changed, now, mp.lastSendMs, MIN_SEND_MS,
-                                  RESEND_MS, /*resendUnsent*/ true))
-            continue;
-        mp.lastSent = money; mp.lastSendMs = now;
+
+    // First sample of a session (or the first after a reload): adopt the wallet
+    // as the baseline instead of reporting it as a change. Without this the
+    // save's own starting cats would look like a purchase the size of the whole
+    // wallet on whichever side sampled first.
+    if (poolSeen_ < 0) {
+        poolSeen_ = cur;
+        if (hostRole) poolTotal_ = cur;
+        char b[112];
+        _snprintf(b, sizeof(b) - 1, "[wallet] POOL SEED t=%d role=%s",
+                  cur, hostRole ? "host" : "join");
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        return;
+    }
+
+    if (hostRole) {
+        // Our engine wallet IS the pool. A local move is already authoritative;
+        // just keep the mirror and let the change gate publish it.
+        if (cur != poolSeen_) {
+            char b[128];
+            _snprintf(b, sizeof(b) - 1, "[wallet] POOL LOCAL t=%d was=%d delta=%d",
+                      cur, poolSeen_, cur - poolSeen_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            poolSeen_ = cur;
+        }
+        poolTotal_ = cur;
+        bool changed = (poolTotal_ != poolSent_);
+        if (!sync::gateShouldSend(changed, now, poolSentMs_, tuning_.moneyMinSendMs,
+                                  tuning_.moneyResendMs, /*resendUnsent*/ true))
+            return;
+        poolSent_ = poolTotal_; poolSentMs_ = now;
         MoneyPacket pkt;
         memset(&pkt, 0, sizeof(pkt));
         pkt.type    = (u8)PKT_MONEY;
         pkt.ownerId = ownerId;
-        pkt.tabRank = r;
-        pkt.money   = money;
+        pkt.ackSeq  = poolAcked_;
+        pkt.money   = poolTotal_;
         net.queueMoney(pkt);
         if (changed) { // resends stay silent; the change is the signal
-            char b[96];
-            _snprintf(b, sizeof(b) - 1, "[money] SEND rank=%u cats=%d", r, money);
+            char b[112];
+            _snprintf(b, sizeof(b) - 1, "[wallet] POOL SEND t=%d ack=%u",
+                      poolTotal_, poolAcked_);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
+        return;
     }
+
+    // Join: report the movement, never the total. The delta stays pending until
+    // the host acks it so applyMoneyPool can re-apply it on top of a total that
+    // does not include it yet.
+    if (cur == poolSeen_) return;
+    int delta = cur - poolSeen_;
+    poolSeen_ = cur;
+    ++poolSeq_;
+    poolPending_.push_back(PoolDelta(poolSeq_, delta));
+    MoneyDeltaPacket pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.type    = (u8)PKT_MONEY_DELTA;
+    pkt.ownerId = ownerId;
+    pkt.seq     = poolSeq_;
+    pkt.delta   = delta;
+    net.queueMoneyDelta(pkt);
+    char b[128];
+    _snprintf(b, sizeof(b) - 1, "[wallet] POOL DELTA seq=%u delta=%d local=%d",
+              poolSeq_, delta, cur);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
 }
 
-void Replicator::applyMoney(const SyncContext& ctx) {
-    GameWorld* gw = ctx.gw; Inbound& in = *ctx.in;
-    std::deque<InboundMoney> got;
-    in.drainMoney(got);
-    if (got.empty()) return;
+void Replicator::applyMoneyPool(const SyncContext& ctx) {
+    GameWorld* gw = ctx.gw; Inbound& in = *ctx.in; NetLink& net = *ctx.net;
+    std::deque<InboundMoney> totals;
+    std::deque<InboundMoneyDelta> deltas;
+    in.drainMoney(totals);
+    in.drainMoneyDeltas(deltas);
+    if (totals.empty() && deltas.empty()) return;
     if (!moneySync_) return;
-    const unsigned int MAX_RANKS = 8;
-    unsigned int rankHand[MAX_RANKS][5];
-    unsigned int nRanks = 0;
-    bool haveRanks = false;
-    for (std::deque<InboundMoney>::iterator it = got.begin(); it != got.end(); ++it) {
-        const MoneyPacket& p = it->pkt;
-        unsigned int r = p.tabRank;
-        if (p.money < 0) continue;
-        // Ranks outside the seeded prefix name different tabs on each client
-        // (see publishMoney) - the sender should not have sent one, and applying
-        // it would write a stranger's wallet.
-        if (!rankIsShared(r)) continue;
-        if (!haveRanks) { // one census per drain (cheap; usually 1 packet anyway)
-            nRanks = tabRepresentatives(gw, rankHand, MAX_RANKS);
-            haveRanks = true;
+    const bool hostRole = isHostRole();
+
+    if (hostRole) {
+        // Fold the join's deltas into the pool. Clamped at 0: both players can
+        // commit purchases against the same cats before either delta lands, and
+        // the goods are already handed over locally, so the pool absorbs the
+        // shortfall rather than going negative.
+        bool moved = false;
+        for (std::deque<InboundMoneyDelta>::iterator it = deltas.begin();
+             it != deltas.end(); ++it) {
+            const MoneyDeltaPacket& p = it->pkt;
+            if (p.seq <= poolAcked_) continue; // already folded (defensive)
+            if (poolTotal_ < 0) {              // no seed yet - adopt the wallet first
+                int cur = -1;
+                if (!engine::readPlayerWallet(gw, &cur) || cur < 0) return;
+                poolTotal_ = cur; poolSeen_ = cur;
+            }
+            int want = poolTotal_ + p.delta;
+            if (want < 0) {
+                char b[128];
+                _snprintf(b, sizeof(b) - 1,
+                          "[wallet] OVERDRAFT want=%d clamped=0 seq=%u delta=%d",
+                          want, p.seq, p.delta);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                want = 0;
+            }
+            poolTotal_ = want;
+            poolAcked_ = p.seq;
+            moved = true;
+            char b[144];
+            _snprintf(b, sizeof(b) - 1, "[wallet] POOL FOLD seq=%u delta=%d t=%d",
+                      p.seq, p.delta, poolTotal_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
-        if (r >= nRanks || rankHand[r][0] == 0xFFFFFFFFu) continue;
-        // Never write a tab we own - our engine is that wallet's authority.
-        if (ownsTab(std::make_pair(rankHand[r][1], rankHand[r][2]), r)) continue;
-        int cur = -1;
-        engine::readWalletByHand(rankHand[r], &cur);
-        if (cur == p.money) continue; // already converged (resend or echo)
-        bool ok = engine::writeWalletByHand(rankHand[r], p.money);
-        char b[112];
-        _snprintf(b, sizeof(b) - 1, "[money] RECV rank=%u cats=%d was=%d ok=%d",
-                  r, p.money, cur, ok ? 1 : 0);
-        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (!moved) return;
+        if (engine::writePlayerWallet(gw, poolTotal_)) {
+            poolSeen_ = poolTotal_;
+        } else {
+            // The fold is acked but the engine refused the write, so the join's
+            // cats are about to be dropped when the next sample re-reads the
+            // unchanged wallet. Never silent: this is money going missing.
+            char b[112];
+            _snprintf(b, sizeof(b) - 1, "[wallet] WARN pool write FAILED t=%d ack=%u",
+                      poolTotal_, poolAcked_);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        // Publish immediately rather than waiting on the send floor: the join is
+        // holding a pending delta and we now know the answer.
+        poolSent_ = poolTotal_; poolSentMs_ = nowMs();
+        MoneyPacket out;
+        memset(&out, 0, sizeof(out));
+        out.type    = (u8)PKT_MONEY;
+        out.ownerId = ctx.localId;
+        out.ackSeq  = poolAcked_;
+        out.money   = poolTotal_;
+        net.queueMoney(out);
+        return;
     }
+
+    // Join: adopt the newest authoritative total, then re-apply whatever the
+    // host has not acked yet so a purchase made moments ago is not reverted for
+    // a round trip and then re-applied.
+    if (totals.empty()) return;
+    const MoneyPacket& p = totals.back().pkt;
+    if (p.money < 0) return;
+    while (!poolPending_.empty() && poolPending_.front().seq <= p.ackSeq)
+        poolPending_.pop_front();
+    poolAcked_ = p.ackSeq;
+    int want = p.money;
+    for (std::deque<PoolDelta>::iterator it = poolPending_.begin();
+         it != poolPending_.end(); ++it)
+        want += it->delta;
+    if (want < 0) want = 0;
+    int cur = -1;
+    if (!engine::readPlayerWallet(gw, &cur)) return;
+    if (cur == want) { poolSeen_ = cur; return; } // already converged
+    bool ok = engine::writePlayerWallet(gw, want);
+    if (ok) poolSeen_ = want;
+    char b[176];
+    _snprintf(b, sizeof(b) - 1,
+              "[wallet] POOL RECV t=%d ack=%u pending=%u want=%d was=%d ok=%d",
+              p.money, p.ackSeq, (unsigned)poolPending_.size(), want, cur, ok ? 1 : 0);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
 }
 
 void Replicator::publishFactions(const SyncContext& ctx) {
@@ -1423,9 +1486,9 @@ void Replicator::onPeerConnected(NetLink& net, u32 ownerId) {
     for (std::map<Key, StatsPub>::iterator it = statsPub_.begin();
          it != statsPub_.end(); ++it)
         if (it->second.lastSendMs != 0) { it->second.lastSendMs = 1; ++nStats; }
-    for (std::map<unsigned int, MoneyPub>::iterator it = moneyPub_.begin();
-         it != moneyPub_.end(); ++it)
-        if (it->second.lastSendMs != 0) { it->second.lastSendMs = 1; ++nMoney; }
+    // The money pool is a single value, not a row cache: age its send stamp so
+    // publishMoneyPool re-broadcasts the authoritative total on its next sample.
+    if (poolSentMs_ != 0) { poolSentMs_ = 1; nMoney = 1; }
     for (std::map<Key, InvPub>::iterator it = invPub_.begin();
          it != invPub_.end(); ++it)
         if (it->second.lastSendMs != 0) { it->second.lastSendMs = 1; ++nInv; }

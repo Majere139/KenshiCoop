@@ -97,6 +97,7 @@ static void testSizes() {
     CHECK_EQ("sizeof(SpawnReqPacket)",          sizeof(SpawnReqPacket),          25);
     CHECK_EQ("sizeof(SpawnInfoPacket)",         sizeof(SpawnInfoPacket),         143);
     CHECK_EQ("sizeof(MoneyPacket)",             sizeof(MoneyPacket),             13);
+    CHECK_EQ("sizeof(MoneyDeltaPacket)",        sizeof(MoneyDeltaPacket),        13);
     CHECK_EQ("sizeof(FactionPacket)",           sizeof(FactionPacket),           61);
     CHECK_EQ("sizeof(TimePacket)",              sizeof(TimePacket),              17);
     CHECK_EQ("sizeof(DoorPacket)",              sizeof(DoorPacket),              31);
@@ -223,8 +224,25 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v51: item craft grade)",
-             (int)PROTOCOL_VERSION, 51);
+    CHECK_EQ("PROTOCOL_VERSION (v52: shared money pool)",
+             (int)PROTOCOL_VERSION, 52);
+
+    // Protocol 52: the shared money pool. The two players spend from ONE wallet,
+    // so the join reports CHANGES and the host the authoritative TOTAL - swap
+    // those roles and concurrent purchases silently mint or burn cats. The
+    // shapes are locked here because both halves must stay distinguishable:
+    // MoneyPacket carries an ack of the join's delta sequence (which is why the
+    // old tabRank field is gone), MoneyDeltaPacket a signed change.
+    CHECK("PKT_MONEY_DELTA distinct", PKT_MONEY_DELTA != PKT_MONEY &&
+          (int)PKT_MONEY_DELTA == 46);
+    {
+        MoneyPacket total; std::memset(&total, 0, sizeof(total));
+        total.type = (u8)PKT_MONEY; total.ackSeq = 7u; total.money = 4000;
+        MoneyDeltaPacket d; std::memset(&d, 0, sizeof(d));
+        d.type = (u8)PKT_MONEY_DELTA; d.seq = 8u; d.delta = -250;
+        CHECK("pool total carries ack", total.ackSeq == 7u && total.money == 4000);
+        CHECK("pool delta is signed", d.delta < 0 && d.seq == 8u);
+    }
 
     // Protocol 48: the parent reference. A worn backpack owns a PRIVATE inventory, so a bagged
     // item is described by no snapshot unless it can name its container. The byte was already
@@ -370,6 +388,7 @@ static void testRoundTrips() {
     roundTrip<SpeedPacket>("SpeedPacket(SET)", (u8)PKT_SPEED_SET);
     roundTrip<StatsPacket>("StatsPacket", (u8)PKT_STATS);
     roundTrip<MoneyPacket>("MoneyPacket", (u8)PKT_MONEY);
+    roundTrip<MoneyDeltaPacket>("MoneyDeltaPacket", (u8)PKT_MONEY_DELTA);
     roundTrip<FactionPacket>("FactionPacket", (u8)PKT_FACTION);
     roundTrip<TimePacket>("TimePacket", (u8)PKT_TIME);
     roundTrip<DoorPacket>("DoorPacket", (u8)PKT_DOOR);
@@ -1254,6 +1273,7 @@ static void testFlushWorldStateContract() {
     SpeedPacket     sp;  std::memset(&sp,  0, sizeof(sp));
     StatsPacket     stp; std::memset(&stp, 0, sizeof(stp));
     MoneyPacket     mo;  std::memset(&mo,  0, sizeof(mo));
+    MoneyDeltaPacket md; std::memset(&md,  0, sizeof(md));
     FactionPacket   fa;  std::memset(&fa,  0, sizeof(fa));
     TimePacket      ti;  std::memset(&ti,  0, sizeof(ti));
     DoorPacket      dp;  std::memset(&dp,  0, sizeof(dp));
@@ -1279,7 +1299,7 @@ static void testFlushWorldStateContract() {
     LoadReqPacket   lrq; std::memset(&lrq, 0, sizeof(lrq));
     LoadNackPacket  lnk; std::memset(&lnk, 0, sizeof(lnk));
 
-    // --- Push one sentinel into every WORLD-STATE queue (31).
+    // --- Push one sentinel into every WORLD-STATE queue (32).
     in.pushEntity(1, 0, e);
     in.pushEvent(1, ev);
     in.pushInv(1, 0, cKey, 0, 0);
@@ -1296,6 +1316,7 @@ static void testFlushWorldStateContract() {
     in.pushSpeed(1, sp);
     in.pushStats(1, stp);
     in.pushMoney(1, mo);
+    in.pushMoneyDelta(1, md);
     in.pushFaction(1, fa);
     in.pushTime(1, ti);
     in.pushDoor(1, dp);
@@ -1346,6 +1367,7 @@ static void testFlushWorldStateContract() {
     WS_EMPTY("speed",       InboundSpeed,       drainSpeed);
     WS_EMPTY("stats",       InboundStats,       drainStats);
     WS_EMPTY("money",       InboundMoney,       drainMoney);
+    WS_EMPTY("moneyDelta",  InboundMoneyDelta,  drainMoneyDeltas);
     WS_EMPTY("faction",     InboundFaction,     drainFaction);
     WS_EMPTY("time",        InboundTime,        drainTime);
     WS_EMPTY("door",        InboundDoor,        drainDoor);

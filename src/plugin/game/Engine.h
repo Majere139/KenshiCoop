@@ -1475,12 +1475,19 @@ bool pickCombatVictim(GameWorld* gw, const unsigned int refHand[5],
 bool orderAttackByHand(GameWorld* gw, const unsigned int atkHand[5],
                        const unsigned int vicHand[5]);
 
-// ---- Protocol 22 groundwork: money + vendor trading (shop_probe / money sync)
-// Kenshi's wallet is PER-PLATOON (Ownerships::money via Platoon, spike 29): there
-// is no global player wallet, so the sync unit is the squad TAB (the same
-// partition positional/inventory sync own). Vendors are ShopTrader RootObjects
-// with save-stable hands; a purchase is Inventory::buyItem mutating vendor stock
-// + wallet LOCALLY on one client only - the divergence the probe measures.
+// ---- Money + vendor trading (protocol 52 pool / shop_probe) -----------------
+// Kenshi keeps ONE player wallet per save: the save's player-state record holds
+// a single `player money` value, and the live field hangs off the player FACTION
+// (Faction::factionOwnerships), not off any squad. The PER-PLATOON
+// Ownerships::money reached by readWalletByHand belongs to NPC/town squads (the
+// cats you loot off a bandit platoon) and reads 0 for the player's own tabs -
+// which is why the old per-tab money channel synced a field the player economy
+// ignores (wallet_probe). Player cats are therefore a SHARED POOL, replicated by
+// protocol 52 over readPlayerWallet/writePlayerWallet.
+//
+// Vendors are ShopTrader RootObjects with save-stable hands; a purchase is
+// Inventory::buyItem mutating vendor stock + the pool LOCALLY on one client only
+// - the divergence the probe measures.
 
 // One nearby vendor (ShopTrader) summary for the shop_probe evidence log.
 struct VendorRead {
@@ -1504,13 +1511,28 @@ struct VendorRead {
 unsigned int listVendorsNear(GameWorld* gw, VendorRead* out, unsigned int maxOut,
                              float radius);
 
-// SEH-guarded: read the WALLET of the platoon containing the body at mHand
+// SEH-guarded: read the PLAYER's wallet - the single pool the HUD shows and
+// every purchase/sale/loot/bounty moves (player faction -> factionOwnerships ->
+// Ownerships::getMoney, engine accessors, never raw offsets). This is the
+// protocol-52 sample point. *outMoney = -1 on failure. Returns true on ok.
+bool readPlayerWallet(GameWorld* gw, int* outMoney);
+
+// SEH-guarded: write the player's wallet via Ownerships::setMoney (the
+// protocol-52 apply primitive). Rejects negative amounts - the pool is clamped
+// at 0 by the host, never driven below it. Returns true on ok.
+bool writePlayerWallet(GameWorld* gw, int money);
+
+// SEH-guarded: read the wallet of the platoon containing the body at mHand
 // (Character -> ActivePlatoon -> Platoon -> Ownerships::getMoney - engine
-// accessors, never raw offsets). *outMoney = -1 on failure. Returns true on ok.
+// accessors, never raw offsets). This is an NPC/town-SQUAD wallet: it reads 0
+// for the player's own tabs, so it is diagnostic only (wallet_probe) and is NOT
+// the player's cats - use readPlayerWallet for those. *outMoney = -1 on
+// failure. Returns true on ok.
 bool readWalletByHand(const unsigned int mHand[5], int* outMoney);
 
 // SEH-guarded: write the wallet of the platoon containing the body at mHand via
-// Ownerships::setMoney (the money-sync apply primitive). Returns true on ok.
+// Ownerships::setMoney (diagnostic counterpart of readWalletByHand; see the
+// note there about which wallet this is). Returns true on ok.
 bool writeWalletByHand(const unsigned int mHand[5], int money);
 
 // Purchase observability detour (protocol 22, 1c groundwork): hook Inventory::

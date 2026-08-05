@@ -114,6 +114,7 @@ function Invoke-OneOracle {
         "sneak_probe"   { return (Test-SneakProbe      -HostFile $HostLog) }
         "spawn_probe"   { return (Test-SpawnProbe      -HostFile $HostLog -JoinFile $JoinLog) }
         "shop_probe"    { return (Test-ShopProbe       -HostFile $HostLog -JoinFile $JoinLog) }
+        "wallet_probe"  { return (Test-WalletProbe     -HostFile $HostLog -JoinFile $JoinLog) }
         "money_sync"    { return (Test-MoneySync       -HostFile $HostLog -JoinFile $JoinLog) }
         "vendor_trade"  { return (Test-VendorTrade     -HostFile $HostLog -JoinFile $JoinLog) }
         "recruit_probe" { return (Test-RecruitProbe    -HostFile $HostLog -JoinFile $JoinLog) }
@@ -138,6 +139,7 @@ function Invoke-OneOracle {
         "save_sync"      { return (Test-SaveSync       -HostFile $HostLog -JoinFile $JoinLog) }
         "save_resume"    { return (Test-SaveResume     -HostFile $HostLog -JoinFile $JoinLog) }
         "load_sync"      { return (Test-LoadSync       -HostFile $HostLog -JoinFile $JoinLog) }
+        "money_persist"  { return (Test-MoneyPersist   -HostFile $HostLog -JoinFile $JoinLog) }
         "connect_bootstrap" { return (Test-ConnectBootstrap -HostFile $HostLog -JoinFile $JoinLog) }
         "connect_stream"    { return (Test-ConnectStream    -HostFile $HostLog -JoinFile $JoinLog) }
         "prod_probe"     { return (Test-ProdProbe      -HostFile $HostLog -JoinFile $JoinLog) }
@@ -415,7 +417,8 @@ Export-ModuleMember -Function @(
     "Test-SneakProbe",
     "Get-SpawnHands", "Test-SpawnProbe", "Test-SpawnSync", "Test-SpawnFarBind",
     "Test-NpcCensus",
-    "Get-WalletSeries", "Test-ShopProbe", "Test-MoneySync", "Test-VendorTrade",
+    "Get-WalletSeries", "Get-PoolSeries", "Test-ShopProbe", "Test-WalletProbe",
+    "Test-MoneySync", "Test-MoneyPersist", "Test-VendorTrade",
     "Test-RecruitProbe", "Test-RecruitSync", "Test-RecruitCtl",
     "Get-FacRelSeries", "Test-FactionProbe", "Test-FactionSync",
     "Get-GTimeSeries", "Test-TimeProbe", "Test-TimeSync", "Get-SlewSummary",

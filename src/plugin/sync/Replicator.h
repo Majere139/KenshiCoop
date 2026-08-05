@@ -329,19 +329,25 @@ public:
     // fights accumulate locally (the owner's stream overwrites it).
     void applyStats(GameWorld* gw, Inbound& in);
 
-    // AFTER publishOwned (protocol 22, both clients): stream the WALLET
-    // (Ownerships::money) of every squad tab this client OWNS, keyed by tab
-    // RANK - change-gated on the reliable channel with a ~1 Hz floor and a
-    // periodic safety resend (the publishStats pacing). Kenshi's wallet is
-    // per-Platoon; nothing else about money is on the wire (shop_probe).
-    void publishMoney(const SyncContext& ctx);
+    // BOTH clients (protocol 52): sample the player's SHARED money pool
+    // (readPlayerWallet) against our baseline and turn any local movement -
+    // purchase, sale, loot, bounty, hire - into wire traffic. One int read a
+    // tick catches every economy path without hooking each of them.
+    //   host: its engine wallet IS the pool, so a local move just re-publishes
+    //         the authoritative total (change-gated, safety resend).
+    //   join: a local move becomes a signed PKT_MONEY_DELTA held pending until
+    //         the host acks it.
+    void publishMoneyPool(const SyncContext& ctx);
 
-    // BEFORE engine (protocol 22): drain received wallet snapshots and write
-    // each PEER-owned tab's money onto our local copy of that tab's platoon
-    // via Ownerships::setMoney. Never writes a rank we own.
-    void applyMoney(const SyncContext& ctx);
+    // BEFORE engine (protocol 52): the receive half of the pool.
+    //   host: fold each inbound delta into the pool (clamped at 0 - the
+    //         both-players-spent-the-same-cats race), write it back and
+    //         re-publish so the join converges on the authoritative total.
+    //   join: adopt the host's total PLUS our own still-unacked deltas, so a
+    //         purchase from a moment ago is not reverted and then re-applied.
+    void applyMoneyPool(const SyncContext& ctx);
 
-    // Per-tab wallet sync master enable (KENSHICOOP_MONEY_SYNC).
+    // Shared money-pool sync master enable (KENSHICOOP_MONEY_SYNC).
     void setMoneySync(bool v) { moneySync_ = v; }
 
     // BEFORE engine (protocol 23, both clients): drain the engine's recruit-edge
@@ -1625,13 +1631,29 @@ private:
     // RESEND_MS names to these fields, so behavior is unchanged - this is the one
     // place their cadence now lives. See SyncTuning.h.
     SyncTuning tuning_;
-    // Protocol 22: per OWNED tab rank, the last SENT wallet value + send time
-    // (change gate + safety resend). A settled economy is silent.
-    struct MoneyPub {
-        int lastSent; unsigned long lastSendMs;
-        MoneyPub() : lastSent(-1), lastSendMs(0) {}
+    // Protocol 52 shared money pool.
+    // poolSeen_   = the wallet value we last observed/wrote, i.e. the baseline a
+    //               local engine move is detected against. -1 = not yet seeded
+    //               (fresh session or post-reload), which suppresses the first
+    //               sample so a seed is never mistaken for a purchase.
+    // poolSent_/poolSentMs_ = host change gate + safety resend for the total.
+    // poolSeq_    = join's monotonic delta sequence (last used).
+    // poolAcked_  = highest seq the host has confirmed folding in.
+    // poolPending_ = join's unacked deltas, re-applied on top of the host's
+    //               total so a just-made purchase does not visibly bounce.
+    // poolTotal_  = host's authoritative pool.
+    struct PoolDelta {
+        u32 seq; int delta;
+        PoolDelta() : seq(0), delta(0) {}
+        PoolDelta(u32 s, int d) : seq(s), delta(d) {}
     };
-    std::map<unsigned int, MoneyPub> moneyPub_;
+    int  poolSeen_;
+    int  poolSent_;
+    unsigned long poolSentMs_;
+    int  poolTotal_;
+    u32  poolSeq_;
+    u32  poolAcked_;
+    std::deque<PoolDelta> poolPending_;
     bool moneySync_;
     // Protocol 24 faction-relation sync state, per faction sid.
     // known      = our current baseline (seeded on first sight, updated on every
@@ -1846,11 +1868,6 @@ private:
     bool isHostRole() const {
         return ownRanks_.empty() || ownRanks_.count(0u) != 0;
     }
-    // Squad-tab census for the rank-keyed channels (money, tab-leader
-    // inventories): ONE representative member hand per tab rank, using the
-    // same latch-aware ranking publishOwned partitions ownership by.
-    unsigned int tabRepresentatives(GameWorld* gw, unsigned int rankHand[][5],
-                                    unsigned int maxRanks);
     // Shared EVT_RECRUIT / EVT_SQUAD_MOVE receive half: pin the new hand as
     // peer-authored and re-key our local copy of the old hand onto it in
     // proxyByKey_ (restoring it first if host-authority had suppressed it).

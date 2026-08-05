@@ -25,7 +25,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 51;
+const u16 PROTOCOL_VERSION = 52;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -49,7 +49,7 @@ enum PacketType {
     PKT_STEALTH          = 18,// UNRELIABLE detection-map snapshot (host -> owner); StealthPacket
     PKT_SPAWN_REQ        = 19,// RELIABLE unresolved-hand query (join -> host); SpawnReqPacket
     PKT_SPAWN_INFO       = 20,// RELIABLE runtime-spawn description (host -> join); SpawnInfoPacket
-    PKT_MONEY            = 21,// RELIABLE owner-authoritative tab wallet (protocol 22); MoneyPacket
+    PKT_MONEY            = 21,// RELIABLE host-authoritative money-pool total (protocol 52); MoneyPacket
     PKT_FACTION          = 22,// RELIABLE player-faction relation row (protocol 24); FactionPacket
     PKT_TIME             = 23,// RELIABLE host-authoritative game clock (protocol 25); TimePacket
     PKT_DOOR             = 24,// RELIABLE baked-door open/lock state row (protocol 26); DoorPacket
@@ -73,7 +73,8 @@ enum PacketType {
     PKT_COMBAT_HIT       = 42,// RELIABLE join-dealt authoritative damage report (join -> host, protocol 45); CombatHitPacket
     PKT_WORLD_ITEM_CLAIM = 43,// RELIABLE proxy-consumed notice (protocol 47); WorldItemClaimHeader
     PKT_CELL_CLAIM       = 44,// RELIABLE zone-cell presence claim (protocol 49); CellClaimPacket
-    PKT_INV_XFER_ACK     = 45 // RELIABLE transfer verdict (protocol 50); InvXferAckPacket
+    PKT_INV_XFER_ACK     = 45,// RELIABLE transfer verdict (protocol 50); InvXferAckPacket
+    PKT_MONEY_DELTA      = 46 // RELIABLE join money-pool delta (join -> host, protocol 52); MoneyDeltaPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -901,19 +902,41 @@ struct StatsPacket {
     f32 freeAttributePoints;   // CharStats::freeAttributePoints (int on wire as f32; -1 = unreadable)
 };
 
-// ---- Protocol 22: per-tab wallet snapshot -----------------------------------
-// Owner-authoritative money for ONE player squad tab, keyed by the tab's RANK
-// among the distinct sorted member containers - the same cross-client-stable
-// tab identity the ownership partition uses (a hand key would also work, but
-// rank is what both sides already agree on for "whose tab is whose"). Change-
-// gated with a floor + safety resend (the PKT_STATS pacing); the receiver
-// writes the value via Ownerships::setMoney onto the platoon of that rank's
-// tab leader. money is signed on the wire because the engine field is an int.
+// ---- Protocol 52: shared money pool ------------------------------------------
+// Kenshi keeps ONE player wallet per save (the single `player money` field in
+// the save's player-state record; the per-platoon Ownerships::money the v22
+// channel used to publish belongs to NPC/town squads and reads 0 for the
+// player's own tabs - which is why that channel synced a field the economy
+// ignores). Both players therefore spend from ONE pool, and the host's engine
+// wallet IS that pool.
+//
+// The pool has two writers, so absolute snapshots would LOSE updates: if both
+// players buy from 1000 - one spending 200, the other 300 - exchanged totals
+// overwrite each other and one purchase becomes free. The join therefore sends
+// the CHANGE (MoneyDeltaPacket) and the host publishes the authoritative TOTAL.
+//
+// Host -> join: the authoritative pool total, change-gated with a safety
+// resend. ackSeq is the highest join delta already folded into that total, so
+// the join can re-apply its still-unacked deltas on top instead of watching a
+// fresh purchase revert and then re-apply. money is signed because the engine
+// field is an int (the host clamps the pool at 0).
 struct MoneyPacket {
     u8  type;    // = PKT_MONEY
-    u32 ownerId; // network player id of the sender (the tab's owner)
-    u32 tabRank; // squad-tab rank (0 = host-owned tab, 1 = join-owned, ...)
-    int money;   // Ownerships::money for that tab's platoon
+    u32 ownerId; // network player id of the sender (the host)
+    u32 ackSeq;  // highest MoneyDeltaPacket.seq folded into this total (0 = none)
+    int money;   // the authoritative shared pool
+};
+
+// Join -> host: one signed change the join's LOCAL economy already applied
+// (purchase, sale, loot, bounty, hire). Reliable + ordered, so the host folds
+// each delta exactly once; seq is monotonic per session and comes back as
+// MoneyPacket::ackSeq. A single ackSeq assumes ONE remote peer (the two-player
+// design target) - a third player would need a per-peer ack.
+struct MoneyDeltaPacket {
+    u8  type;    // = PKT_MONEY_DELTA
+    u32 ownerId; // network player id of the sender (the join)
+    u32 seq;     // monotonic per-session delta sequence (starts at 1)
+    int delta;   // signed change to the pool (negative = spent)
 };
 
 // ---- Protocol 24: player-faction relation row --------------------------------

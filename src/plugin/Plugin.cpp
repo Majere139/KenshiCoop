@@ -1121,13 +1121,15 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
             g_repl.publishStats(gw, g_net, g_net.localId());
             g_repl.applyStats(gw, g_inbound);
         }
-        // Per-tab wallet sync (protocol 22): each client streams the money of
-        // the squad tabs it OWNS (change-gated reliable, keyed by tab rank);
-        // received snapshots land on the peer tabs via Ownerships::setMoney.
-        // Ordered after publishOwned (ownership ranks are the partition rule).
+        // Shared money pool (protocol 52): Kenshi keeps ONE player wallet, so
+        // both players spend from one pool with the host as authority. Publish
+        // samples the wallet and reports any local movement (join: a signed
+        // delta, host: the authoritative total); apply folds deltas / adopts the
+        // total. Ordered after publishOwned so isHostRole() reflects this tick's
+        // ownership partition.
         if (g_cfg.moneySync) {
-            g_repl.publishMoney(replCtx(gw));
-            g_repl.applyMoney(replCtx(gw));
+            g_repl.publishMoneyPool(replCtx(gw));
+            g_repl.applyMoneyPool(replCtx(gw));
         }
         // Recruitment sync (protocol 23): drain the recruit detour's edge queue
         // into reliable EVT_RECRUIT events (subject = old hand, actor = new
@@ -1987,9 +1989,9 @@ void configureReplicator() {
     g_repl.setChainSync(g_cfg.chainSync);
     g_repl.setStealthSync(g_cfg.stealthSync);
 
-    // Per-tab wallet sync (protocol 22, default ON): owner-authoritative money
-    // per squad tab. KENSHICOOP_MONEY_SYNC=0 is the A/B escape hatch (and the
-    // shop_probe baseline).
+    // Shared money pool (protocol 52, default ON): one host-authoritative purse
+    // both players spend from. KENSHICOOP_MONEY_SYNC=0 is the A/B escape hatch
+    // (and the shop_probe baseline).
     g_repl.setMoneySync(g_cfg.moneySync);
 
     // Runtime-spawn proxy replication (protocol 21, default ON): the join mints
@@ -2087,9 +2089,9 @@ void installEngineDetours() {
         }
     }
 
-    // Purchase observability (protocol 22, 1c groundwork): log every real
-    // trade-UI purchase ("[shop] BUY-LOCAL"), the field evidence for the
-    // vendor-stock mirror design. Rides the money-sync gate.
+    // Purchase observability (protocol 52 groundwork): log every real trade-UI
+    // purchase ("[shop] BUY-LOCAL"), the field evidence for the vendor-stock
+    // mirror design. Rides the money-sync gate.
     if (g_cfg.moneySync) {
         if (coop::engine::installShopHook())
             coopLog("[shop] buyItem detour installed; purchase logging ON");

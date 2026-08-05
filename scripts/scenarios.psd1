@@ -684,15 +684,15 @@
             Tier = 'probe'; WanVariant = $false
         }
 
-        # shop_probe: money/vendor-trading phase-0 diagnostic (protocol 22 - no
-        # money sync exists yet, nothing is forced off). Both sides log nearby
-        # vendors (money+stock) and every squad tab's wallet at 1 Hz; the host
-        # then drives one programmatic Inventory::buyItem, and the join tries
-        # the same against its driven vendor copy. Gates only on the EVIDENCE
-        # (vendor enumerated, wallet series readable, both buy attempts
-        # logged); wallet/vendor divergence and the join-buy outcome are
-        # recorded as FINDINGs that gate the 1b/1c design. Save 'sync': the
-        # bar town puts real ShopTraders in range.
+        # shop_probe: vendor-trading diagnostic (money sync forced off). Both
+        # sides log nearby vendors (money+stock) and every squad tab's
+        # per-platoon wallet at 1 Hz; the host then drives one programmatic
+        # Inventory::buyItem, and the join tries the same against its driven
+        # vendor copy. Gates only on the EVIDENCE (vendor enumerated, wallet
+        # series readable, both buy attempts logged); wallet/vendor divergence
+        # and the join-buy outcome are recorded as FINDINGs that gate the
+        # vendor-mirror design. Save 'sync': the bar town puts real ShopTraders
+        # in range.
         shop_probe = @{
             DiagEnv = @{ KENSHICOOP_MONEY_SYNC = '0' }
             Save = 'sync'; Setup = ''; Tolerance = 6.0
@@ -702,12 +702,27 @@
             Tier = 'probe'; WanVariant = $false
         }
 
-        # money_sync: protocol-22 per-tab wallet sync (moneySync ON - the
-        # default). Same script as shop_probe minus the vendor legs: host
-        # writes 5000 into its rank-0 tab wallet, join writes 7000 into its
-        # rank-1 tab, and the PKT_MONEY channel must carry both across.
-        # Gates on CONVERGENCE (each sentinel present in the peer's final
-        # WALLET series + no drift on any co-visible rank).
+        # wallet_probe: WHICH engine field is the player's purse (money sync
+        # forced OFF so nothing is being written by the channel). Both sides log
+        # the player-faction wallet (POOL) next to the per-platoon squad wallets
+        # (TABW) at 1 Hz and the host round-trips a write through the pool. Gates
+        # that the measurement happened + the pool is writable; the identity of
+        # the live field is the FINDING protocol 52 rests on.
+        wallet_probe = @{
+            DiagEnv = @{ KENSHICOOP_MONEY_SYNC = '0' }
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'wallet_probe'
+            Gating   = @('wallet_probe', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'probe'; WanVariant = $false
+        }
+
+        # money_sync: protocol-52 shared money pool (moneySync ON - the
+        # default). Kenshi keeps ONE player wallet, so this gates CONSERVATION
+        # rather than convergence: the host seeds the pool to 10000, the join
+        # spends 250 and the host 1000, and both clients must end at 8750. A
+        # surplus means a spend was lost (what snapshot sync would do to two
+        # concurrent purchases); a deficit means one was applied twice.
         money_sync = @{
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'money_sync'
@@ -716,14 +731,15 @@
             Tier = 'full'; WanVariant = $false
         }
 
-        # vendor_trade: protocol-22 phase 1c - the buyer-side purchase
+        # vendor_trade: protocol-52 phase 1c - the buyer-side purchase
         # COMPOSITE. Each side performs the exact buyer-side mutations of one
-        # Inventory::buyItem (wallet debit + bought item into the tab leader's
-        # personal inventory, same tick) on the tab it owns; gates that BOTH
-        # effects converge on the peer (PKT_MONEY + the inventory snapshot
-        # channel). The vendor-side mutation stays local by design (the engine
-        # regenerates vendor stock per client; the [shop] BUY-LOCAL detour is
-        # collecting field evidence for that mirror).
+        # Inventory::buyItem (cats out of the shared pool + bought item into the
+        # tab leader's personal inventory, same tick); gates that BOTH effects
+        # land - the item converges on the peer over the inventory snapshot
+        # channel, and BOTH purchases are paid for out of the one pool (seed
+        # 5000 -> 4500). The vendor-side mutation stays local by design (the
+        # engine regenerates vendor stock per client; the [shop] BUY-LOCAL detour
+        # is collecting field evidence for that mirror).
         vendor_trade = @{
             DiagEnv = @{ KENSHICOOP_INV_SYNC = '1' }
             Save = 'sync'; Setup = ''; Tolerance = 6.0
@@ -1121,6 +1137,25 @@
             Save = 'sync'; Setup = ''; Tolerance = 6.0
             PrimaryGate = 'load_sync'
             Gating   = @('load_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march', 'clock_sync')
+            Tier = 'full'; WanVariant = $false
+        }
+
+        # money_persist: the regression gate for the bug protocol 52 fixes - cats
+        # the JOIN moved used to be erased by the next load, because only the
+        # host's save survived and it held the host's untouched wallet. The JOIN
+        # spends a QUARTER of the pool (a fraction, so no fixture balance is
+        # assumed and the spend is still real with the channel OFF), the host
+        # waits until that delta has actually moved its own (authoritative) pool,
+        # latches the total, then coordinated-saves and loads mid-session. Gates
+        # that BOTH clients come back at the latched total; coming back at the
+        # pre-spend number IS the bug, which KENSHICOOP_MONEY_SYNC=0 reproduces.
+        # clock_sync is not gated for the same reason as load_sync (the load
+        # restarts the in-game clock series the oracle aligns on).
+        money_persist = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'money_persist'
+            Gating   = @('money_persist')
             Advisory = @('smoothness', 'anim_truth', 'march', 'clock_sync')
             Tier = 'full'; WanVariant = $false
         }

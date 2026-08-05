@@ -20,10 +20,12 @@
 namespace coop {
 
 struct SyncTuning {
-    // Money (protocol 22): wallets move in bursts, ~1 Hz sampling floor is
-    // plenty; a lost write self-heals on the safety resend.
-    unsigned long moneyMinSendMs;   // sampling floor between money sends
-    unsigned long moneyResendMs;    // unchanged-row safety resend
+    // Money pool (protocol 52): purchases come in bursts, so a ~1 Hz floor on
+    // the host's TOTAL is plenty (a fold publishes immediately regardless - the
+    // join is waiting on that answer), and a lost total self-heals on the safety
+    // resend. Join DELTAS are never throttled: each one is a conservation event.
+    unsigned long moneyMinSendMs;   // sampling floor between pool-total sends
+    unsigned long moneyResendMs;    // unchanged-total safety resend
 
     // Faction relations (protocol 24): relations move in bursts; 1 Hz sample,
     // long safety resend for rows we ever sent.

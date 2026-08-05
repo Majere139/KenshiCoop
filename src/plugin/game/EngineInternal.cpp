@@ -632,11 +632,15 @@ void reconcileVoteButtons() {
     if (memcmp(cur, g_voteBtn, n) != 0) restoreVoteButtons();
 }
 
-// Money + vendor trading (protocol 22 groundwork). Character::getPlatoon gives
-// the body's ActivePlatoon (its squad-tab container); ActivePlatoon::me is the
-// persistent Platoon whose Ownerships block holds that tab's WALLET (spike 29 -
-// there is no global player wallet). getMoney/setMoney are the engine's own
-// accessors (never raw offsets); Inventory::buyItem is the real purchase path
+// Money + vendor trading (protocol 52 pool). The player's cats are a SINGLE
+// wallet hanging off the player Faction (factionOwnerships) - the save stores
+// one `player money` value. Character::getPlatoon gives the body's ActivePlatoon
+// (its squad-tab container) and ActivePlatoon::me the persistent Platoon, whose
+// Ownerships block holds that SQUAD's wallet - real, but an NPC/town-squad
+// concept that reads 0 for the player's own tabs (wallet_probe), which is why
+// the old per-tab money channel replicated a field the economy never reads.
+// getMoney/setMoney are the engine's own accessors, shared by both wallets
+// (never raw offsets); Inventory::buyItem is the real purchase path
 // (wallet debit + vendor stock mutation + item transfer), called on the VENDOR
 // inventory with sendingTo = the buyer.
 typedef ActivePlatoon* (__fastcall* GetPlatoonFn)(const Character* self);

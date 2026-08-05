@@ -1,6 +1,6 @@
 // ScenarioSession.cpp - session lifecycle scenarios (monolith split from
 // Scenario.cpp, 2026-07-12): latejoin_probe/latejoin_sync, save_probe,
-// save_sync/save_stage1, resume_check, load_probe, load_sync. Classes are
+// save_sync/save_stage1, resume_check, load_probe, load_sync, money_persist. Classes are
 // TU-private (anonymous namespace); only makeSessionScenario
 // (ScenarioSupport.h) is exported.
 // Must NOT: change any SCENARIO log string (oracle API, resources/CODE_MAP.md).
@@ -19,7 +19,7 @@ namespace {
 // mutates state in the PRE-ARM window (onGameplay - gameplay has started but
 // the join has not connected yet; the harness launches the join 8 s after
 // host gameplay + its own load time): toggles a baked door, writes a
-// sentinel faction relation, bumps its tab wallet, and places + completes a
+// sentinel faction relation, bumps the shared money pool, and places + completes a
 // small building. Post-arm both sides census door/faction/money at 1 Hz;
 // build evidence is the join's [build] MINT line (or its absence). PROBE
 // QUESTIONS: which pre-connect mutations reach the join and how fast
@@ -197,19 +197,12 @@ private:
     }
 
     void doMoneyMutation(const ScenarioContext& ctx) {
-        EntityState sq[MAX_SQUAD];
-        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
-        int idx = tabLeaderIdx(sq, n, 0u); // host owns tab rank 0
         int before = -1, after = -1, ok = 0;
-        if (idx >= 0) {
-            unsigned int h[5];
-            handFromEntity(sq[idx], h);
-            if (engine::readWalletByHand(h, &before)) {
-                int want = before + MONEY_BUMP;
-                if (engine::writeWalletByHand(h, want)) {
-                    engine::readWalletByHand(h, &after);
-                    ok = (after == want) ? 1 : 0;
-                }
+        if (engine::readPlayerWallet(ctx.gw, &before)) {
+            int want = before + MONEY_BUMP;
+            if (engine::writePlayerWallet(ctx.gw, want)) {
+                engine::readPlayerWallet(ctx.gw, &after);
+                ok = (after == want) ? 1 : 0;
             }
         }
         moneyOk_ = (ok == 1);
@@ -286,20 +279,16 @@ private:
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             }
         }
-        // Wallets: both tab leaders.
-        EntityState sq[MAX_SQUAD];
-        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
-        for (unsigned int rank = 0; rank < 2; ++rank) {
-            int idx = tabLeaderIdx(sq, n, rank);
-            if (idx < 0) continue;
-            unsigned int h[5];
-            handFromEntity(sq[idx], h);
-            int money = -1;
-            if (!engine::readWalletByHand(h, &money)) continue;
+        // The shared money pool (protocol 52): one value per client, so the
+        // host's pre-arm bump has to show up in the join's series for the money
+        // leg to have healed. rank= is kept in the line shape (always 0 now) so
+        // the oracle's row parser is unchanged.
+        int money = -1;
+        if (engine::readPlayerWallet(ctx.gw, &money)) {
             char b[128];
             _snprintf(b, sizeof(b) - 1,
-                      "SCENARIO LJMONEYROW rank=%u money=%d t=%lu",
-                      rank, money, ctx.elapsedMs);
+                      "SCENARIO LJMONEYROW rank=0 money=%d t=%lu",
+                      money, ctx.elapsedMs);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
         ++censusLogged_;
@@ -1120,6 +1109,235 @@ private:
     bool          siteSeen_;
 };
 
+// money_persist (protocol 52, full tier; loadSync + saveSync ON): the bug this
+// whole channel exists for. Before the shared pool, cats the JOIN earned or
+// spent lived only in the join's own engine wallet, so the host's save - the only
+// save that survives - wrote the host's untouched number and the join's economy
+// was silently erased on the next load.
+//
+// The gate replays exactly that: the JOIN spends, the HOST saves + loads
+// (protocol-32 coordination drags the join through the same load), and the pool
+// must come back on BOTH sides at the post-spend total.
+//   * join t=8s:  spend a QUARTER of the pool (a purchase, as far as the engine
+//                 is concerned). A fraction rather than a fixed amount so the
+//                 scenario does not depend on how many cats the fixture ships
+//                 with - and, unlike a host-seeded base, it is still a real
+//                 spend with the channel switched OFF, which is what makes the
+//                 KENSHICOOP_MONEY_SYNC=0 A/B reproduce the reported bug
+//                 instead of just failing to set itself up.
+//   * host: waits until the fold has actually moved its own wallet (the join's
+//           delta landed), latches that total as the expectation, then issues the
+//           coordinated save and, once the join has ACKed its copy, loads it.
+//   * both: post-swap, the pool must read the latched total. Reading the
+//     pre-spend number instead IS the original bug.
+class MoneyPersistScenario : public TimedScenario {
+public:
+    MoneyPersistScenario()
+        : TimedScenario("money_persist", /*evidenceMs=*/1000),
+          spent_(false), spendOk_(false), startPool_(-1), expect_(-1),
+          latched_(false), poolMoved_(false),
+          saveIssued_(false), saveOk_(false), ackSeen_(false),
+          ackOk_(false), loadIssued_(false), loadOk_(false), sigWas2_(false),
+          swapDone_(false), checked_(false), postOk_(false), postPool_(-1),
+          dropStartMs_(0), sigClearedMs_(0), checkAtMs_(0), lastStatusMs_(0) {}
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        engine::readPlayerWallet(ctx.gw, &startPool_);
+        char b[128];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO MPSTART host=%d pool=%d",
+                  ctx.isHost ? 1 : 0, startPool_);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        bool live = engine::gameplayLive(ctx.gw);
+        if (evidenceDue(ctx.elapsedMs)) {
+            int pool = -1;
+            engine::readPlayerWallet(ctx.gw, &pool);
+            char b[128];
+            _snprintf(b, sizeof(b) - 1, "SCENARIO MPPOOL money=%d who=%s t=%lu",
+                      pool, ctx.isHost ? "host" : "join", ctx.elapsedMs);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            // The join's expectation is the LAST total it saw before the load
+            // began, not the number its own spend produced: the host is the
+            // authority and what it saves is what it converged us to.
+            if (!ctx.isHost && spendOk_ && pool >= 0 &&
+                !swapDone_ && !sigWas2_ && dropStartMs_ == 0) {
+                expect_ = pool;
+            }
+        }
+
+        // ---- Join: the spend that used to be thrown away -------------------
+        if (!ctx.isHost && !spent_ && ctx.elapsedMs >= SPEND_AT_MS) {
+            int before = -1, after = -1, ok = 0, amount = 0;
+            bool readable = engine::readPlayerWallet(ctx.gw, &before) &&
+                            before >= MIN_POOL;
+            // An unreadable/empty pool this early is more likely "not settled
+            // yet" than "broken", so retry until the deadline rather than
+            // reporting a failure we would have to explain away.
+            if (readable || ctx.elapsedMs >= SPEND_DEADLINE_MS) {
+                spent_ = true;
+                if (readable) {
+                    amount = before / 4;
+                    ok = engine::writePlayerWallet(ctx.gw, before - amount) ? 1 : 0;
+                    engine::readPlayerWallet(ctx.gw, &after);
+                }
+                startPool_ = before; // the pre-spend total the reload must beat
+                spendOk_ = (ok == 1) && (amount > 0) && (after == before - amount);
+                expect_ = after;     // what the reload must give us back
+                latched_ = spendOk_;
+                char b[176];
+                _snprintf(b, sizeof(b) - 1,
+                          "SCENARIO MPSPEND amount=%d ok=%d before=%d after=%d t=%lu",
+                          amount, ok, before, after, ctx.elapsedMs);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+
+        // ---- Host: latch the folded total, then save + load -----------------
+        if (ctx.isHost) {
+            // The fold is what proves the join's spend reached the authority, so
+            // the expectation is read from OUR wallet after it moves - never
+            // computed from a number we assumed the join had. Latch whether it
+            // moved or not, and record which: waiting for a fold that will never
+            // come (the channel switched off) would stall the run before the
+            // save, and then the A/B would only show a scenario that failed to
+            // set itself up rather than the erase it is meant to catch.
+            if (!latched_ && ctx.elapsedMs >= LATCH_AFTER_MS) {
+                int pool = -1;
+                if (engine::readPlayerWallet(ctx.gw, &pool) && pool >= 0) {
+                    latched_ = true;
+                    expect_ = pool;
+                    poolMoved_ = (pool != startPool_);
+                    char b[176];
+                    _snprintf(b, sizeof(b) - 1,
+                              "SCENARIO MPLATCH expect=%d start=%d moved=%d t=%lu",
+                              expect_, startPool_, poolMoved_ ? 1 : 0,
+                              ctx.elapsedMs);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                }
+            }
+            if (latched_ && !saveIssued_ && live) {
+                saveIssued_ = true;
+                saveOk_ = engine::saveGameAs(SAVE_NAME);
+                char b[128];
+                _snprintf(b, sizeof(b) - 1, "SCENARIO MPSAVE name='%s' ok=%d t=%lu",
+                          SAVE_NAME, saveOk_ ? 1 : 0, ctx.elapsedMs);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            if (saveIssued_ && !ackSeen_ && savexfer::lastAckXferId() != 0) {
+                ackSeen_ = true;
+                ackOk_ = (savexfer::lastAckOk() == 1);
+                char b[112];
+                _snprintf(b, sizeof(b) - 1, "SCENARIO MPACK ok=%d t=%lu",
+                          ackOk_ ? 1 : 0, ctx.elapsedMs);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            if (ackSeen_ && ackOk_ && !loadIssued_ && live) {
+                loadIssued_ = true;
+                loadOk_ = engine::loadSave(SAVE_NAME);
+                char b[128];
+                _snprintf(b, sizeof(b) - 1, "SCENARIO MPLOAD name='%s' ok=%d t=%lu",
+                          SAVE_NAME, loadOk_ ? 1 : 0, ctx.elapsedMs);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+
+        // ---- Both sides: world-swap tracking (the load_sync detection) -------
+        if (!live && dropStartMs_ == 0) {
+            dropStartMs_ = ctx.elapsedMs;
+        } else if (live && dropStartMs_ != 0) {
+            unsigned long ms = ctx.elapsedMs - dropStartMs_;
+            dropStartMs_ = 0;
+            if (ms >= SWAP_MIN_MS && !swapDone_) {
+                swapDone_ = true;
+                checkAtMs_ = ctx.elapsedMs + SETTLE_MS;
+                char b[112];
+                _snprintf(b, sizeof(b) - 1, "SCENARIO MPSWAPDONE swapMs=%lu t=%lu",
+                          ms, ctx.elapsedMs);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        {
+            // Synchronous load: execute() rebuilds the world inside one call, so
+            // live never visibly drops - latch off the deferred LOADGAME signal.
+            int sig = engine::saveMgrSignal(0);
+            if (sig == 2) { sigWas2_ = true; sigClearedMs_ = 0; }
+            else if (sigWas2_ && sigClearedMs_ == 0) sigClearedMs_ = ctx.elapsedMs;
+            if (!swapDone_ && sigWas2_ && sigClearedMs_ != 0 && live &&
+                dropStartMs_ == 0 &&
+                ctx.elapsedMs >= sigClearedMs_ + SYNC_CONFIRM_MS) {
+                swapDone_ = true;
+                checkAtMs_ = ctx.elapsedMs + SETTLE_MS;
+                char b[112];
+                _snprintf(b, sizeof(b) - 1,
+                          "SCENARIO MPSWAPDONE t=%lu (synchronous inside execute)",
+                          ctx.elapsedMs);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+
+        // ---- Both sides: did the cats survive the reload? -------------------
+        if (swapDone_ && !checked_ && live && ctx.elapsedMs >= checkAtMs_) {
+            checked_ = true;
+            engine::readPlayerWallet(ctx.gw, &postPool_);
+            postOk_ = (expect_ >= 0) && (postPool_ == expect_);
+            char b[176];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO MPPOST money=%d expect=%d start=%d ok=%d who=%s t=%lu",
+                      postPool_, expect_, startPool_, postOk_ ? 1 : 0,
+                      ctx.isHost ? "host" : "join", ctx.elapsedMs);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        if (ctx.elapsedMs - lastStatusMs_ >= 5000) {
+            lastStatusMs_ = ctx.elapsedMs;
+            char b[192];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO MPSTATE spend=%d latch=%d save=%d ack=%d load=%d "
+                      "swap=%d post=%d live=%d t=%lu",
+                      spendOk_ ? 1 : 0, latched_ ? 1 : 0, saveOk_ ? 1 : 0,
+                      ackOk_ ? 1 : 0, loadOk_ ? 1 : 0, swapDone_ ? 1 : 0,
+                      postOk_ ? 1 : 0, live ? 1 : 0, ctx.elapsedMs);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        bool localDone = ctx.isHost
+            ? (saveOk_ && ackOk_ && loadOk_ && checked_)
+            : (spendOk_ && checked_);
+        if ((localDone && ctx.elapsedMs >= checkAtMs_ + TAIL_HOLD_MS) ||
+            ctx.elapsedMs >= DURATION_MS) {
+            passed_ = ctx.isHost
+                ? (poolMoved_ && saveOk_ && ackOk_ && loadOk_ && swapDone_ && postOk_)
+                : (spendOk_ && swapDone_ && postOk_);
+            return true;
+        }
+        return false;
+    }
+
+private:
+    static const unsigned long SPEND_AT_MS      = 8000;
+    static const unsigned long SPEND_DEADLINE_MS = 14000;
+    static const unsigned long LATCH_AFTER_MS   = 18000;
+    static const unsigned long SWAP_MIN_MS      = 400;
+    static const unsigned long SYNC_CONFIRM_MS  = 3000;
+    static const unsigned long SETTLE_MS        = 5000;
+    static const unsigned long TAIL_HOLD_MS     = 8000;
+    static const unsigned long DURATION_MS      = 110000;
+    static const int           MIN_POOL         = 4; // a quarter has to be >= 1
+
+    bool          spent_, spendOk_;
+    int           startPool_, expect_;
+    bool          latched_, poolMoved_;
+    bool          saveIssued_, saveOk_, ackSeen_, ackOk_;
+    bool          loadIssued_, loadOk_, sigWas2_, swapDone_, checked_, postOk_;
+    int           postPool_;
+    unsigned long dropStartMs_, sigClearedMs_, checkAtMs_, lastStatusMs_;
+
+    static const char* const SAVE_NAME;
+};
+const char* const MoneyPersistScenario::SAVE_NAME = "coopresume";
+
 } // namespace
 
 Scenario* makeSessionScenario(const std::string& name) {
@@ -1131,6 +1349,7 @@ Scenario* makeSessionScenario(const std::string& name) {
     if (name == "resume_check")   return new ResumeCheckScenario();
     if (name == "load_probe")     return new LoadProbeScenario();
     if (name == "load_sync")      return new LoadSyncScenario();
+    if (name == "money_persist")  return new MoneyPersistScenario();
     return 0;
 }
 

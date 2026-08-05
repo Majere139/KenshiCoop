@@ -66,7 +66,7 @@
 #include <kenshi/Gear.h>            // Sword (spike 451 weapon-mint ctor trace)
 #include <kenshi/Faction.h>         // Faction::getData / FactionManager::getFactionByStringID (protocol 21)
 #include <kenshi/FactionRelations.h> // FactionRelations (protocol 24 faction-relation sync)
-#include <kenshi/Platoon.h>         // Platoon / ActivePlatoon / Ownerships (wallet, protocol 22)
+#include <kenshi/Platoon.h>         // Platoon / ActivePlatoon / Ownerships (wallets, protocol 52)
 #include <kenshi/Building/DoorStuff.h> // DoorStuff (door/gate state, protocol 26)
 #include <kenshi/Building/FarmBuilding.h>      // FarmBuilding growth floats (protocol 33; pulls Production/Storage/UseableStuff)
 #include <kenshi/Building/CraftingBuilding.h>  // CraftingBuilding::operate override (protocol 33)

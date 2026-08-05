@@ -1,5 +1,5 @@
 // EngineWorld.cpp - world economy + structures (monolith split from
-// EngineInternal.cpp, 2026-07-12): protocol 22 money/wallet + vendor trading,
+// EngineInternal.cpp, 2026-07-12): protocol 52 money pool + vendor trading,
 // protocol 23 recruitment probe, protocol 24 faction relations read/write,
 // protocol 26 door/gate state, protocols 27/28 placed-building sync +
 // dismantle, protocol 33 production machines, protocol 34 storage/machine
@@ -17,9 +17,20 @@
 namespace coop {
 namespace engine {
 
-// ---- Protocol 22 groundwork: money + vendor trading -------------------------
+// ---- Money + vendor trading (protocol 52 pool) -------------------------------
 
 namespace {
+// The PLAYER's wallet: the single pool the HUD shows and the economy spends
+// from, which hangs off the player FACTION rather than any squad (see the
+// Engine.h note - the per-platoon wallet below reads 0 for player tabs).
+// Caller holds SEH.
+Ownerships* playerWalletOf(GameWorld* gw) {
+    if (!gw || !gw->player) return 0;
+    Faction* f = gw->player->getFaction();
+    if (!f) return 0;
+    return f->factionOwnerships;
+}
+
 // Ownerships block (the wallet) of the platoon containing 'c', or 0. The chain
 // Character -> ActivePlatoon (getPlatoon) -> Platoon (::me) -> Ownerships is all
 // engine-owned pointers; caller holds SEH.
@@ -103,6 +114,27 @@ unsigned int listVendorsNear(GameWorld* gw, VendorRead* out, unsigned int maxOut
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { return n; }
     return n;
+}
+
+bool readPlayerWallet(GameWorld* gw, int* outMoney) {
+    if (outMoney) *outMoney = -1;
+    if (!gw || !outMoney || !g_ownGetMoneyFn) return false;
+    __try {
+        Ownerships* ow = playerWalletOf(gw);
+        if (!ow) return false;
+        *outMoney = g_ownGetMoneyFn(ow);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool writePlayerWallet(GameWorld* gw, int money) {
+    if (!gw || money < 0 || !g_ownSetMoneyFn) return false;
+    __try {
+        Ownerships* ow = playerWalletOf(gw);
+        if (!ow) return false;
+        g_ownSetMoneyFn(ow, money);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
 bool readWalletByHand(const unsigned int mHand[5], int* outMoney) {

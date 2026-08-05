@@ -1,6 +1,6 @@
 // ScenarioProbes.cpp - diagnostic probes + economy/faction/time scenarios
 // (monolith split from Scenario.cpp, 2026-07-12): spike (the numbered-probe
-// dispatcher), shop_probe/money_sync, vendor_trade, recruit_probe/
+// dispatcher), shop_probe, wallet_probe/money_sync, vendor_trade, recruit_probe/
 // recruit_sync, squad_probe/squad_sync, faction_probe/faction_sync,
 // time_probe/time_sync, hunger_probe/hunger_sync, cell_probe. Classes are TU-private
 // (anonymous namespace); only makeProbeScenario (ScenarioSupport.h) is
@@ -338,12 +338,15 @@ private:
     char          r4Sid_[48];  // spike 401 research bench template sid
     char          r4ResSid_[48]; // spike 401 subject RESEARCH record sid
 };
-// shop_probe (protocol 22 phase 0, probe tier): money + vendor-trading evidence.
+// shop_probe (probe tier): money + vendor-trading evidence.
 //
-// Kenshi facts under test (spikes 28-30): the wallet is per-Platoon (Ownerships::
-// money - no global player wallet), vendors are ShopTrader RootObjects with
-// save-stable hands, and Inventory::buyItem mutates vendor stock + wallet LOCALLY
-// on one client only. Nothing about money is on the wire today.
+// Kenshi facts under test (spikes 28-30): vendors are ShopTrader RootObjects
+// with save-stable hands, and Inventory::buyItem mutates vendor stock + the
+// buyer's cats LOCALLY on one client only. The wallet legs here are the
+// PER-PLATOON wallet, which wallet_probe showed is a squad concept the player
+// economy does not spend from (the player's cats are the shared pool, protocol
+// 52) - so a sentinel written here is expected NOT to cross even with money sync
+// on, and this scenario keeps measuring exactly that.
 //
 // Script:
 //   * both sides, 1 Hz: enumerate nearby vendors ("SCENARIO VENDOR hand=..
@@ -351,36 +354,30 @@ private:
 //     ("SCENARIO WALLET rank=.. money=..") - the divergence series.
 //   * host t=10s / join t=22s: each side (1) SETS its OWNED tab's wallet to a
 //     side-distinct sentinel via Ownerships::setMoney (host rank0=5000, join
-//     rank1=7000) - validates the 1b apply primitive AND, on the peer's WALLET
-//     series, decisively answers "does any wallet state cross today"; then
-//     (2) attempts ONE programmatic Inventory::buyItem against the nearest
-//     stocked vendor ([shop] BUY-BEFORE/AFTER evidence). Vendor inventories
-//     are lazy (built on shop-open), so the stock is forced first.
+//     rank1=7000), then (2) attempts ONE programmatic Inventory::buyItem
+//     against the nearest stocked vendor ([shop] BUY-BEFORE/AFTER evidence).
+//     Vendor inventories are lazy (built on shop-open), so the stock is forced
+//     first.
 // The verdict only asserts the script ran (wallet series + the scripted action
 // logged on each side); what crossed is judged/recorded by Test-ShopProbe.
-// The SAME script also runs as "money_sync" (probe=false): with the protocol
-// 22 wallet channel LEFT ON, the sentinel writes must CROSS - each side's
-// WALLET series must converge to the peer's sentinel. Test-MoneySync gates on
-// that convergence (the shop_probe run gates only on the evidence existing).
 class ShopProbeScenario : public TimedScenario {
 public:
-    explicit ShopProbeScenario(bool probe)
-        : TimedScenario(probe ? "shop_probe" : "money_sync", /*evidenceMs=*/1000),
-          probe_(probe), actDone_(false),
+    ShopProbeScenario()
+        : TimedScenario("shop_probe", /*evidenceMs=*/1000),
+          actDone_(false),
           buyRes_(-9), walletReads_(0), sawVendor_(false) {}
 
     virtual void onStart(const ScenarioContext& ctx) {
         char b[96];
-        _snprintf(b, sizeof(b) - 1, "SCENARIO SHOPPROBE start host=%d probe=%d",
-                  ctx.isHost ? 1 : 0, probe_ ? 1 : 0);
+        _snprintf(b, sizeof(b) - 1, "SCENARIO SHOPPROBE start host=%d",
+                  ctx.isHost ? 1 : 0);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
     virtual bool onTick(const ScenarioContext& ctx) {
         // 1 Hz evidence: vendor census + per-tab wallet series (both sides).
-        // The money_sync leg skips the vendor census (wallet-only gate).
         if (evidenceDue(ctx.elapsedMs)) {
-            if (probe_) logVendors(ctx);
+            logVendors(ctx);
             logWallets(ctx);
         }
         // One scripted action window per side, staggered so the logs separate
@@ -393,7 +390,7 @@ public:
         if (!actDone_ && ctx.elapsedMs >= actAt) {
             actDone_ = true;
             doWalletSet(ctx);
-            if (probe_) doBuy(ctx);
+            doBuy(ctx);
         }
         if (ctx.elapsedMs >= DURATION_MS) {
             // Script-ran gate only: wallets were readable and both scripted
@@ -449,9 +446,9 @@ private:
     }
 
     // Wallet-write leg: set the OWNED tab's wallet to a side-distinct sentinel
-    // via the engine accessor (host 5000, join 7000). Proves writeWallet works
-    // (the 1b apply primitive) and, on the peer's WALLET series, whether ANY
-    // wallet state crosses today (expected: it does not - the 1b gap evidence).
+    // via the engine accessor (host 5000, join 7000). Proves the write primitive
+    // works and, on the peer's WALLET series, whether per-platoon wallet state
+    // crosses (expected: it does not - only the player pool is replicated).
     void doWalletSet(const ScenarioContext& ctx) {
         EntityState sq[MAX_SQUAD];
         unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
@@ -524,7 +521,6 @@ private:
     static const unsigned int  MAX_SQUAD      = 32;
     static const float         VENDOR_RADIUS;
 
-    bool          probe_;
     bool          actDone_;
     int           buyRes_;
     unsigned int  walletReads_;
@@ -532,31 +528,196 @@ private:
 };
 const float ShopProbeScenario::VENDOR_RADIUS = 100.0f;
 
-// vendor_trade (protocol 22 phase 1c): the buyer-side purchase COMPOSITE gate.
+// wallet_probe (probe tier, money sync forced OFF) / money_sync (full tier, ON).
+//
+// THE QUESTION (wallet_probe): which engine field holds the cats the player
+// actually spends? The per-platoon Ownerships::money the old money channel
+// published is reachable per squad tab, but a save holds exactly ONE `player
+// money` value - so at most one of these candidates can be the real purse. Both
+// sides log both candidates at 1 Hz ("SCENARIO POOL" = player faction wallet,
+// "SCENARIO TABW" = per-tab platoon wallets) and the host round-trips a write
+// through the pool. Test-WalletProbe records which candidate carries the save's
+// cats and whether the write sticks.
+//
+// THE GATE (money_sync): CONSERVATION across the shared pool. Snapshot sync
+// cannot pass this - it loses one of two concurrent spends - so the script
+// spends from BOTH sides and checks the arithmetic:
+//   * host t=8s:  seed the pool to BASE (10000) so the run is save-independent.
+//   * join t=18s: spend JOIN_SPEND (250) locally - a PKT_MONEY_DELTA the host
+//                 must fold, exactly like a purchase in the join's trade UI.
+//   * host t=28s: spend HOST_SPEND (1000) locally.
+//   * t=40s: BOTH sides must read BASE - JOIN_SPEND - HOST_SPEND. Every cat is
+//     accounted for on both clients, or the gate fails.
+class MoneyPoolScenario : public TimedScenario {
+public:
+    explicit MoneyPoolScenario(bool probe)
+        : TimedScenario(probe ? "wallet_probe" : "money_sync", /*evidenceMs=*/1000),
+          probe_(probe), poolReads_(0), seeded_(false), spent_(false),
+          wroteOk_(false), finalPool_(-1) {}
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        int pool = -1;
+        engine::readPlayerWallet(ctx.gw, &pool);
+        char b[112];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO WALLETPROBE start host=%d probe=%d pool=%d",
+                  ctx.isHost ? 1 : 0, probe_ ? 1 : 0, pool);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (evidenceDue(ctx.elapsedMs)) logCandidates(ctx);
+
+        if (probe_) {
+            // Write round-trip on the host only: if the pool is the live field,
+            // this is the field the HUD changes with.
+            if (!wroteOk_ && ctx.isHost && ctx.elapsedMs >= PROBE_WRITE_AT_MS) {
+                int before = -1, after = -1;
+                engine::readPlayerWallet(ctx.gw, &before);
+                int want = (before >= 0 ? before : 0) + PROBE_BUMP;
+                int ok = engine::writePlayerWallet(ctx.gw, want) ? 1 : 0;
+                engine::readPlayerWallet(ctx.gw, &after);
+                wroteOk_ = (ok == 1) && (after == want);
+                char b[160];
+                _snprintf(b, sizeof(b) - 1,
+                          "SCENARIO POOLWRITE want=%d ok=%d before=%d after=%d t=%lu",
+                          want, ok, before, after, ctx.elapsedMs);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            if (ctx.elapsedMs >= DURATION_MS) {
+                // Evidence gate: the candidates were readable, and on the host
+                // the pool write round-tripped.
+                passed_ = (poolReads_ > 0) && (!ctx.isHost || wroteOk_);
+                return true;
+            }
+            return false;
+        }
+
+        // ---- money_sync: the conservation script ----------------------------
+        if (ctx.isHost && !seeded_ && ctx.elapsedMs >= SEED_AT_MS) {
+            seeded_ = true;
+            int before = -1;
+            engine::readPlayerWallet(ctx.gw, &before);
+            int ok = engine::writePlayerWallet(ctx.gw, BASE) ? 1 : 0;
+            char b[144];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO POOLSEED base=%d ok=%d before=%d t=%lu",
+                      BASE, ok, before, ctx.elapsedMs);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+        unsigned long spendAt = ctx.isHost ? HOST_SPEND_AT_MS : JOIN_SPEND_AT_MS;
+        int amount = ctx.isHost ? HOST_SPEND : JOIN_SPEND;
+        if (!spent_ && ctx.elapsedMs >= spendAt) {
+            spent_ = true;
+            doSpend(ctx, amount);
+        }
+        if (ctx.elapsedMs >= DURATION_MS) {
+            engine::readPlayerWallet(ctx.gw, &finalPool_);
+            char b[144];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO POOLFINAL money=%d expect=%d who=%s t=%lu",
+                      finalPool_, EXPECT, ctx.isHost ? "host" : "join",
+                      ctx.elapsedMs);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            // Conservation: both sides land on base minus BOTH spends. A lost
+            // update (either side's spend dropped) shows up as a surplus here.
+            passed_ = spent_ && (finalPool_ == EXPECT);
+            return true;
+        }
+        return false;
+    }
+
+private:
+    // Both money candidates, side by side, at 1 Hz: the player pool (one value
+    // per client) and the per-tab platoon wallets (one per squad tab).
+    void logCandidates(const ScenarioContext& ctx) {
+        int pool = -1;
+        if (engine::readPlayerWallet(ctx.gw, &pool)) ++poolReads_;
+        char b[112];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO POOL money=%d who=%s t=%lu",
+                  pool, ctx.isHost ? "host" : "join", ctx.elapsedMs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        if (!probe_) return; // the gate leg only needs the pool series
+        EntityState sq[MAX_SQUAD];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
+        for (unsigned int rank = 0; rank < 4; ++rank) {
+            int li = tabLeaderIdx(sq, n, rank);
+            if (li < 0) continue;
+            unsigned int h[5];
+            handFromEntity(sq[li], h);
+            int money = -1;
+            engine::readWalletByHand(h, &money);
+            char c[112];
+            _snprintf(c, sizeof(c) - 1, "SCENARIO TABW rank=%u money=%d t=%lu",
+                      rank, money, ctx.elapsedMs);
+            c[sizeof(c) - 1] = '\0'; coop::logLine(c);
+        }
+    }
+
+    // Spend locally, exactly as the trade UI would: debit our OWN engine wallet
+    // and let the pool channel report the movement (host: re-publish the total,
+    // join: a signed delta).
+    void doSpend(const ScenarioContext& ctx, int amount) {
+        int before = -1, after = -1, ok = 0;
+        if (engine::readPlayerWallet(ctx.gw, &before) && before >= amount) {
+            ok = engine::writePlayerWallet(ctx.gw, before - amount) ? 1 : 0;
+            engine::readPlayerWallet(ctx.gw, &after);
+        }
+        char b[176];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO POOLSPEND who=%s amount=%d ok=%d before=%d after=%d t=%lu",
+                  ctx.isHost ? "host" : "join", amount, ok, before, after,
+                  ctx.elapsedMs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    static const unsigned long PROBE_WRITE_AT_MS = 10000;
+    static const unsigned long SEED_AT_MS        = 8000;
+    static const unsigned long JOIN_SPEND_AT_MS  = 18000;
+    static const unsigned long HOST_SPEND_AT_MS  = 28000;
+    static const unsigned long DURATION_MS       = 40000;
+    static const unsigned int  MAX_SQUAD         = 32;
+    static const int           PROBE_BUMP        = 1234;
+    static const int           BASE              = 10000;
+    static const int           JOIN_SPEND        = 250;
+    static const int           HOST_SPEND        = 1000;
+    static const int           EXPECT            = BASE - JOIN_SPEND - HOST_SPEND;
+
+    bool          probe_;
+    unsigned int  poolReads_;
+    bool          seeded_;
+    bool          spent_;
+    bool          wroteOk_;
+    int           finalPool_;
+};
+
+// vendor_trade (protocol 52 phase 1c): the buyer-side purchase COMPOSITE gate.
 //
 // A real Inventory::buyItem is unreachable in automation (vendor inventories
 // are lazy and the test save's SHOP_TRADER_CLASS objects carry no bound trader
 // - shop_probe runs 103018-104036), so the scenario performs the exact buyer-
-// side mutations ONE purchase makes - a wallet debit and the bought item
-// landing in the buyer's personal inventory, same tick - on the tab each side
-// OWNS, and gates that BOTH effects converge on the peer through the two
-// existing channels (PKT_MONEY + the bidirectional inventory snapshots). The
-// VENDOR-side mutation (stock shrink, register cash) intentionally stays local
-// for now: the engine regenerates vendor stock per client anyway, and the
-// [shop] BUY-LOCAL detour is gathering the field evidence for that mirror.
+// side mutations ONE purchase makes - cats out of the shared pool and the bought
+// item landing in the buyer's personal inventory, same tick - and gates that
+// BOTH effects converge on the peer through the two channels (the protocol-52
+// pool + the bidirectional inventory snapshots). The VENDOR-side mutation (stock
+// shrink, register cash) intentionally stays local for now: the engine
+// regenerates vendor stock per client anyway, and the [shop] BUY-LOCAL detour is
+// gathering the field evidence for that mirror.
 //
-// Script (mirrors money_sync's stagger):
-//   * both sides, 1 Hz: every tab's WALLET line + a TINV line (count + content
-//     hash) for every tab leader's personal container.
-//   * host t=6s: seed its rank-0 wallet to 5000; t=10s: TRADE - one test item
-//     into the rank-0 leader's inventory + wallet -= 250 (-> 4750).
-//   * join t=18s/t=22s: same on its rank-1 tab with 7000 -> 6750.
+// Script: two purchases, one per side, out of ONE purse.
+//   * both sides, 1 Hz: the POOL series + a TINV line (count + content hash)
+//     for every tab leader's personal container.
+//   * host t=6s: seed the pool to 5000 (the join converges on it).
+//   * host t=10s: TRADE - one test item into the rank-0 leader's inventory and
+//     250 out of the pool.
+//   * join t=22s: the same on its rank-1 tab - another 250 out of the SAME pool.
+//   * end: the pool reads 4500 on both sides (both purchases paid for) and each
+//     side's item is visible on the peer.
 class VendorTradeScenario : public TimedScenario {
 public:
     VendorTradeScenario()
         : TimedScenario("vendor_trade", /*evidenceMs=*/1000),
           seeded_(false), traded_(false),
-          tradeOk_(false), walletReads_(0) {}
+          tradeOk_(false), walletReads_(0), finalPool_(-1) {}
 
     virtual void onStart(const ScenarioContext& ctx) {
         char b[96];
@@ -569,20 +730,39 @@ public:
         if (evidenceDue(ctx.elapsedMs)) {
             logSeries(ctx);
         }
-        unsigned long seedAt  = ctx.isHost ? HOST_SEED_AT_MS  : JOIN_SEED_AT_MS;
         unsigned long tradeAt = ctx.isHost ? HOST_TRADE_AT_MS : JOIN_TRADE_AT_MS;
-        if (!seeded_ && ctx.elapsedMs >= seedAt)  { seeded_ = true; doSeed(ctx); }
+        // One purse, so only the host seeds it; the join trades against the total
+        // the pool channel hands it.
+        if (ctx.isHost && !seeded_ && ctx.elapsedMs >= HOST_SEED_AT_MS) {
+            seeded_ = true; doSeed(ctx);
+        }
         if (!traded_ && ctx.elapsedMs >= tradeAt) { traded_ = true; doTrade(ctx); }
         if (ctx.elapsedMs >= DURATION_MS) {
-            passed_ = (walletReads_ > 0) && traded_ && tradeOk_;
+            engine::readPlayerWallet(ctx.gw, &finalPool_);
+            char b[144];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO TRADEFINAL money=%d expect=%d who=%s t=%lu",
+                      finalPool_, SEED - 2 * PRICE, ctx.isHost ? "host" : "join",
+                      ctx.elapsedMs);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            // Both purchases must be paid for out of the one pool - a lost
+            // update leaves a surplus of exactly one PRICE.
+            passed_ = (walletReads_ > 0) && traded_ && tradeOk_ &&
+                      (finalPool_ == SEED - 2 * PRICE);
             return true;
         }
         return false;
     }
 
 private:
-    // One WALLET + one TINV line per distinct squad tab (keyed by rank).
+    // The POOL series plus one TINV line per distinct squad tab (keyed by rank).
     void logSeries(const ScenarioContext& ctx) {
+        int pool = -1;
+        if (engine::readPlayerWallet(ctx.gw, &pool)) ++walletReads_;
+        char p[112];
+        _snprintf(p, sizeof(p) - 1, "SCENARIO POOL money=%d who=%s t=%lu",
+                  pool, ctx.isHost ? "host" : "join", ctx.elapsedMs);
+        p[sizeof(p) - 1] = '\0'; coop::logLine(p);
         EntityState sq[MAX_SQUAD];
         unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_SQUAD);
         for (unsigned int rank = 0; rank < 4; ++rank) {
@@ -590,12 +770,6 @@ private:
             if (li < 0) continue;
             unsigned int h[5];
             handFromEntity(sq[li], h);
-            int money = -1;
-            if (engine::readWalletByHand(h, &money)) ++walletReads_;
-            char b[96];
-            _snprintf(b, sizeof(b) - 1, "SCENARIO WALLET rank=%u money=%d t=%lu",
-                      rank, money, ctx.elapsedMs);
-            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             InvItemEntry items[INV_ITEMS_MAX];
             unsigned int hash = 0;
             unsigned int cnt = engine::captureContainerContents(
@@ -622,13 +796,10 @@ private:
     }
 
     void doSeed(const ScenarioContext& ctx) {
-        unsigned int h[5]; unsigned int rank = 0;
-        int ok = 0, target = ctx.isHost ? SEED_HOST : SEED_JOIN;
-        if (ownLeaderHand(ctx, h, &rank))
-            ok = engine::writeWalletByHand(h, target) ? 1 : 0;
+        int ok = engine::writePlayerWallet(ctx.gw, SEED) ? 1 : 0;
         char b[112];
-        _snprintf(b, sizeof(b) - 1, "SCENARIO TRADESEED who=%s rank=%u target=%d ok=%d t=%lu",
-                  ctx.isHost ? "host" : "join", rank, target, ok, ctx.elapsedMs);
+        _snprintf(b, sizeof(b) - 1, "SCENARIO TRADESEED who=%s target=%d ok=%d t=%lu",
+                  ctx.isHost ? "host" : "join", SEED, ok, ctx.elapsedMs);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
@@ -639,12 +810,12 @@ private:
         char sid[48]; sid[0] = '\0';
         if (ownLeaderHand(ctx, h, &rank)) {
             InvItemEntry items[INV_ITEMS_MAX];
-            engine::readWalletByHand(h, &w0);
+            engine::readPlayerWallet(ctx.gw, &w0);
             cnt0 = engine::captureContainerContents(ctx.gw, h, items, INV_ITEMS_MAX, &hash);
             // The two buyer-side mutations of one purchase, same tick.
             added = engine::addTestItemsToContainer(ctx.gw, h, 1, sid, sizeof(sid));
-            if (w0 >= PRICE) engine::writeWalletByHand(h, w0 - PRICE);
-            engine::readWalletByHand(h, &w1);
+            if (w0 >= PRICE) engine::writePlayerWallet(ctx.gw, w0 - PRICE);
+            engine::readPlayerWallet(ctx.gw, &w1);
             cnt1 = engine::captureContainerContents(ctx.gw, h, items, INV_ITEMS_MAX, &hash);
         }
         tradeOk_ = (added > 0) && (w1 >= 0) && (w0 - w1 == PRICE);
@@ -659,18 +830,17 @@ private:
 
     static const unsigned long HOST_SEED_AT_MS  = 6000;
     static const unsigned long HOST_TRADE_AT_MS = 10000;
-    static const unsigned long JOIN_SEED_AT_MS  = 18000;
     static const unsigned long JOIN_TRADE_AT_MS = 22000;
     static const unsigned long DURATION_MS      = 40000;
     static const unsigned int  MAX_SQUAD        = 32;
-    static const int           SEED_HOST        = 5000;
-    static const int           SEED_JOIN        = 7000;
+    static const int           SEED             = 5000;
     static const int           PRICE            = 250;
 
     bool          seeded_;
     bool          traded_;
     bool          tradeOk_;
     unsigned int  walletReads_;
+    int           finalPool_;
 };
 
 // recruit_probe (protocol 23 phase 0, probe tier): mid-session recruitment
@@ -1931,8 +2101,9 @@ const float CellProbeScenario::TOWN_R = 1200.0f;
 Scenario* makeProbeScenario(const std::string& name) {
     if (name == "spike")        return new SpikeScenario();
     if (name == "cell_probe")   return new CellProbeScenario();
-    if (name == "shop_probe")   return new ShopProbeScenario(/*probe=*/true);
-    if (name == "money_sync")   return new ShopProbeScenario(/*probe=*/false);
+    if (name == "shop_probe")   return new ShopProbeScenario();
+    if (name == "wallet_probe") return new MoneyPoolScenario(/*probe=*/true);
+    if (name == "money_sync")   return new MoneyPoolScenario(/*probe=*/false);
     if (name == "vendor_trade") return new VendorTradeScenario();
     if (name == "recruit_probe") return new RecruitProbeScenario(true);
     if (name == "recruit_sync")  return new RecruitProbeScenario(false);

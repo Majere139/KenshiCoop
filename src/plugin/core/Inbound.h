@@ -153,12 +153,19 @@ struct InboundStats {
     StatsPacket pkt;
 };
 
-// One received per-tab wallet snapshot (protocol 22): the tab's owner streams
-// its Ownerships::money; the receiver writes it onto its local copy of that
-// tab's platoon.
+// One received shared-pool total (protocol 52): the host publishes the
+// authoritative pool; the join writes it onto its own engine wallet after
+// re-applying any delta the host has not acked yet.
 struct InboundMoney {
     u32         ownerId;
     MoneyPacket pkt;
+};
+
+// One received pool delta (protocol 52): a change the join's local economy
+// already applied, which the host folds into the authoritative pool.
+struct InboundMoneyDelta {
+    u32              ownerId;
+    MoneyDeltaPacket pkt;
 };
 
 // One received player-faction relation row (protocol 24): from the host it is
@@ -403,7 +410,8 @@ public:
         wp_(worldReset_),
         med_(worldReset_),        treat_(worldReset_),      combatHit_(worldReset_),
         speed_(worldReset_),
-        stats_(worldReset_),      money_(worldReset_),      faction_(worldReset_),
+        stats_(worldReset_),      money_(worldReset_),      moneyDelta_(worldReset_),
+        faction_(worldReset_),
         time_(worldReset_),       door_(worldReset_),       prod_(worldReset_),
         research_(worldReset_),   buildPlace_(worldReset_), buildState_(worldReset_),
         buildDoor_(worldReset_),  buildRemove_(worldReset_), stealth_(worldReset_, 512),
@@ -535,10 +543,15 @@ public:
         InboundStats ist; ist.ownerId = ownerId; ist.pkt = pkt;
         EnterCriticalSection(&cs_); stats_.push_back(ist); LeaveCriticalSection(&cs_);
     }
-    // NET thread: one received per-tab wallet snapshot (protocol 22), owner-tagged.
+    // NET thread: one received shared-pool total (protocol 52), owner-tagged.
     void pushMoney(u32 ownerId, const MoneyPacket& pkt) {
         InboundMoney imo; imo.ownerId = ownerId; imo.pkt = pkt;
         EnterCriticalSection(&cs_); money_.push_back(imo); LeaveCriticalSection(&cs_);
+    }
+    // NET thread: one received pool delta (protocol 52), owner-tagged.
+    void pushMoneyDelta(u32 ownerId, const MoneyDeltaPacket& pkt) {
+        InboundMoneyDelta imd; imd.ownerId = ownerId; imd.pkt = pkt;
+        EnterCriticalSection(&cs_); moneyDelta_.push_back(imd); LeaveCriticalSection(&cs_);
     }
     // NET thread: one received faction-relation row (protocol 24), owner-tagged.
     void pushFaction(u32 ownerId, const FactionPacket& pkt) {
@@ -738,6 +751,9 @@ public:
     void drainMoney(std::deque<InboundMoney>& out) {
         EnterCriticalSection(&cs_); out.swap(money_); LeaveCriticalSection(&cs_);
     }
+    void drainMoneyDeltas(std::deque<InboundMoneyDelta>& out) {
+        EnterCriticalSection(&cs_); out.swap(moneyDelta_); LeaveCriticalSection(&cs_);
+    }
     void drainStealth(std::deque<InboundStealth>& out) {
         EnterCriticalSection(&cs_); out.swap(stealth_); LeaveCriticalSection(&cs_);
     }
@@ -833,6 +849,7 @@ private:
     WorldQ<InboundSpeed>           speed_;
     WorldQ<InboundStats>           stats_;
     WorldQ<InboundMoney>           money_;
+    WorldQ<InboundMoneyDelta>      moneyDelta_;
     WorldQ<InboundFaction>         faction_;
     WorldQ<InboundTime>            time_;
     WorldQ<InboundDoor>            door_;

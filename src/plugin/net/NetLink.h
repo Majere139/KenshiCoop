@@ -117,9 +117,14 @@ public:
     // (protocol 17, player-squad only). Change-gated by the caller.
     void queueStats(const StatsPacket& pkt);
 
-    // MAIN thread: queue a reliable owner-authoritative per-tab wallet snapshot
-    // (protocol 22). Change-gated by the caller (the PKT_STATS pacing).
+    // MAIN thread: queue the reliable host-authoritative money-pool total
+    // (protocol 52, host -> join). Change-gated by the caller.
     void queueMoney(const MoneyPacket& pkt);
+
+    // MAIN thread: queue a reliable money-pool delta (protocol 52, join ->
+    // host). Emitted once per observed local change; ordered delivery is what
+    // makes the host fold it exactly once.
+    void queueMoneyDelta(const MoneyDeltaPacket& pkt);
     void queueFaction(const FactionPacket& pkt);
     void queueTime(const TimePacket& pkt);
     void queueDoor(const DoorPacket& pkt);
@@ -279,8 +284,9 @@ private:
     std::vector<SpeedPacket>     outSpeed_;
     // Reliable character-stats snapshots (protocol 17). Guarded by outCs_.
     std::vector<StatsPacket>     outStats_;
-    // Reliable per-tab wallet snapshots (protocol 22). Guarded by outCs_.
+    // Reliable money-pool totals + join deltas (protocol 52). Guarded by outCs_.
     std::vector<MoneyPacket>     outMoney_;
+    std::vector<MoneyDeltaPacket> outMoneyDelta_;
     std::vector<FactionPacket>   outFaction_;
     std::vector<TimePacket>      outTime_;
     std::vector<DoorPacket>      outDoor_;

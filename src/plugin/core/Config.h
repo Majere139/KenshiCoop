@@ -329,12 +329,13 @@ struct Config {
     // "0" is the A/B escape hatch.
     bool          stealthSync;
 
-    // KENSHICOOP_MONEY_SYNC (default ON): per-tab wallet sync (protocol 22) -
-    // each client streams the Ownerships::money of every squad tab it OWNS
-    // (change-gated reliable, keyed by tab rank); the receiver writes the
-    // peer tab's wallet via Ownerships::setMoney. Without it any purchase /
-    // sale / bounty changes cats on one client only (shop_probe finding).
-    // "0" is the A/B escape hatch.
+    // KENSHICOOP_MONEY_SYNC (default ON): the shared money pool (protocol 52).
+    // Kenshi keeps ONE player wallet per save, so both players spend from one
+    // purse with the HOST as authority: the join reports each local change as a
+    // signed delta, the host folds it in and publishes the total. Without it
+    // every purchase / sale / bounty moves cats on one client only, and the
+    // join's economy is erased by the next save (the host's wallet is the one
+    // that persists). "0" is the A/B escape hatch.
     bool          moneySync;
 
     // KENSHICOOP_SPAWN_SYNC (default ON): runtime-spawn proxy replication

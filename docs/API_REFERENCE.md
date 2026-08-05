@@ -580,6 +580,16 @@ faction relations, town/squad management, and AI player config; for spawning you
 generally pass the player's faction straight through to
 `createRandomCharacter`.
 
+**Money lives here, not on the squad.** `Faction::factionOwnerships` is an
+`Ownerships*` whose `getMoney()`/`setMoney(int)` are the cats the player actually
+spends — one value per save, matching the single `player money` field the save
+file stores. `Platoon::ownerships` reached via `Character::getPlatoon()` ->
+`ActivePlatoon::me` is a real per-squad wallet, but it is an NPC/town-squad
+concept and reads 0 for the player's own tabs (measured: `wallet_probe` samples
+every tab at 1 Hz and reported `tabNonZero=0/80`), so a mod that writes it will
+change nothing the HUD or a vendor sees. `Character::getMoney()` is likewise not
+the purse.
+
 ---
 
 ## 6. Key enums

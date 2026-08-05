@@ -64,6 +64,8 @@ Replicator::Replicator()
       speedLastSendMs_(0), speedCombatSampleMs_(0), speedCombatHoldMs_(0),
       spawnSync_(false), spawnPosLogMs_(0),
       spawnMintRadius_(0.0f), censusScanMs_(0),
+      poolSeen_(-1), poolSent_(-1), poolSentMs_(0), poolTotal_(-1),
+      poolSeq_(0), poolAcked_(0),
       moneySync_(true), recruitSync_(true),
       squadSync_(true), tabsSeeded_(0),
       cellAuth_(false), claimSendMs_(0), claimAssertMs_(0), claimMapMs_(0),
@@ -254,7 +256,13 @@ void Replicator::resetSession() {
     medRecv_.clear();
     medNpc_.clear();
     statsPub_.clear();
-    moneyPub_.clear();
+    // Protocol 52: the pool baseline describes the OLD world's wallet, so a
+    // reload must re-seed it - otherwise the newly loaded save's cats read as
+    // one giant local purchase. Pending deltas die with the session they were
+    // measured in.
+    poolSeen_ = -1; poolSent_ = -1; poolSentMs_ = 0; poolTotal_ = -1;
+    poolSeq_ = 0; poolAcked_ = 0;
+    poolPending_.clear();
     stealthPub_.clear();
     pinOwned_.clear();
     pinPeer_.clear();

@@ -210,6 +210,7 @@ void NetLink::queueSpeed(const SpeedPacket& pkt) { pushLocked(outCs_, outSpeed_,
 void NetLink::queueStats(const StatsPacket& pkt) { pushLocked(outCs_, outStats_, pkt); }
 
 void NetLink::queueMoney(const MoneyPacket& pkt) { pushLocked(outCs_, outMoney_, pkt); }
+void NetLink::queueMoneyDelta(const MoneyDeltaPacket& pkt) { pushLocked(outCs_, outMoneyDelta_, pkt); }
 
 void NetLink::queueFaction(const FactionPacket& pkt) { pushLocked(outCs_, outFaction_, pkt); }
 
@@ -712,12 +713,20 @@ void NetLink::threadLoop() {
                             inbound_->pushStats(stp.ownerId, stp);
                         }
                     } else if (type == PKT_MONEY) {
-                        // Reliable owner-authoritative per-tab wallet snapshot
-                        // (protocol 22). Delivered immediately like the others.
+                        // Reliable host-authoritative money-pool total
+                        // (protocol 52). Delivered immediately like the others.
                         MoneyPacket mo;
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &mo)
                             && inbound_) {
                             inbound_->pushMoney(mo.ownerId, mo);
+                        }
+                    } else if (type == PKT_MONEY_DELTA) {
+                        // Reliable money-pool delta (protocol 52, join -> host).
+                        // Ordered delivery is what makes the fold exactly-once.
+                        MoneyDeltaPacket md;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &md)
+                            && inbound_) {
+                            inbound_->pushMoneyDelta(md.ownerId, md);
                         }
                     } else if (type == PKT_FACTION) {
                         // Reliable player-faction relation row (protocol 24):
@@ -1326,16 +1335,36 @@ void NetLink::threadLoop() {
             }
         }
 
-        // Drain + send any queued per-tab wallet snapshots on CH_RELIABLE
-        // (protocol 22). Fixed-size PODs; change-gated by the Replicator so a
-        // settled economy is silent. A lost wallet write would diverge cats
-        // until the safety resend, so reliable is the right channel.
+        // Drain + send any queued money-pool totals on CH_RELIABLE (protocol
+        // 52). Fixed-size PODs; change-gated by the Replicator so a settled
+        // economy is silent. A lost total would diverge cats until the safety
+        // resend, so reliable is the right channel.
         std::vector<MoneyPacket> moneyPkts;
         EnterCriticalSection(&outCs_);
         moneyPkts.swap(outMoney_);
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < moneyPkts.size(); ++i) {
             ENetPacket* out = enet_packet_create(&moneyPkts[i], sizeof(MoneyPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send any queued money-pool deltas on CH_RELIABLE (protocol
+        // 52, join -> host). These are CONSERVATION intents, not snapshots: a
+        // dropped or reordered delta would silently mint or burn cats, which is
+        // exactly what the reliable ordered channel prevents.
+        std::vector<MoneyDeltaPacket> moneyDeltaPkts;
+        EnterCriticalSection(&outCs_);
+        moneyDeltaPkts.swap(outMoneyDelta_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < moneyDeltaPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&moneyDeltaPkts[i], sizeof(MoneyDeltaPacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);
