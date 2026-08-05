@@ -645,36 +645,25 @@ void driveLoadSync(GameWorld* gw) {
             coop::u32 fp = coop::savexfer::folderFingerprint(name);
             char b[192];
             if (!s_forceStream && fp != 0 && fp == it->pkt.fingerprint) {
-                // Already in this exact save? A connect-triggered push (host
-                // bakes its current save and announces it) would otherwise
-                // reload the join into the world it is already in - a pointless
-                // load-screen hitch for the classic "both pre-loaded the same
-                // save" flow. Skip only when in-game AND the loaded save name
-                // matches; a title-screen join (not yet in-game) must still
-                // load to actually enter the world.
-                char curp[64]; curp[0] = '\0';
-                bool alreadyIn = false;
-                if (g_gameStarted) {
-                    coop::engine::saveInfo(curp, sizeof(curp), 0, 0);
-                    alreadyIn = (curp[0] && _stricmp(curp, name) == 0);
-                }
-                if (alreadyIn) {
-                    _snprintf(b, sizeof(b) - 1,
-                              "[load] GO id=%u name='%s' fp=%08x MATCH - already loaded, skip",
-                              it->pkt.loadId, name, fp);
-                    b[sizeof(b) - 1] = '\0'; coopLog(b);
-                    g_loadAfterCommit.clear();
-                } else {
-                    _snprintf(b, sizeof(b) - 1,
-                              "[load] GO id=%u name='%s' fp=%08x MATCH -> loading",
-                              it->pkt.loadId, name, fp);
-                    b[sizeof(b) - 1] = '\0'; coopLog(b);
-                    warnIfNoPortraits(name);
-                    g_loadAfterCommit.clear();
-                    coop::engine::setLoadBypassOnce();
-                    if (!coop::engine::loadSave(name))
-                        coopErr("[load] coordinated load FAILED to issue");
-                }
+                // Our copy is loadable as-is, so load it - ALWAYS, including
+                // when this save is the one already live here. A host
+                // mid-session load and a connect-push arrive as the SAME
+                // packet (nothing on the wire says which), so the old "already
+                // in this save, skip the hitch" arm swallowed the real reload:
+                // the host swapped worlds while this side kept running the
+                // pre-load one, holding its characters' damage, position and
+                // inventory, and never reached sessionResetForWorldReload().
+                // The cost of reloading unconditionally is one load screen when
+                // two clients connect already sitting on the same save.
+                _snprintf(b, sizeof(b) - 1,
+                          "[load] GO id=%u name='%s' fp=%08x MATCH -> loading",
+                          it->pkt.loadId, name, fp);
+                b[sizeof(b) - 1] = '\0'; coopLog(b);
+                warnIfNoPortraits(name);
+                g_loadAfterCommit.clear();
+                coop::engine::setLoadBypassOnce();
+                if (!coop::engine::loadSave(name))
+                    coopErr("[load] coordinated load FAILED to issue");
             } else {
                 _snprintf(b, sizeof(b) - 1,
                           "[load] GO id=%u name='%s' hostFp=%08x localFp=%08x %s -> NACK (transfer)",
