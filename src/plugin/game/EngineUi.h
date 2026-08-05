@@ -10,8 +10,6 @@
 #ifndef KENSHICOOP_ENGINE_UI_H
 #define KENSHICOOP_ENGINE_UI_H
 
-class GameWorld;
-
 namespace coop {
 namespace engine {
 
@@ -34,10 +32,10 @@ struct CoopPanelState {
     bool               isHost;      // current armed role (seeds the Host toggle)
     int                transportSel;// current armed transport (0 steam, 1 udp)
     const char*        detail;      // one-line status string for the panel/overlay
-    // Join-side save-transfer status (null when not streaming): while a join
-    // receives the host's world at the menu it has no leader for the overlay, so
-    // the F2 panel's status line shows this instead (e.g. "Streaming host
-    // world... 42% (3.1/7.4 MB)"). Set by coopPanelDrive, rendered in dbgVal.
+    // Join-side save-transfer status (null when not streaming): byte-level
+    // progress the one-line detail above has no room for, shown on the F2 panel
+    // while a join receives the host's world (e.g. "Streaming host world... 42%
+    // (3.1/7.4 MB)"). Set by coopPanelDrive, rendered in dbgVal.
     const char*        transferDetail;
 };
 // The panel's role/transport selections at the moment Connect is hit. peerId is the
@@ -48,13 +46,15 @@ typedef void (*CoopDisconnectFn)();
 void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
                    CoopDisconnectFn onDisconnect);
 
-// Persistent co-op connection-status overlay: a single ScreenLabel tracked to the
-// local leader (the spike-47/48 screenshot-proven render path) whose caption shows
-// the live session status, colored by state (0 = offline/red, 1 = waiting/yellow,
-// 2 = connected/green). Recreated if the leader pointer changes (world reload) and
-// updated in place via _NV_setCaption when the text/state changes. Pass show=false
-// to remove it. Main-thread only; SEH-guarded.
-void coopOverlayTick(GameWorld* gw, const char* text, int state, bool show);
+// Persistent co-op connection-status banner: a single screen-space label fixed 10
+// px in from the top-left corner (a createFloatingLabel MyGUI::Window on the
+// spike-48 screenshot-proven "Info" layer) whose caption shows the live session
+// status, colored by state (0 = offline/red, 1 = waiting/yellow, 2 =
+// connected/green). Needs no player character, so it also shows at the title
+// screen; updated in place when the text/state changes and re-minted if the GUI
+// destroyed the widget (world load). Pass show=false to remove it. Main-thread
+// only; SEH-guarded.
+void coopOverlayTick(const char* text, int state, bool show);
 
 } // namespace engine
 } // namespace coop

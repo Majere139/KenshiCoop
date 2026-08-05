@@ -724,16 +724,16 @@ void driveLoadSync(GameWorld* gw) {
     }
 }
 
-// Co-op session panel (F2) + status overlay. Interactive sessions only - the
+// Co-op session panel (F2) + status banner. Interactive sessions only - the
 // unattended harness (scenario / self-exit timer) never touches the panel, and
 // keeping the GUI stack out of those runs avoids perturbing the scenario
-// oracles. Both calls are SEH-guarded internally and touch only GUI + input +
-// (guarded) leader read, so they are safe wherever the GUI stack is up. gw may
-// be null (title screen): coopOverlayTick then finds no leader and hides the
-// banner, while the panel itself needs no world. Driven from BOTH the in-game
-// mainLoop_hook and the title-screen titleUpdate_hook so a join can go ONLINE
-// (and copy/paste Steam IDs) straight from the main menu.
-void coopPanelDrive(GameWorld* gw) {
+// oracles. Both calls are SEH-guarded internally and touch only GUI + input, so
+// they are safe wherever the GUI stack is up - neither needs a world, which is
+// why this takes no GameWorld*. Driven from BOTH the in-game mainLoop_hook and
+// the title-screen titleUpdate_hook so a join can go ONLINE (and copy/paste
+// Steam IDs) straight from the main menu, and so the banner reports status there
+// too.
+void coopPanelDrive() {
     if (!(g_cfg.scenario.empty() && g_cfg.testSeconds == 0)) return;
     coop::engine::CoopPanelState ps;
     ps.selfSteamId  = (unsigned long long)coop::steamp2p::selfId();
@@ -786,7 +786,7 @@ void coopPanelDrive(GameWorld* gw) {
     coop::steaminvite::tick();
 
     coop::engine::coopPanelTick(&ps, &coopUiConnect, &coopUiDisconnect);
-    coop::engine::coopOverlayTick(gw, detail.c_str(), ostate, g_net.isRunning());
+    coop::engine::coopOverlayTick(detail.c_str(), ostate, g_net.isRunning());
 }
 
 // Main-thread tick hook: the one safe point where we touch game state.
@@ -1484,7 +1484,7 @@ void mainLoop_hook(GameWorld* gw, float dt) {
     }
 #endif
 
-    coopPanelDrive(gw);
+    coopPanelDrive();
 
     // Protocol 32 world-swap edge detection + session reset. Runs FIRST so the
     // reload edge lands before any sync code touches pointers from the torn-down
@@ -1660,8 +1660,8 @@ void mainLoop_hook(GameWorld* gw, float dt) {
 // abort titleUpdate_hook before the bootstrap pump runs. No C++ unwind objects
 // live in titleUpdate_hook, but coopPanelDrive uses std::string internally, so
 // the guarded call lives in its own function (C2712).
-void coopPanelDriveSeh(GameWorld* gw) {
-    __try { coopPanelDrive(gw); }
+void coopPanelDriveSeh() {
+    __try { coopPanelDrive(); }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         static bool s_warned = false;
         if (!s_warned) { s_warned = true;
@@ -1702,16 +1702,17 @@ void titleUpdate_hook(TitleScreen* self) {
         processNetEvents(0);
         if (g_cfg.saveSync) driveSaveSync();
         if (g_cfg.loadSync && coop::engine::savesReady()) driveLoadSync(0);
-        // F2 panel while the join waits at the menu (guarded; the host's world is
-        // the destination, so we skip the config auto-load for a join session).
-        coopPanelDriveSeh(0);
+        // F2 panel + status banner while the join waits at the menu (guarded; the
+        // host's world is the destination, so we skip the config auto-load for a
+        // join session).
+        coopPanelDriveSeh();
         return;
     }
 
     // Co-op panel (F2) at the main menu for the HOST / offline case: lets a user
     // toggle ONLINE and paste a Steam ID before any save is loaded. Guarded
     // because the title-screen GUI stack is otherwise unexercised.
-    coopPanelDriveSeh(0);
+    coopPanelDriveSeh();
 
     if (g_autoLoadDone || g_cfg.save.empty()) return;
 

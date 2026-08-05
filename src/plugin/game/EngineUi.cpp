@@ -589,54 +589,131 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
 }
 
 // ---- Persistent co-op status overlay ----------------------------------------
-// A ScreenLabel tracked to the local leader (the spike-47/48 render path, reused
-// via the marker* SEH shims above), showing live session status colored by state
-// (0 = offline/red, 1 = waiting/yellow, 2 = connected/green). Recreated if the
-// leader pointer changes (world reload); removed when show=false or no leader.
+// A fixed banner in the top-left corner of the screen showing live session status
+// colored by state (0 = offline/red, 1 = waiting/yellow, 2 = connected/green).
+// Unlike the character-tracked ScreenLabel this replaces, it needs no player
+// character and holds its place while the camera moves - which also makes it
+// visible at the title screen, where a join has no leader while it streams the
+// host's world. Removed when show=false.
+//
+// Two widgets, because neither factory alone does the job. Measured 2026-08-04:
+// createFloatingLabel hands back a bare MyGUI::Window that IS visible and
+// layer-attached at the coords we ask for, but its skin carries no text region at
+// all - setCaption is silently dropped (getCaption().size() stays 0) and it has no
+// children, so it draws nothing. It is still the only way to get a widget parented
+// to a screen layer instead of to another window, so we keep it as an invisible
+// container and put Kenshi's own label factory inside it (createLabelAbs ->
+// MyGUI::TextBox with a text-bearing skin, the one the datapanel rows use).
+// Caption + colour go to the child; the container is only geometry.
 
 namespace {
-ScreenLabel* g_overlay       = 0;
-Character*   g_overlayLeader = 0;
-int          g_overlayState  = -1;
-std::string  g_overlayText;
+// Banner box in pixels: 10 px in from the top-left corner. Applied with the
+// absolute setCoord instead of createFloatingLabel's normalized coords, since a
+// corner inset is a pixel quantity and the reconstructed header's top/left
+// argument order is ambiguous (the normalized values are overwritten either way).
+const int kOverlayX = 10;
+const int kOverlayY = 10;
+const int kOverlayW = 520;
+const int kOverlayH = 26;
+
+MyGUI::Window*  g_overlayBox   = 0; // container: geometry + layer attachment
+MyGUI::TextBox* g_overlay      = 0; // the label that actually draws the text
+int             g_overlayState = -1;
+std::string     g_overlayText;
 
 int overlayColorId(int state) { return state == 2 ? 0 : (state == 1 ? 2 : 1); }
 
-Character* panelLeaderSeh(GameWorld* gw) {
+// Put the freshly-minted container in its pixel box and mint the label inside it.
+// createLabelAbs takes its text by const-ref and MyGUI::Align is a trivial int
+// wrapper (no destructor), so this whole frame is SEH-safe - the same rule
+// dbgColourSeh follows for MyGUI::Colour.
+MyGUI::TextBox* overlayBuildSeh(MyGUI::Window* box, const std::string* text) {
     __try {
-        if (!gw || !gw->player) return 0;
-        if (gw->player->playerCharacters.size() == 0) return 0;
-        return gw->player->playerCharacters[0];
+        box->setCoord(kOverlayX, kOverlayY, kOverlayW, kOverlayH);
+        box->setVisible(true);
+        MyGUI::TextBox* l = ::gui->createLabelAbs(box, 0, 0, kOverlayW, kOverlayH,
+                                                  *text, MyGUI::Align::Left);
+        if (l) {
+            l->setTextAlign(MyGUI::Align::Left);
+            l->setVisible(true);
+        }
+        return l;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// Caption + colour in place. MyGUI::UString owns a buffer (destructor => C2712),
+// so the caller builds it outside this frame and passes a pointer. false = the
+// widget faulted; the caller then treats the pointer as dead.
+bool overlayUpdateSeh(MyGUI::TextBox* l, const MyGUI::UString* text,
+                      const MyGUI::Colour* col) {
+    __try {
+        l->setCaption(*text);
+        l->setTextColour(*col);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Destroying the container takes its label child with it (MyGUI owns the subtree).
+void overlayDestroySeh(ForgottenGUI* g, MyGUI::Window* box) {
+    __try { g->destroyWidget(box); } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 } // namespace
 
-void coopOverlayTick(GameWorld* gw, const char* text, int state, bool show) {
+void coopOverlayTick(const char* text, int state, bool show) {
     ForgottenGUI* g = ::gui;
     if (!g) return;
 
-    Character* leader = show ? panelLeaderSeh(gw) : 0;
-    if (!show || !leader) {
-        if (g_overlay) {
-            markerDestroySeh(g, g_overlay);
-            g_overlay = 0; g_overlayLeader = 0; g_overlayState = -1; g_overlayText.clear();
+    if (!show) {
+        if (g_overlayBox) {
+            overlayDestroySeh(g, g_overlayBox);
+            g_overlayBox = 0; g_overlay = 0;
+            g_overlayState = -1; g_overlayText.clear();
         }
         return;
     }
 
     std::string t = text ? std::string(text) : std::string();
-    if (!g_overlay || leader != g_overlayLeader) {
-        if (g_overlay) markerDestroySeh(g, g_overlay);
-        MyGUI::Colour col; markerColour(overlayColorId(state), &col);
-        Ogre::Vector3 off(0.0f, 2.8f, 0.0f);
-        g_overlay = markerCreateSeh(g, leader, &t, &col, &off);
-        g_overlayLeader = leader; g_overlayState = state; g_overlayText = t;
-        return;
+    if (!g_overlay) {
+        // createFloatingLabel takes the layer BY VALUE (an unwindable temporary
+        // => C2712), so the container mint stays outside SEH, exactly like
+        // createDatapanel above; ::gui was verified non-null. Layer MUST be "Info"
+        // for the same reason the panel uses it - nothing draws on "Windows".
+        if (g_overlayBox) { overlayDestroySeh(g, g_overlayBox); g_overlayBox = 0; }
+        std::string layer = "Info";
+        std::string empty;
+        g_overlayBox = g->createFloatingLabel(0.01f, 0.01f, 0.30f, 0.03f, empty,
+                                              MyGUI::Align::Default, layer);
+        if (!g_overlayBox) {
+            coop::logErrLine("[coop-ui] banner container FAILED");
+            return;
+        }
+        g_overlay = overlayBuildSeh(g_overlayBox, &t);
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "[coop-ui] banner box=%p label=%p",
+                  (void*)g_overlayBox, (void*)g_overlay);
+        b[sizeof(b) - 1] = '\0';
+        coop::logLine(b);
+        if (!g_overlay) {
+            coop::logErrLine("[coop-ui] banner label FAILED");
+            return;
+        }
+        g_overlayState = -1;   // no caller state is -1: forces the caption pass
+        g_overlayText.clear();
     }
+
     if (t != g_overlayText || state != g_overlayState) {
         MyGUI::Colour col; markerColour(overlayColorId(state), &col);
-        markerUpdateSeh(g_overlay, &t, &col);
-        g_overlayText = t; g_overlayState = state;
+        MyGUI::UString u(t.c_str());
+        if (overlayUpdateSeh(g_overlay, &u, &col)) {
+            g_overlayText = t; g_overlayState = state;
+        } else {
+            // The GUI destroyed the widgets under us - clearGUI() on a world load
+            // empties the layer and notifies nobody, so a pointer held across
+            // ticks dangles silently (same lesson as the ScreenLabel registry
+            // note above). Forget them and re-mint on the next tick.
+            g_overlayBox = 0; g_overlay = 0;
+            g_overlayState = -1; g_overlayText.clear();
+        }
     }
 }
 
