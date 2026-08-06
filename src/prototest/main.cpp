@@ -1125,11 +1125,15 @@ static void testOwnRanks() {
     }
 }
 
-// ---- 7. SteamID64 parse (SteamId.h) ---------------------------------------------
+// ---- 7. SteamID64 parse + mask (SteamId.h) --------------------------------------
 // Guards the F2 panel "Paste friend's Steam ID" button: clipboard text is noisy
 // (surrounding whitespace, a trailing newline, or a "Steam ID: 7656..." wrapper),
 // so parseSteamId64 keeps only digits and requires a 17-digit community ID
 // (76561... prefix). Arbitrary clipboard junk must be rejected.
+//
+// maskSteamId64 is the other half: the panel rows show only the last 4 digits so
+// a streamed screen leaks no account. A leaked prefix would defeat the point, so
+// the exact output shape is pinned here.
 
 static void testSteamIdParse() {
     std::printf("== SteamID64 parse (SteamId.h) ==\n");
@@ -1155,6 +1159,15 @@ static void testSteamIdParse() {
           !coop::parseSteamId64("765611980000000000", id) && id == 123ull);
     CHECK("17 digits, wrong prefix rejected",
           !coop::parseSteamId64("12345678901234567", id) && id == 123ull);
+
+    // Masked display: "****" + the last 4 digits, nothing else.
+    CHECK("full id masked to last 4",
+          coop::maskSteamId64(76561198012345678ull) == "****5678");
+    CHECK("trailing zeros kept as digits",
+          coop::maskSteamId64(76561198000000000ull) == "****0000");
+    // Not real ids, but steamPeer from the config is never length-checked.
+    CHECK("short value masked, not padded", coop::maskSteamId64(42ull) == "****42");
+    CHECK("zero masked", coop::maskSteamId64(0ull) == "****0");
 }
 
 // ---- 8. Pose-fixture acceptance (WorkPose.h) ------------------------------------

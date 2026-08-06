@@ -23,7 +23,7 @@
 #include <mygui/MyGUI_Delegate.h> // MyGUI::newDelegate + CDelegate* (free-fn callbacks)
 #include <windows.h>
 
-#include "../core/SteamId.h" // parseSteamId64 (pure) for the paste-from-clipboard button
+#include "../core/SteamId.h" // parseSteamId64 (paste button) + maskSteamId64 (id rows)
 
 namespace coop {
 namespace engine {
@@ -507,15 +507,15 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
 
         // Friend's SteamID: prefer the value pasted in-panel this session; fall
         // back to the config (steamPeer, mainly for advanced/back-compat use).
+        // Both id rows show only the last 4 digits - the panel is often on screen
+        // while streaming. Nothing needs the full digits by eye: Copy puts the
+        // real id on the clipboard and Paste takes it back off.
         std::string peerKey = "Friend's Steam ID";
         std::string peerVal;
         unsigned long long peerShown = g_pastedPeer ? g_pastedPeer
                                                      : (unsigned long long)st->peerSteamId;
         if (peerShown != 0) {
-            char pb[32];
-            _snprintf(pb, sizeof(pb) - 1, "%llu", peerShown);
-            pb[sizeof(pb) - 1] = '\0';
-            peerVal = pb;
+            peerVal = coop::maskSteamId64(peerShown);
         } else if (g_pasteFailed) {
             peerVal = "(clipboard was not a Steam ID - copy theirs and retry)";
         } else {
@@ -524,15 +524,10 @@ void coopPanelTick(const CoopPanelState* st, CoopConnectFn onConnect,
         std::string pasteKey = "pasteid";
         std::string pasteCap = "Paste friend's Steam ID";
 
-        char selfBuf[40];
-        if (st->selfSteamId) {
-            _snprintf(selfBuf, sizeof(selfBuf) - 1, "%llu", (unsigned long long)st->selfSteamId);
-            selfBuf[sizeof(selfBuf) - 1] = '\0';
-        } else {
-            strcpy(selfBuf, "(Steam not running)");
-        }
         std::string selfKey  = "Your Steam ID";
-        std::string selfVal  = selfBuf;
+        std::string selfVal  = st->selfSteamId
+                                   ? coop::maskSteamId64((unsigned long long)st->selfSteamId)
+                                   : std::string("(Steam not running)");
         std::string copyKey  = "copyid";
         std::string copyCap  = "Copy my Steam ID";
         std::string empty    = "";

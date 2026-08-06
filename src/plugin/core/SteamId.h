@@ -1,4 +1,4 @@
-// SteamId.h - Steam64 ID parsing (pure, zero game/Win32 deps).
+// SteamId.h - Steam64 ID parsing + display masking (pure, zero game/Win32 deps).
 //
 // The F2 panel lets a player paste a friend's Steam ID from the clipboard
 // instead of editing coop_config.json. Clipboard text is noisy (surrounding
@@ -38,6 +38,27 @@ inline bool parseSteamId64(const std::string& text, unsigned long long& out) {
     }
     out = v;
     return true;
+}
+
+// Render an id for on-screen display with all but the last 4 digits hidden
+// ("76561198012345678" -> "****5678"), so a player streaming or screen-sharing
+// the F2 panel does not expose their (or their friend's) account. The digits are
+// built here instead of with _snprintf("%llu") to keep this header pure.
+// A pasted id is always 17 digits, but the config fallback (steamPeer) is not
+// length-checked, so shorter values are tolerated: fewer than 4 digits yields
+// "****" plus whatever exists.
+inline std::string maskSteamId64(unsigned long long id) {
+    char digits[24]; // decimal digits, least-significant first
+    int n = 0;
+    if (id == 0) digits[n++] = '0';
+    while (id > 0 && n < 20) {
+        digits[n++] = (char)('0' + (int)(id % 10ull));
+        id /= 10ull;
+    }
+    std::string out("****");
+    int take = n < 4 ? n : 4;
+    for (int i = take - 1; i >= 0; --i) out += digits[i];
+    return out;
 }
 
 } // namespace coop
