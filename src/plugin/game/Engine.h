@@ -431,6 +431,16 @@ Character* sameTemplateNear(GameWorld* gw, const char* charSid,
 unsigned int spawnRuntimeSquad(GameWorld* gw, unsigned int count,
                                unsigned int (*outHands)[5]);
 
+// The same runtime squad, but ANGRY and still thinking: the spawn faction's
+// relation row with the player is set to 'relation' (both directions, the
+// probe-24 finding that their row is the one their AI consults) and the bodies
+// are NOT detached from town AI. Detaching is what makes spawnRuntimeSquad's
+// bodies inert - they ignore movement orders entirely and never aggro - which
+// is fine for an identity fixture and useless for a fight the enemy has to
+// START. Fills outHands; returns the number spawned.
+unsigned int spawnHostileSquad(GameWorld* gw, unsigned int count, float relation,
+                               unsigned int (*outHands)[5]);
+
 // ---- Combat (Phase 3c, L5) -------------------------------------------------
 
 // Read-only snapshot of a Character's combat state (the L5 probe). POD so it can be

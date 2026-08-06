@@ -222,6 +222,44 @@ unsigned int spawnRuntimeSquad(GameWorld* gw, unsigned int count,
     return n;
 }
 
+unsigned int spawnHostileSquad(GameWorld* gw, unsigned int count, float relation,
+                               unsigned int (*outHands)[5]) {
+    if (!gw || count == 0) return 0;
+    Faction* fac = nonPlayerFactionGuarded(gw);
+    if (!fac) {
+        coop::logLine("[spawn] hostile squad SKIPPED (no non-player faction nearby)");
+        return 0;
+    }
+    bool angry = false;
+    __try {
+        Faction* pf = gw->player ? gw->player->getFaction() : 0;
+        if (pf && pf->relations && fac->relations && g_relSetFn) {
+            g_relSetFn(pf->relations, fac, relation);
+            g_relSetFn(fac->relations, pf, relation);
+            angry = true;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        angry = false;
+    }
+    unsigned int n = 0;
+    for (unsigned int i = 0; i < count; ++i) {
+        float fwd  = 6.0f + 2.0f * (float)(i / 2);
+        float side = (i & 1) ? 2.0f : -2.0f;
+        Character* c = spawnCharInFaction(gw, fwd, side, fac);
+        if (!c) continue;
+        unsigned int h[5] = { 0, 0, 0, 0, 0 };
+        readObjectHand(static_cast<RootObject*>(c), h);
+        if (outHands) for (int j = 0; j < 5; ++j) outHands[n][j] = h[j];
+        ++n;
+    }
+    char b[144];
+    _snprintf(b, sizeof(b) - 1,
+              "[spawn] hostile squad spawned=%u/%u rel=%.1f applied=%d (AI intact)",
+              n, count, relation, angry ? 1 : 0);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    return n;
+}
+
 bool spawnMachineInFront(GameWorld* gw, float fwd, float side, Faction* owner,
                          RootObject** spawned) {
     if (spawned) *spawned = 0;

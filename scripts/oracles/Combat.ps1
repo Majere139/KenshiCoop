@@ -433,6 +433,143 @@ function Test-AssaultTravel {
     return (Add-GateResult -Name $GateName -Status PASS -Metrics $m)
 }
 
+# Proxy divergence. A minted proxy stands in for a body another client owns, so
+# the two copies must occupy roughly the same spot - and unlike the fight-parity
+# measures this one is not a sampling race, it is a distance that either stays
+# bounded or does not. Pre-fix run 20260806_091951 has one proxy walking
+# 165 -> 350 -> 484 -> 561 u away while the host holds it still and its local
+# copy fights the whole time, which is the 2026-08-05 field report exactly.
+# Parses the join's throttled "[proxy] drift ... d=<u> streamed=<0|1> fight=<0|1>"
+# sweep (one line per proxy per second).
+function Test-ProxyDrift {
+    param([string]$JoinFile, [double]$MaxDrift = 130.0, [int]$MinSamples = 10,
+          [double]$MaxHostStep = 40.0, [double]$RunawayDrift = 300.0)
+    $pat = '\[proxy\] drift hand=(\d+),(\d+) d=([\d\.]+) .*streamed=(\d) fight=(\d) hstep=(-?[\d\.]+)'
+    $all = @(Select-String -Path $JoinFile -Pattern $pat -ErrorAction SilentlyContinue |
+              ForEach-Object {
+                  $g = $_.Matches[0].Groups
+                  [pscustomobject]@{ hand = "$($g[1].Value),$($g[2].Value)"
+                                     d = [double]$g[3].Value
+                                     streamed = [int]$g[4].Value
+                                     fight = [int]$g[5].Value
+                                     hstep = [double]$g[6].Value } })
+    # Judge only samples where the OWNER's copy was roughly still between
+    # sweeps. The census is 1 Hz against a game that runs at 5x, so a sample
+    # taken while the owner is sprinting measures that latency, not a
+    # disagreement - the copy is tracking, a tick behind. hstep < 0 means we
+    # have no previous sweep for that proxy yet.
+    $rows = @($all | Where-Object { $_.hstep -ge 0 -and $_.hstep -le $MaxHostStep })
+    $lagged = $all.Count - $rows.Count
+    # No telemetry AT ALL is a failure, not a skip: this gate's scenario always
+    # mints, so a silent sweep means a stale DLL or a renamed log line - the way
+    # a broken measurement quietly reports success.
+    if ($all.Count -eq 0) {
+        $d = 'no [proxy] drift samples in the join log (telemetry missing - stale build?)'
+        Write-Host "  PROXY-DRIFT FAIL - $d"
+        return (Add-GateResult -Name 'proxy_drift' -Status FAIL -Metrics @{ samples = 0 } -Detail $d)
+    }
+    if ($rows.Count -lt $MinSamples) {
+        $m = @{ samples = $rows.Count; lagged = $lagged }
+        Write-Host "  PROXY-DRIFT SKIP - only $($rows.Count) judgeable proxy samples of $($all.Count) (need >= $MinSamples; $lagged excluded as owner-in-motion)"
+        return (Add-GateResult -Name 'proxy_drift' -Status PASS -Metrics $m -Detail 'insufficient samples')
+    }
+    $ds = @($rows | ForEach-Object { $_.d } | Sort-Object)
+    $max = $ds[-1]
+    $med = $ds[[int]($ds.Count / 2)]
+    $over = @($rows | Where-Object { $_.d -gt $MaxDrift })
+    # The damaging combination: far from where its owner has it AND fighting, so
+    # the local AI is acting on a position the other world does not agree with.
+    $overFighting = @($over | Where-Object { $_.fight -eq 1 })
+    # Being over the line is not itself the defect. The reconciliation triggers
+    # at 120 u and reparks at most every 5 s, so a body that is walking can sit
+    # just above the line between parks - measured max 114-153 u across fixed
+    # runs, against 661 u with reconciliation off. What separates the two is not
+    # the peak: it is whether the copy is FIGHTING out there, and whether the
+    # distance keeps growing instead of being pulled back.
+    $runaway = @($rows | Where-Object { $_.d -gt $RunawayDrift })
+    $worst = ($rows | Sort-Object d -Descending | Select-Object -First 1)
+    $m = @{ samples = $rows.Count; lagged = $lagged; maxDrift = $max; medDrift = $med
+            over = $over.Count; overFighting = $overFighting.Count
+            runaway = $runaway.Count
+            worstHand = $worst.hand; worstStreamed = $worst.streamed }
+    $bad = @()
+    if ($overFighting.Count -gt 0) {
+        $w = ($overFighting | Sort-Object d -Descending | Select-Object -First 1)
+        $bad += ("proxy $($w.hand) was FIGHTING $([int]$w.d) u from where its owner has it " +
+                 "($($overFighting.Count) samples): the two screens disagree about where " +
+                 "the fight is happening")
+    }
+    if ($runaway.Count -gt 0) {
+        $bad += ("proxy $($worst.hand) reached $([int]$max) u from its owner's copy " +
+                 "(runaway limit $RunawayDrift): nothing is pulling it back")
+    }
+    if ($bad.Count -gt 0) {
+        $d = $bad -join '; '
+        Write-Host "  PROXY-DRIFT FAIL - $d [max=$([int]$max) median=$([int]$med) over=$($over.Count) samples=$($rows.Count)]"
+        return (Add-GateResult -Name 'proxy_drift' -Status FAIL -Metrics $m -Detail $d)
+    }
+    Write-Host ("  PROXY-DRIFT PASS - no proxy fought while displaced and none ran away " +
+                "(max=$([int]$max), median=$([int]$med), $($over.Count) sample(s) over $MaxDrift u " +
+                "but at peace; samples=$($rows.Count), $lagged excluded as owner-in-motion)")
+    return (Add-GateResult -Name 'proxy_drift' -Status PASS -Metrics $m)
+}
+
+# mint_aggro: the UNPROVOKED half of the field report, and the only one of these
+# scenarios where nothing of ours touches the enemy. The host spawns a hostile
+# squad with its AI intact at census range, the join mints it, and the host then
+# puts it beside the join's characters. From there the fight is the enemy's to
+# start - so if one screen has it swinging while the other has it at peace, the
+# client that does not own it invented that fight out of its own local AI.
+#   1. spawned - the host put a hostile squad out there (scenario marker)
+#   2. minted  - the join had to create the body locally (no local copy at load)
+#   3. quiet   - NO attack was ordered by the scenario; a provoked fight is a
+#                different and accepted situation (pc_assault's architecture),
+#                so a run that somehow issued one proves nothing here
+#   4. parity  - the gate: both screens agree about whether it is fighting
+function Test-MintAggro {
+    param([string]$HostFile, [string]$JoinFile, [double]$MaxOneSidedFrac = 0.25,
+          [int]$MinPairs = 8)
+    $spawned = @(Select-String -Path $HostFile -Pattern 'SCENARIO TRAVELFIGHT enemy spawned n=(\d+)' -ErrorAction SilentlyContinue)
+    $closed  = @(Select-String -Path $HostFile -Pattern 'SCENARIO TRAVELFIGHT enemy closed n=(\d+)' -ErrorAction SilentlyContinue)
+    $issued  = @(Select-String -Path $JoinFile -Pattern 'SCENARIO TRAVELFIGHT issued atk=' -ErrorAction SilentlyContinue)
+    $minted  = @(Select-String -Path $JoinFile -Pattern '\[spawn\] proxy BOUND hand=' -ErrorAction SilentlyContinue).Count
+    $par = Get-EnemyStateParity -HostFile $HostFile -JoinFile $JoinFile
+    $nSpawn = if ($spawned.Count -ge 1) { [int]$spawned[0].Matches[0].Groups[1].Value } else { 0 }
+    $nClose = if ($closed.Count -ge 1) { [int]$closed[0].Matches[0].Groups[1].Value } else { 0 }
+
+    $m = @{ spawned = $nSpawn; closed = $nClose; minted = $minted; issued = $issued.Count
+            pairs = $par.pairs; agree = $par.agree
+            joinOnly = $par.joinOnly; joinOnlyFrac = $par.joinOnlyFrac
+            hostOnly = $par.hostOnly; hostOnlyFrac = $par.hostOnlyFrac }
+    $bad = @()
+    if ($nSpawn -lt 1) { $bad += "the host never spawned the hostile squad (link 1)" }
+    elseif ($nClose -lt 1) { $bad += "the squad was never brought to the join (link 1)" }
+    if ($minted -lt 1) { $bad += "the join minted nothing, so no body had a fragile identity (link 2)" }
+    if ($issued.Count -gt 0) { $bad += "an attack WAS ordered, so any fight here is player-authored (link 3)" }
+    if ($par.pairs -lt $MinPairs) {
+        $bad += "only $($par.pairs) paired enemy samples (need >= $MinPairs; the two logs never saw the same body - link 4)"
+    } else {
+        if ($par.joinOnlyFrac -gt $MaxOneSidedFrac) {
+            $bad += ("the enemy fights on the JOIN while the host has it at peace in " +
+                     "$($par.joinOnly)/$($par.pairs) samples ($($par.joinOnlyFrac)); link 4: parity")
+        }
+        if ($par.hostOnlyFrac -gt $MaxOneSidedFrac) {
+            $bad += ("the enemy fights on the HOST while the join has it at peace in " +
+                     "$($par.hostOnly)/$($par.pairs) samples ($($par.hostOnlyFrac)); link 4: parity")
+        }
+    }
+    if ($bad.Count -gt 0) {
+        Write-Host ("  MINT-AGGRO FAIL - " + ($bad -join "; ") +
+                    " [spawned=$nSpawn closed=$nClose minted=$minted issued=$($issued.Count) " +
+                    "pairs=$($par.pairs) joinOnly=$($par.joinOnly) hostOnly=$($par.hostOnly)]")
+        return (Add-GateResult -Name 'mint_aggro' -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    Write-Host ("  MINT-AGGRO PASS - unprovoked hostile mint: spawned=$nSpawn minted=$minted; " +
+                "fight parity $($par.agree)/$($par.pairs) agree " +
+                "(join-only $($par.joinOnly), host-only $($par.hostOnly))")
+    return (Add-GateResult -Name 'mint_aggro' -Status PASS -Metrics $m)
+}
+
 # The largest "moved=<u>" the travel series reported in one log (cumulative path
 # length of that client's own leader, snap steps excluded by the scenario).
 function Get-TravelMoved {

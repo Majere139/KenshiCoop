@@ -134,9 +134,21 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
     // their mint position, then the drive's teleports no-opped on the frozen
     // bodies forever). Their existence authority is the census entry for the
     // STREAM key that minted them; drive/starve policy is applyTargets'.
+    // ...but exempt from EXISTENCE judgment only. The same exemption used to
+    // skip parkDivergedCopy too, and nothing else bounds a proxy's position:
+    // the drive corrects it only while the host is streaming it, and a proxy
+    // is by definition a body that was out of stream range when it was minted.
+    // Left alone it walks off on local AI - 561 u and still swinging in run
+    // 20260806_091951 - which is the field report's "an enemy attacking my
+    // character on the join, not on the host". Its census row is keyed by the
+    // STREAM key that minted it, never its local hand, so keep that mapping.
     std::set<Character*> proxyChars;
+    std::map<Character*, Key> proxyKeyOf;
     for (std::map<Key, Character*>::iterator it = proxyByKey_.begin();
-         it != proxyByKey_.end(); ++it) proxyChars.insert(it->second);
+         it != proxyByKey_.end(); ++it) {
+        proxyChars.insert(it->second);
+        proxyKeyOf[it->second] = it->first;
+    }
     // Un-hide anything suppressed before it became a proxy / driven body (the
     // mint can land on a body a previous pass already judged).
     for (std::map<Key, Character*>::iterator it = suppressed_.begin();
@@ -203,6 +215,59 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
         censusFreshChkMs_ = nowF;
     }
 
+    // Proxy divergence telemetry. A minted proxy is exempt from BOTH passes
+    // below (its local hand matches no other client, so the wide pass used to
+    // read every far-minted proxy as a ghost and freeze it at its mint spot),
+    // and that exemption also skips parkDivergedCopy - so nothing bounds how
+    // far a proxy's local copy can wander from the body it stands for. The
+    // 2026-08-05 field report is what that looks like from the outside: an
+    // enemy attacking on the join while the host, holding the same body 213 u
+    // away with nobody near it, had it at peace. Measure the gap before
+    // deciding what to do about it - one line per proxy per second, against
+    // the census position of the STREAM key that minted it.
+    if (censusFresh && !proxyChars.empty()) {
+        unsigned long nowD = nowMs();
+        if ((nowD - proxyDriftLogMs_) >= 1000) {
+            proxyDriftLogMs_ = nowD;
+            for (std::map<Key, Character*>::iterator it = proxyByKey_.begin();
+                 it != proxyByKey_.end(); ++it) {
+                std::map<Key, CensusPos>::iterator cp = censusPos_.find(it->first);
+                if (cp == censusPos_.end()) continue;
+                float lx = 0, ly = 0, lz = 0;
+                if (!engine::readPos(it->second, &lx, &ly, &lz)) continue;
+                float d = dist3(lx, ly, lz, cp->second.x, cp->second.y, cp->second.z);
+                // How far the OWNER's copy moved since the last sweep. The
+                // census is 1 Hz and the game can run at 5x, so a sprinting
+                // body's local copy sits a whole census tick behind - it reads
+                // as hundreds of units of "drift" while actually tracking
+                // faithfully (the giveaway: local lands on the host position
+                // from the previous sample). Only a body whose owner is
+                // roughly still can be judged on distance alone.
+                float hstep = -1.0f;
+                std::map<Key, CensusPos>::iterator pv =
+                    proxyDriftPrev_.find(it->first);
+                if (pv != proxyDriftPrev_.end())
+                    hstep = dist3(pv->second.x, pv->second.y, pv->second.z,
+                                  cp->second.x, cp->second.y, cp->second.z);
+                proxyDriftPrev_[it->first] = cp->second;
+                // streamed=1 means applyTargets has a fresh sample and IS
+                // driving it; the uncorrected case is the one that can run away.
+                std::map<Key, Driven>::iterator dt = targets_.find(it->first);
+                bool streamed = (dt != targets_.end()) && dt->second.fresh;
+                engine::CombatRead pc;
+                bool fighting = engine::readCombat(it->second, &pc) &&
+                                (pc.inCombat || pc.modeActive);
+                char b[208]; _snprintf(b, sizeof(b) - 1,
+                    "[proxy] drift hand=%u,%u d=%.0f local=%.0f,%.0f host=%.0f,%.0f "
+                    "streamed=%d fight=%d hstep=%.0f",
+                    (unsigned)it->first.i, (unsigned)it->first.s, d, lx, lz,
+                    cp->second.x, cp->second.z, streamed ? 1 : 0, fighting ? 1 : 0,
+                    hstep);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+    }
+
     // Under presence authority this pass runs on both sides, so the audit label
     // has to follow the role rather than the pass. With cellAuth off it is
     // join-only and this still reads "join".
@@ -242,7 +307,11 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
     for (unsigned int i = 0; i < n; ++i) {
         // Proxy bodies answer to their streamed key's census entry, not their
         // local hand (which exists on no other client) - never judge them.
-        if (proxyChars.find(chars[i]) != proxyChars.end()) continue;
+        // Reconcile their POSITION against that same census row, though.
+        if (proxyChars.find(chars[i]) != proxyChars.end()) {
+            reconcileProxy(chars[i], states[i], proxyKeyOf);
+            continue;
+        }
         Key k = keyOf(states[i]);
         // Presence authority: not every body here answers to us.
         if (authorHoldsBody(gw, localId, k, chars[i], states[i].x, states[i].z)) {
@@ -370,7 +439,10 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
         for (unsigned int i = 0; i < n; ++i) nearSet.insert(chars[i]);
         for (unsigned int i = 0; i < wn; ++i) {
             if (nearSet.find(wChars[i]) != nearSet.end()) continue;
-            if (proxyChars.find(wChars[i]) != proxyChars.end()) continue;
+            if (proxyChars.find(wChars[i]) != proxyChars.end()) {
+                reconcileProxy(wChars[i], wStates[i], proxyKeyOf);
+                continue;
+            }
             // Phase 2 mid-band tier: a DRIVEN body used to skip this pass
             // entirely - correct for parking/suppression (the stream owns its
             // position, and hiding a driven body is self-defeating), but it
@@ -1275,6 +1347,17 @@ void Replicator::pruneAttention(const std::set<Key>& seen) {
         if (seen.find(it->first) == seen.end()) attnObsPeer_.erase(it++);
         else ++it;
     }
+}
+
+void Replicator::reconcileProxy(Character* c, const EntityState& st,
+                                const std::map<Character*, Key>& keyOf) {
+    std::map<Character*, Key>::const_iterator pk = keyOf.find(c);
+    if (pk == keyOf.end()) return;
+    // st carries the LOCAL enumeration's hand; the census row answers to the
+    // stream key, so the drift is measured and the park keyed by that.
+    float drift = parkDivergedCopy(c, st, pk->second);
+    if (censusFreezeAi_ && drift >= 0.0f)
+        censusFreezeDivergedAi(c, pk->second, drift);
 }
 
 float Replicator::parkDivergedCopy(Character* c, const EntityState& st, const Key& k) {

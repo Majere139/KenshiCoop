@@ -1637,11 +1637,12 @@ private:
 // the reason its two copies of the bandit ended up 213 u apart.
 class AssaultTravelScenario : public TimedScenario {
 public:
-    AssaultTravelScenario(const char* name, bool mintVictim)
-        : TimedScenario(name, 0), mint_(mintVictim), lastLogMs_(0), lastOrderMs_(0),
+    AssaultTravelScenario(const char* name, bool mintVictim, bool aggro = false)
+        : TimedScenario(name, 0), mint_(mintVictim), aggro_(aggro),
+          lastLogMs_(0), lastOrderMs_(0),
           lastWalkMs_(0), lastNearMs_(0), haveOwn_(false), havePeer_(false),
           haveVic_(false), issued_(false), pickFailLogged_(false), outbound_(true),
-          spawned_(false), spedUp_(false), hold_(false), lastPickMs_(0),
+          spawned_(false), closed_(false), spedUp_(false), hold_(false), lastPickMs_(0),
           lastApproachMs_(0), nFar_(0),
           haveAnchor_(false), ax_(0), ay_(0), az_(0),
           havePrev_(false), px_(0), py_(0), pz_(0), moved_(0.0f) {}
@@ -1669,10 +1670,24 @@ public:
             ctx.elapsedMs >= SPAWN_AT_MS) {
             spawnFarSquad(ctx);
         }
+        // Aggro variant: once the join has had time to mint them from the
+        // census, put the squad ON the join's characters. They are hostile and
+        // their AI is intact, so from here the FIGHT IS THEIRS TO START - which
+        // is the whole point, and the one thing the provoked variant cannot
+        // show (there, our own attack order is what the peer's copy answers).
+        if (aggro_ && ctx.isHost && spawned_ && !closed_ &&
+            ctx.elapsedMs >= CLOSE_AT_MS) {
+            closeFarSquad(ctx);
+        }
 
         // JOIN only: pick a victim near our own leader (falling back to the peer
         // leader's crowd) and order the unprovoked attack. Nothing host-side.
-        if (!ctx.isHost && haveOwn_ && ctx.elapsedMs >= assaultAtMs()) {
+        // The aggro variant issues NOTHING: an attack of ours would make the
+        // enemy's answer player-authored, which is the accepted pc_assault
+        // situation (the join's melee on a host-owned NPC is damage-guarded and
+        // reported, and the host holds its copy at peace for position parity) -
+        // so a provoked fight here would prove nothing about an invented one.
+        if (!aggro_ && !ctx.isHost && haveOwn_ && ctx.elapsedMs >= assaultAtMs()) {
             if (!haveVic_ && (ctx.elapsedMs - lastPickMs_) >= pickEveryMs()) {
                 lastPickMs_ = ctx.elapsedMs;
                 lastOrderMs_ = ctx.elapsedMs;
@@ -1772,6 +1787,13 @@ public:
                     for (unsigned int i = 0; i < nFar_; ++i) logEnemyState(farHands_[i], farHands_[i]);
                 } else if (haveVic_) {
                     logEnemyState(vic_, vicCanon_);
+                } else if (aggro_ && ctx.pickMintedProxy && haveOwn_) {
+                    // No victim to key off - we never picked one. Report whatever
+                    // the replicator minted nearest us, under the canonical hand
+                    // the host publishes it by, so the two logs still pair.
+                    unsigned int local[5], canon[5]; float d = 0.0f;
+                    if (ctx.pickMintedProxy(ownHand_, local, canon, &d))
+                        logEnemyState(local, canon);
                 }
             }
             // The per-hand fight truth of every nearby NPC on THIS client. The
@@ -1793,7 +1815,13 @@ public:
             // leader latched (host), and the travel leg actually moved. The
             // cross-client judgement is Test-AssaultTravel's.
             bool travelled = moved_ >= MIN_TRAVEL;
-            passed_ = travelled && (ctx.isHost ? havePeer_ : (issued_ && haveVic_));
+            // The aggro variant has no assault to report: the join is only
+            // required to have travelled, and the host to have put an enemy out
+            // there. Whether a fight happened at all - and whether both screens
+            // agree about it - is the oracle's business, not the script's.
+            passed_ = aggro_
+                ? (ctx.isHost ? (spawned_ && nFar_ > 0 && havePeer_) : travelled)
+                : (travelled && (ctx.isHost ? havePeer_ : (issued_ && haveVic_)));
             char b[160]; _snprintf(b, sizeof(b) - 1,
                 "SCENARIO TRAVELFIGHT done moved=%.0f travelled=%d issued=%d vic=%d peer=%d",
                 moved_, travelled ? 1 : 0, issued_ ? 1 : 0,
@@ -1811,6 +1839,9 @@ private:
     static const unsigned long MINT_ASSAULT_AT_MS = 18000;
     static const unsigned long SPAWN_AT_MS      = 8000;
     static const unsigned long TRAVEL_AT_MS     = 14000;
+    // Long enough after the spawn for the census round trip to mint the squad
+    // on the join (spawn_far measures that latency at a few seconds).
+    static const unsigned long CLOSE_AT_MS      = 32000;
     static const unsigned long ORDER_EVERY_MS   = 2500;
     static const unsigned long MINT_PICK_EVERY_MS = 750;
     static const unsigned long APPROACH_EVERY_MS  = 4000;
@@ -1830,6 +1861,8 @@ private:
     static const float         MIN_TRAVEL;  // path length that counts as travel
     static const float         MINT_DIST;   // enemy park distance (census range)
     static const float         MINT_FIGHT_DIST; // attack once the mint is this close
+    static const float         CLOSE_DIST;  // where the aggro squad lands, beside the peer
+    static const float         HOSTILE_REL; // relation written both ways for the aggro squad
     static const float         TRAVEL_SPEED_MULT; // game-speed vote while travelling
 
     unsigned long assaultAtMs() const { return mint_ ? MINT_ASSAULT_AT_MS : ASSAULT_AT_MS; }
@@ -1912,10 +1945,44 @@ private:
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 
+    // Teleport the squad onto the peer's leader. The mint has already happened
+    // by now (that is what the far park bought), so this only decides where the
+    // fragile-identity body ends up standing.
+    void closeFarSquad(const ScenarioContext& ctx) {
+        closed_ = true;
+        float tx = ax_, ty = ay_, tz = az_;
+        if (havePeer_) {
+            Character* pc = engine::resolveCharByHand(peerHand_[3], peerHand_[4],
+                                                      peerHand_[0], peerHand_[1],
+                                                      peerHand_[2]);
+            float x = 0, y = 0, z = 0;
+            if (pc && engine::readPos(pc, &x, &y, &z)) { tx = x; ty = y; tz = z; }
+        }
+        unsigned int moved = 0;
+        for (unsigned int i = 0; i < nFar_; ++i) {
+            Character* c = farChar(i);
+            if (!c) continue;
+            engine::park(c, tx + CLOSE_DIST + (float)i * 3.0f, ty, tz, 0.0f);
+            ++moved;
+        }
+        char b[176]; _snprintf(b, sizeof(b) - 1,
+            "SCENARIO TRAVELFIGHT enemy closed n=%u at=%.0f,%.0f dist=%.0f",
+            moved, tx, tz, CLOSE_DIST);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
     // HOST: the enemy squad, parked out at census range so the join must mint it.
     void spawnFarSquad(const ScenarioContext& ctx) {
         spawned_ = true;
-        nFar_ = engine::spawnRuntimeSquad(ctx.gw, FAR_N, farHands_);
+        if (aggro_) {
+            // Hostile AND still thinking. spawnRuntimeSquad's detach is what
+            // makes its bodies inert (run 20260805_232126: three of them held
+            // their park coordinates for 76 s, ignoring every march order), and
+            // an inert enemy can neither approach nor pick a fight.
+            nFar_ = engine::spawnHostileSquad(ctx.gw, FAR_N, HOSTILE_REL, farHands_);
+        } else {
+            nFar_ = engine::spawnRuntimeSquad(ctx.gw, FAR_N, farHands_);
+        }
         unsigned int parked = 0;
         for (unsigned int i = 0; i < nFar_; ++i) {
             Character* c = farChar(i);
@@ -2023,6 +2090,7 @@ private:
     static const float MAX_STEP; // per-sample step treated as real movement
 
     const bool    mint_;
+    const bool    aggro_;
     unsigned long lastLogMs_;
     unsigned long lastOrderMs_;
     unsigned long lastWalkMs_;
@@ -2034,6 +2102,7 @@ private:
     bool          pickFailLogged_;
     bool          outbound_;
     bool          spawned_;
+    bool          closed_;
     bool          spedUp_;
     bool          hold_;
     unsigned long lastPickMs_;
@@ -2061,6 +2130,10 @@ const float AssaultTravelScenario::MAX_STEP    = 150.0f;
 // is the path the field session took.
 const float AssaultTravelScenario::MINT_DIST   = 450.0f;
 const float AssaultTravelScenario::MINT_FIGHT_DIST = 60.0f;
+// Inside any plausible aggro radius, outside each other's collision.
+const float AssaultTravelScenario::CLOSE_DIST  = 12.0f;
+// -100 is the engine's own "at war" end of the relation table.
+const float AssaultTravelScenario::HOSTILE_REL = -100.0f;
 const float AssaultTravelScenario::TRAVEL_SPEED_MULT = 5.0f;
 
 } // namespace
@@ -2073,6 +2146,7 @@ Scenario* makeCombatScenario(const std::string& name) {
     if (name == "assault_town") return new AssaultTownScenario();
     if (name == "assault_travel") return new AssaultTravelScenario("assault_travel", false);
     if (name == "assault_mint")   return new AssaultTravelScenario("assault_mint", true);
+    if (name == "mint_aggro")     return new AssaultTravelScenario("mint_aggro", true, true);
     if (name == "player_ko")    return new PlayerKoScenario();
     if (name == "combat_crowd") return new CombatCrowdScenario();
     if (name == "combat_battle") return new CombatBattleScenario();

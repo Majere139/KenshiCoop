@@ -1033,6 +1033,7 @@ private:
     unsigned long             censusFreshChkMs_; // join: when we last sampled it
     unsigned long             censusStaleMs_;    // join: cumulative stale time
     unsigned long             censusStaleEdges_; // join: fresh -> stale transitions
+    unsigned long             proxyDriftLogMs_;  // join: last [proxy] drift sample sweep
     // Phase 2 mid-band streaming tier (HOST): census-walk NPCs OUTSIDE the
     // ~200/260 u stream bubble, nearest-first, refreshed at the 1 Hz census
     // cadence. publishOwned round-robins a small slice of them through the
@@ -1058,6 +1059,8 @@ private:
     // censusParkDist_ back onto the host's spot (0 disables).
     struct CensusPos { float x, y, z; };
     std::map<Key, CensusPos>  censusPos_;     // join: host pos per census row
+    std::map<Key, CensusPos>  proxyDriftPrev_; // join: census pos at the last [proxy]
+                                              //   drift sweep (owner-motion estimate)
     float                     censusParkDist_;
     unsigned long             censusParks_;   // join: divergence-park count
     std::map<Key, unsigned long> parkMs_;     // join: per-key park cooldown
@@ -2080,6 +2083,13 @@ private:
     // census position, or -1 if unknown (no census row / parking disabled) -
     // the census-band AI-freeze uses it to decide when a body is diverging.
     float parkDivergedCopy(Character* c, const EntityState& st, const Key& k);
+    // The same reconciliation for a MINTED PROXY, whose census row is keyed by
+    // the stream key that minted it rather than by its local hand. Both
+    // authority passes exempt proxies from existence judgment; without this
+    // they were exempt from position correction as well, and a proxy the host
+    // has stopped streaming answers to nothing at all.
+    void reconcileProxy(Character* c, const EntityState& st,
+                        const std::map<Character*, Key>& keyOf);
     // Phase C capability veto: filter an interest-anchor set down to the
     // anchors this client can actually speak for. An anchor whose zone the
     // LOCAL engine has not loaded (or is still streaming in) is dropped, so

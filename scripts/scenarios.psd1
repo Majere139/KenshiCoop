@@ -473,11 +473,42 @@
         # exactly this way, and 47% of that session's combat orders came back r=1
         # ("the victim hand does not resolve here"), so link 0 of the oracle
         # asserts the mint really happened before judging the fight.
+        # Gated on proxy_drift, with the fight parity kept as a FINDING. The join
+        # ORDERS this attack, and a join melee on a host-owned NPC is deliberately
+        # damage-guarded - it reports the damage it would have dealt and the host
+        # applies it, holding its own copy at peace for position parity (protocol
+        # 45). So "the join is fighting and the host is not" is this scenario's
+        # design, not its defect: the fraction sat at 0.23-0.39 across five runs
+        # spanning three different builds, drifting across the 0.25 line without
+        # tracking any change. What must hold here is the same thing that must
+        # hold everywhere - the minted body stands where its owner has it.
         assault_mint = @{
             Save = 'sync'; Setup = ''; Tolerance = 18.0
-            PrimaryGate = 'assault_mint'
-            Gating   = @('assault_mint', 'clock_sync')
-            Advisory = @('smoothness', 'anim_truth', 'march', 'combat_snap_rate', 'lifecycle', 'mint_dist')
+            PrimaryGate = 'proxy_drift'
+            Gating   = @('proxy_drift', 'clock_sync')
+            Advisory = @('assault_mint', 'smoothness', 'anim_truth', 'march', 'combat_snap_rate', 'lifecycle', 'mint_dist')
+            Tier = 'full'; WanVariant = $false
+        }
+        # mint_aggro: the UNPROVOKED half of the same report, and the half that
+        # assault_mint cannot show. There the join orders the attack, which makes
+        # the enemy's answer player-authored - architecturally pc_assault, where a
+        # cosmetic join-side fight against a peaceful host copy is by design. Here
+        # nothing of ours touches it: the host spawns a squad that is hostile and
+        # still has its AI (spawnRuntimeSquad's detach leaves bodies inert), the
+        # join mints it from the census, the host sets it down beside the join's
+        # characters, and the fight is the enemy's to start. Whoever does not own
+        # that body must not be running a fight for it.
+        # The GATE here is proxy_drift, not the fight parity. Whether a given
+        # sample catches both copies mid-swing is a sampling race - measured
+        # across four runs the fight-parity fraction swung from 0.045 to 0.354
+        # in both directions with no code change - whereas the distance between
+        # a proxy and the body it stands for either stays bounded or does not.
+        # Parity stays on as a finding because it is what the player SEES.
+        mint_aggro = @{
+            Save = 'sync'; Setup = ''; Tolerance = 18.0
+            PrimaryGate = 'proxy_drift'
+            Gating   = @('proxy_drift', 'clock_sync')
+            Advisory = @('mint_aggro', 'smoothness', 'anim_truth', 'march', 'combat_snap_rate', 'lifecycle', 'mint_dist')
             Tier = 'full'; WanVariant = $false
         }
         # player_ko: players as VICTIMS both directions - scaffold KO + revive on
