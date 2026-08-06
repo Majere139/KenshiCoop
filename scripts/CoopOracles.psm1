@@ -168,6 +168,8 @@ function Invoke-OneOracle {
         "damage_guard"  { return (Test-DamageGuard     -HostFile $HostLog -JoinFile $JoinLog) }
         "player_combat" { return (Test-PlayerCombat    -HostFile $HostLog -JoinFile $JoinLog) }
         "assault_town"  { return (Test-AssaultTown     -HostFile $HostLog -JoinFile $JoinLog) }
+        "assault_travel" { return (Test-AssaultTravel  -HostFile $HostLog -JoinFile $JoinLog) }
+        "assault_mint"  { return (Test-AssaultTravel  -HostFile $HostLog -JoinFile $JoinLog -GateName 'assault_mint' -RequireMint) }
         "pc_assault"    { return (Test-PcAssault       -HostFile $HostLog -JoinFile $JoinLog) }
         "player_ko"     { return (Test-PlayerKo        -HostFile $HostLog -JoinFile $JoinLog) }
         "medic_order"   { return (Test-MedicOrder      -HostFile $HostLog -JoinFile $JoinLog) }

@@ -531,6 +531,44 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
     }
 }
 
+bool Replicator::pickMintedProxyNear(GameWorld* gw, const unsigned int refHand[5],
+                                     unsigned int outLocal[5],
+                                     unsigned int outCanon[5],
+                                     float* outDist) const {
+    if (!gw || !refHand || !outLocal || proxyByKey_.empty()) return false;
+    Character* ref = engine::resolveCharByHand(refHand[3], refHand[4], refHand[0],
+                                               refHand[1], refHand[2]);
+    float rx = 0, ry = 0, rz = 0;
+    if (!ref || !engine::readPos(ref, &rx, &ry, &rz)) return false;
+    const Key* bestKey = 0;
+    Character* bestChar = 0;
+    float bestD2 = 0.0f;
+    for (std::map<Key, Character*>::const_iterator it = proxyByKey_.begin();
+         it != proxyByKey_.end(); ++it) {
+        float x = 0, y = 0, z = 0;
+        if (!it->second || !engine::readPos(it->second, &x, &y, &z)) continue;
+        float dx = x - rx, dz = z - rz;
+        float d2 = dx * dx + dz * dz;
+        if (!bestKey || d2 < bestD2) {
+            bestKey = &it->first; bestChar = it->second; bestD2 = d2;
+        }
+    }
+    if (!bestKey) return false;
+    // The LOCAL hand is the one that can be acted on here. A proxy's map key is
+    // the PEER's hand, which by definition does not resolve in this client's
+    // object table - resolving the key is what silently sank the first cut of
+    // assault_mint's victim pick (run 20260805_230032: three proxies bound, not
+    // one attack ordered).
+    if (!engine::readObjectHand(reinterpret_cast<RootObject*>(bestChar), outLocal))
+        return false;
+    if (outCanon) {
+        outCanon[0] = bestKey->t; outCanon[1] = bestKey->c; outCanon[2] = bestKey->cs;
+        outCanon[3] = bestKey->i; outCanon[4] = bestKey->s;
+    }
+    if (outDist) *outDist = (float)sqrt((double)bestD2);
+    return true;
+}
+
 void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
     std::deque<InboundEvent> got;
     in.drainEvents(got);

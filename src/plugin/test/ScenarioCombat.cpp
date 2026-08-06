@@ -1,6 +1,6 @@
 // ScenarioCombat.cpp - combat scenarios (monolith split from Scenario.cpp,
 // 2026-07-12): combat_probe, combat_order, combat_kill, player_combat,
-// assault_town, player_ko, combat_crowd. Classes are TU-private (anonymous
+// assault_town, assault_travel, player_ko, combat_crowd. Classes are TU-private (anonymous
 // namespace); only makeCombatScenario (ScenarioSupport.h) is exported.
 // Must NOT: change any SCENARIO log string (oracle API, resources/CODE_MAP.md).
 
@@ -1604,6 +1604,465 @@ private:
     unsigned int  vic_[5];
 };
 
+// assault_travel (2026-08-05 free-play report: "an enemy was attacking my
+// character on the join client, but not the host", hit after travelling a long
+// distance). assault_town already proves a join-picked fight crosses while both
+// squads STAND STILL; the field session's one different ingredient was MOTION -
+// the pair was sprinting when the bandit engaged, and the paired logs show the
+// fight running on the join for 22 s while the host's copy took the order (r=2)
+// and never engaged (localFight=0 through five forced re-issues, the two worlds'
+// copies drifting 31 -> 60 u apart). So this scenario is assault_town PLUS a
+// travel leg: the join picks a bar NPC, attacks it, and then BOTH sides walk
+// their OWN tab on a long ping-pong leg so the whole fight happens under drift.
+//
+// Script (join): t=10s pick victim + attack (2.5 s keep-alive; orderAttackByHand
+//                no-ops while already fighting). t=14s start travelling.
+// Script (host): no combat orders at all - the fight must cross as the join's
+//                streamed intent - only the same travel leg for its own tab.
+// Evidence (both sides): the 1 Hz attacker combat read ("...view fight=.. dist=..
+// moved=.."), COMBATSTATE for the attacker + its target, and the 1 Hz NPC entity
+// series (MEMBER on the host, RECV on the join) whose task= field is each
+// client's OWN truth about whether a body is fighting - that series is what lets
+// Test-AssaultTravel measure the reported asymmetry per hand, including for a
+// victim the host's own pick would skip once it is in combat.
+// assault_mint is the same script with ONE substitution, and it is the closer
+// reproduction: the victim is a body the join never had at load. In the field
+// session the bandit arrived as a runtime spawn the join had no local copy of
+// ("[spawn] census-missing ... (no local body)"), minted a proxy for six seconds
+// before the fight, and then fought it under a rewritten local container - and
+// 47% of that session's combat orders came back r=1, "the victim hand does not
+// resolve here". So the host spawns the enemy squad out at census range, the
+// join mints it, walks off its travel leg to meet it and attacks the proxy -
+// the whole approach at mult=5, which is the speed the field session ran at and
+// the reason its two copies of the bandit ended up 213 u apart.
+class AssaultTravelScenario : public TimedScenario {
+public:
+    AssaultTravelScenario(const char* name, bool mintVictim)
+        : TimedScenario(name, 0), mint_(mintVictim), lastLogMs_(0), lastOrderMs_(0),
+          lastWalkMs_(0), lastNearMs_(0), haveOwn_(false), havePeer_(false),
+          haveVic_(false), issued_(false), pickFailLogged_(false), outbound_(true),
+          spawned_(false), spedUp_(false), hold_(false), lastPickMs_(0),
+          lastApproachMs_(0), nFar_(0),
+          haveAnchor_(false), ax_(0), ay_(0), az_(0),
+          havePrev_(false), px_(0), py_(0), pz_(0), moved_(0.0f) {}
+
+    virtual void onGameplay(const ScenarioContext& ctx) { latchLeaders(ctx); }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        latchLeaders(ctx);
+        Character* ld = engine::leader(ctx.gw);
+        if (ld && engine::readPos(ld, &ax_, &ay_, &az_)) haveAnchor_ = true;
+        char b[176]; _snprintf(b, sizeof(b) - 1,
+            "SCENARIO TRAVELFIGHT anchor=%.1f,%.1f,%.1f have=%d mint=%d",
+            ax_, ay_, az_, haveAnchor_ ? 1 : 0, mint_ ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!haveOwn_ || !havePeer_) latchLeaders(ctx);
+        accumulateTravel(ctx);
+
+        // HOST, mint variant only: spawn the enemy squad at census range and
+        // march it in, so the join has to MINT its copies (spawn_far's path)
+        // before it can fight one.
+        if (mint_ && ctx.isHost && haveAnchor_ && !spawned_ &&
+            ctx.elapsedMs >= SPAWN_AT_MS) {
+            spawnFarSquad(ctx);
+        }
+
+        // JOIN only: pick a victim near our own leader (falling back to the peer
+        // leader's crowd) and order the unprovoked attack. Nothing host-side.
+        if (!ctx.isHost && haveOwn_ && ctx.elapsedMs >= assaultAtMs()) {
+            if (!haveVic_ && (ctx.elapsedMs - lastPickMs_) >= pickEveryMs()) {
+                lastPickMs_ = ctx.elapsedMs;
+                lastOrderMs_ = ctx.elapsedMs;
+                if (mint_) {
+                    haveVic_ = pickMintedVictim(ctx);
+                } else {
+                    haveVic_ = engine::pickCombatVictim(ctx.gw, ownHand_, 0, vic_, 0);
+                    if (!haveVic_ && havePeer_)
+                        haveVic_ = engine::pickCombatVictim(ctx.gw, peerHand_, 0, vic_, 0);
+                    // A save-resident victim is streamed under the hand it
+                    // already has: local and canonical are the same body.
+                    if (haveVic_) for (int i = 0; i < 5; ++i) vicCanon_[i] = vic_[i];
+                }
+                if (!haveVic_ && !pickFailLogged_) {
+                    coop::logLine(mint_
+                        ? "SCENARIO TRAVELFIGHT pick FAILED (no minted body yet; retrying)"
+                        : "SCENARIO TRAVELFIGHT pick FAILED (no upright NPC; retrying)");
+                    pickFailLogged_ = true;
+                }
+            }
+            if (haveVic_ && (!issued_ || (ctx.elapsedMs - lastOrderMs_) >= ORDER_EVERY_MS)) {
+                lastOrderMs_ = ctx.elapsedMs;
+                bool ok = engine::orderAttackByHand(ctx.gw, ownHand_, vic_);
+                if (!issued_) {
+                    // vic= is the CANONICAL hand (what the peer streams the body
+                    // by, so what pairs across the two logs); local= is the hand
+                    // the order actually went to, which for a mint is different.
+                    char b[192]; _snprintf(b, sizeof(b) - 1,
+                        "SCENARIO TRAVELFIGHT issued atk=%u,%u vic=%u,%u local=%u,%u ok=%d",
+                        ownHand_[3], ownHand_[4], vicCanon_[3], vicCanon_[4],
+                        vic_[3], vic_[4], ok ? 1 : 0);
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    issued_ = true;
+                }
+            }
+        }
+
+        // The travel was at 5x. The field session ran the whole approach at
+        // mult=5 ([speed] SET mult=5.00 either side) - that is why the pair
+        // covered ~5200 u in 13 s, why the two copies of the bandit ended up
+        // 213 u apart, and it is the ingredient a walking test cannot supply.
+        // Both sides vote for it; the consensus channel (and its own clamp when
+        // a fight starts) is part of what is under test here.
+        if (mint_ && !spedUp_ && ctx.elapsedMs >= TRAVEL_AT_MS) {
+            spedUp_ = true;
+            bool ok = engine::writeGameSpeed(ctx.gw, TRAVEL_SPEED_MULT, false);
+            char b[128]; _snprintf(b, sizeof(b) - 1,
+                "SCENARIO TRAVELFIGHT speed request mult=%.1f ok=%d",
+                TRAVEL_SPEED_MULT, ok ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+
+        // Travel. Each side walks only its OWN tab leader (never the peer's - a
+        // driven copy is the peer's to author), ping-ponging between the arm
+        // anchor and a point LEG_DIST out so the fight never stops moving. In
+        // the mint variant the JOIN drops the leg as soon as it has a mint to
+        // walk at (hold_) or a fight to run (issued_) - either goal would fight
+        // the leg over the same body. Its travel is what it covers while the
+        // enemy is spawning and being minted, which is the field order of
+        // events: a long run, and then an enemy at the end of it.
+        if (haveAnchor_ && !(mint_ && !ctx.isHost && (issued_ || hold_)) &&
+            ctx.elapsedMs >= TRAVEL_AT_MS &&
+            (ctx.elapsedMs - lastWalkMs_) >= WALK_EVERY_MS) {
+            lastWalkMs_ = ctx.elapsedMs;
+            walkLeg(ctx);
+        }
+
+        // 1 Hz evidence, both sides.
+        if (ctx.elapsedMs - lastLogMs_ >= 1000 || lastLogMs_ == 0) {
+            lastLogMs_ = ctx.elapsedMs;
+            const unsigned int* atk = ctx.isHost ? peerHand_ : ownHand_;
+            bool haveAtk = ctx.isHost ? havePeer_ : haveOwn_;
+            if (haveAtk) {
+                engine::CombatRead cr;
+                bool fight = engine::readCombatByHand(atk, &cr) &&
+                             (cr.inCombat || cr.modeActive);
+                char b[192]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO TRAVELFIGHT %s fight=%d tgt=%u,%u wait=%d dist=%.0f moved=%.0f",
+                    ctx.isHost ? "hostview" : "joinview",
+                    fight ? 1 : 0,
+                    cr.hasTarget ? cr.target[3] : 0,
+                    cr.hasTarget ? cr.target[4] : 0,
+                    cr.waiting ? 1 : 0, anchorDist(ctx), moved_);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                logCombatStateLine(atk, ctx.elapsedMs);
+                if (cr.hasTarget) logCombatStateLine(cr.target, ctx.elapsedMs);
+            }
+            if (!ctx.isHost && haveVic_) logCombatStateLine(vic_, ctx.elapsedMs);
+            // The ENEMY's fight state, keyed by the hand BOTH clients know it
+            // by. A minted body's local hand differs per client, so the broad
+            // MEMBER/RECV pairing below cannot see it - and the enemy's state is
+            // the whole report ("attacking me on the join, not on the host").
+            // The host publishes every enemy it spawned; the join publishes the
+            // one it is fighting, under the same canonical key.
+            if (mint_) {
+                if (ctx.isHost) {
+                    for (unsigned int i = 0; i < nFar_; ++i) logEnemyState(farHands_[i], farHands_[i]);
+                } else if (haveVic_) {
+                    logEnemyState(vic_, vicCanon_);
+                }
+            }
+            // The per-hand fight truth of every nearby NPC on THIS client. The
+            // task field carries it, and unlike a victim re-pick this series
+            // keeps reporting a body once it is fighting - the only way the
+            // oracle can pair the victim's state across the two logs when the
+            // host's copy never engaged.
+            EntityState npcs[MAX_LOG];
+            unsigned int n = engine::captureNpcs(ctx.gw, npcs, MAX_LOG);
+            const char* kind = ctx.isHost ? "MEMBER" : "RECV";
+            for (unsigned int i = 0; i < n; ++i) logScenarioEntity(kind, npcs[i]);
+        }
+
+        unsigned long dur = ctx.isHost
+            ? (mint_ ? MINT_HOST_DURATION_MS : HOST_DURATION_MS)
+            : (mint_ ? MINT_JOIN_DURATION_MS : JOIN_DURATION_MS);
+        if (ctx.elapsedMs >= dur) {
+            // Script-ran verdict only: the assault was issued (join) / the peer
+            // leader latched (host), and the travel leg actually moved. The
+            // cross-client judgement is Test-AssaultTravel's.
+            bool travelled = moved_ >= MIN_TRAVEL;
+            passed_ = travelled && (ctx.isHost ? havePeer_ : (issued_ && haveVic_));
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "SCENARIO TRAVELFIGHT done moved=%.0f travelled=%d issued=%d vic=%d peer=%d",
+                moved_, travelled ? 1 : 0, issued_ ? 1 : 0,
+                haveVic_ ? 1 : 0, havePeer_ ? 1 : 0);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            return true;
+        }
+        return false;
+    }
+
+private:
+    static const unsigned long ASSAULT_AT_MS    = 10000;
+    // Mint variant: the enemy has to be spawned, censused, requested and minted
+    // before there is anything to attack, so the assault waits longer.
+    static const unsigned long MINT_ASSAULT_AT_MS = 18000;
+    static const unsigned long SPAWN_AT_MS      = 8000;
+    static const unsigned long TRAVEL_AT_MS     = 14000;
+    static const unsigned long ORDER_EVERY_MS   = 2500;
+    static const unsigned long MINT_PICK_EVERY_MS = 750;
+    static const unsigned long APPROACH_EVERY_MS  = 4000;
+    static const unsigned long WALK_EVERY_MS    = 4000;
+    // The mint variant needs the enemy to spawn, be censused, minted and then
+    // walk in before a fight can even start, so its window is spawn_far-sized
+    // (85 s host, inside the harness's 90 s kill grace from the capture mark).
+    static const unsigned long HOST_DURATION_MS = 66000;
+    static const unsigned long JOIN_DURATION_MS = 58000;
+    static const unsigned long MINT_HOST_DURATION_MS = 85000;
+    static const unsigned long MINT_JOIN_DURATION_MS = 76000;
+    static const unsigned int  MAX_LOG          = 40;
+    static const unsigned int  FAR_N            = 3;
+    static const float         LEG_DIST;    // ping-pong leg length (units)
+    static const float         ARRIVE_DIST; // turn around inside this
+    static const float         WALK_SPEED;  // commanded travel pace (u/s)
+    static const float         MIN_TRAVEL;  // path length that counts as travel
+    static const float         MINT_DIST;   // enemy park distance (census range)
+    static const float         MINT_FIGHT_DIST; // attack once the mint is this close
+    static const float         TRAVEL_SPEED_MULT; // game-speed vote while travelling
+
+    unsigned long assaultAtMs() const { return mint_ ? MINT_ASSAULT_AT_MS : ASSAULT_AT_MS; }
+    // At mult=5 a 2.5 s gap between victim polls is 12.5 s of game time - long
+    // enough for the enemy to walk in, reach us and wander back out unseen.
+    unsigned long pickEveryMs() const { return mint_ ? MINT_PICK_EVERY_MS : ORDER_EVERY_MS; }
+
+    // JOIN: the nearest body the replicator MINTED for us. The first cut of this
+    // asked "which NPC was absent from the arm-time census", which picked a bar
+    // resident that had merely wandered into range (run 20260805_224826: the join
+    // minted 3 proxies at ~460 u and fought none of them), so the proxy table is
+    // the only acceptable answer.
+    bool pickMintedVictim(const ScenarioContext& ctx) {
+        if (!ctx.pickMintedProxy || !haveOwn_) return false;
+        unsigned int local[5], canon[5];
+        float d = 0.0f;
+        if (!ctx.pickMintedProxy(ownHand_, local, canon, &d)) return false;
+        // Wait for it to ARRIVE. A proxy minted at census range is still hidden
+        // on this client, so an attack order aimed at it does nothing at all
+        // (run 20260805_225447: minted=1, cap=0, the PC never even moved). The
+        // field fight started when the bandit reached the players, ~11 s after
+        // the mint - the mint is what makes the body's identity fragile, the
+        // arrival is what makes a fight possible.
+        // Go to it. The enemy squad cannot come to us: a runtime spawn is
+        // detached from town AI and a CharMovement destination on one of those
+        // bodies does nothing at all (run 20260805_232126: all three enemies
+        // held their exact park coordinates, task=65535 idle=1, for the full 76
+        // s while the host re-issued the march every 5 s). So once a mint
+        // exists the join stops its ping-pong leg and walks AT the proxy - the
+        // travel is already banked by then, moved_ is in the thousands.
+        if (d > MINT_FIGHT_DIST) {
+            approachMint(ctx, local, d);
+            if ((ctx.elapsedMs - lastNearMs_) >= 5000) {
+                lastNearMs_ = ctx.elapsedMs;
+                char b[176]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO TRAVELFIGHT minted nearest local=%u,%u canon=%u,%u dist=%.0f (closing to %.0f)",
+                    local[3], local[4], canon[3], canon[4], d, MINT_FIGHT_DIST);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            return false;
+        }
+        for (int i = 0; i < 5; ++i) { vic_[i] = local[i]; vicCanon_[i] = canon[i]; }
+        char b[192]; _snprintf(b, sizeof(b) - 1,
+            "SCENARIO TRAVELFIGHT minted victim local=%u,%u canon=%u,%u dist=%.0f",
+            vic_[3], vic_[4], vicCanon_[3], vicCanon_[4], d);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        return true;
+    }
+
+    // JOIN: walk our leader at the minted proxy, reading the proxy through the
+    // hand that resolves HERE. hold_ takes the ping-pong leg out of the way for
+    // good - the two walk orders would otherwise fight over the same body.
+    void approachMint(const ScenarioContext& ctx, const unsigned int local[5], float d) {
+        Character* me = ownLeader(ctx);
+        Character* en = engine::resolveCharByHand(local[3], local[4], local[0],
+                                                  local[1], local[2]);
+        float x = 0, y = 0, z = 0;
+        if (!me || !en || !engine::readPos(en, &x, &y, &z)) return;
+        if (!hold_) {
+            hold_ = true;
+            char h[160]; _snprintf(h, sizeof(h) - 1,
+                "SCENARIO TRAVELFIGHT approach mint dist=%.0f moved=%.0f", d, moved_);
+            h[sizeof(h) - 1] = '\0'; coop::logLine(h);
+        }
+        // Slow cadence. The distance poll runs at 750 ms so the fight can start
+        // the moment we arrive, but a walk order re-issued that often just
+        // restarts the path every time and the body never leaves the spot (run
+        // 20260805_233024: moved_ froze at 1030 and the mint stayed at 450 u).
+        if (lastApproachMs_ != 0 &&
+            (ctx.elapsedMs - lastApproachMs_) < APPROACH_EVERY_MS) return;
+        lastApproachMs_ = ctx.elapsedMs;
+        // Walk to the proxy's GROUND, not its reported y: the enemies park on a
+        // rise ~49 u above the travel plane and a destination up in the air is
+        // not a place the pathfinder will take a player body (run
+        // 20260805_233514: eleven orders, the leader never left the leg end).
+        bool ok = engine::walkTo(me, x, ay_, z, WALK_SPEED);
+        char b[176]; _snprintf(b, sizeof(b) - 1,
+            "SCENARIO TRAVELFIGHT approach order dst=%.0f,%.0f mintY=%.0f d=%.0f ok=%d",
+            x, z, y, d, ok ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // HOST: the enemy squad, parked out at census range so the join must mint it.
+    void spawnFarSquad(const ScenarioContext& ctx) {
+        spawned_ = true;
+        nFar_ = engine::spawnRuntimeSquad(ctx.gw, FAR_N, farHands_);
+        unsigned int parked = 0;
+        for (unsigned int i = 0; i < nFar_; ++i) {
+            Character* c = farChar(i);
+            if (!c) continue;
+            engine::park(c, ax_ + MINT_DIST + (float)i * 4.0f, ay_, az_, 0.0f);
+            ++parked;
+        }
+        char b[160]; _snprintf(b, sizeof(b) - 1,
+            "SCENARIO TRAVELFIGHT enemy spawned n=%u parked=%u dist=%.0f",
+            nFar_, parked, MINT_DIST);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // One enemy fight-state sample, read through the hand that resolves HERE and
+    // reported under the hand both clients share.
+    void logEnemyState(const unsigned int localHand[5], const unsigned int canonHand[5]) {
+        engine::CombatRead cr;
+        bool ok = engine::readCombatByHand(localHand, &cr);
+        bool fight = ok && (cr.inCombat || cr.modeActive);
+        char b[176]; _snprintf(b, sizeof(b) - 1,
+            "SCENARIO TRAVELFIGHT enemystate canon=%u,%u fight=%d read=%d tgt=%u,%u",
+            canonHand[3], canonHand[4], fight ? 1 : 0, ok ? 1 : 0,
+            (ok && cr.hasTarget) ? cr.target[3] : 0,
+            (ok && cr.hasTarget) ? cr.target[4] : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    Character* farChar(unsigned int i) {
+        return engine::resolveCharByHand(farHands_[i][3], farHands_[i][4],
+                                         farHands_[i][0], farHands_[i][1],
+                                         farHands_[i][2]);
+    }
+
+    void latchLeaders(const ScenarioContext& ctx) {
+        const unsigned int ownRank = ctx.isHost ? 0u : 1u;
+        EntityState sq[MAX_LOG];
+        unsigned int n = engine::captureSquad(ctx.gw, false, sq, MAX_LOG);
+        if (!haveOwn_) {
+            int idx = tabLeaderIdx(sq, n, ownRank);
+            if (idx >= 0) {
+                handFromEntity(sq[idx], ownHand_);
+                haveOwn_ = true;
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO TRAVELFIGHT own rank=%u hand=%u,%u",
+                    ownRank, ownHand_[3], ownHand_[4]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+        if (!havePeer_) {
+            int idx = tabLeaderIdx(sq, n, ownRank == 0u ? 1u : 0u);
+            if (idx >= 0) {
+                handFromEntity(sq[idx], peerHand_);
+                havePeer_ = true;
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "SCENARIO TRAVELFIGHT peer hand=%u,%u",
+                    peerHand_[3], peerHand_[4]);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+    }
+
+    // Cumulative path length of our OWN leader: the witness that the fight
+    // really happened while moving (a straight-line anchor distance would read
+    // zero at the ping-pong turn).
+    void accumulateTravel(const ScenarioContext& ctx) {
+        Character* c = ownLeader(ctx);
+        float x = 0, y = 0, z = 0;
+        if (!c || !engine::readPos(c, &x, &y, &z)) return;
+        if (havePrev_) {
+            float dx = x - px_, dz = z - pz_;
+            float step = (float)sqrt((double)(dx * dx + dz * dz));
+            if (step < MAX_STEP) moved_ += step; // ignore teleports/snaps
+        }
+        px_ = x; py_ = y; pz_ = z; havePrev_ = true;
+    }
+
+    void walkLeg(const ScenarioContext& ctx) {
+        Character* c = ownLeader(ctx);
+        if (!c) return;
+        float x = 0, y = 0, z = 0;
+        if (!engine::readPos(c, &x, &y, &z)) return;
+        float tx = outbound_ ? (ax_ + LEG_DIST) : ax_;
+        float dx = x - tx, dz = z - az_;
+        if (dx * dx + dz * dz <= ARRIVE_DIST * ARRIVE_DIST) {
+            outbound_ = !outbound_;
+            tx = outbound_ ? (ax_ + LEG_DIST) : ax_;
+        }
+        engine::walkTo(c, tx, ay_, az_, WALK_SPEED);
+    }
+
+    Character* ownLeader(const ScenarioContext& ctx) {
+        if (!haveOwn_) return engine::leader(ctx.gw);
+        return engine::resolveCharByHand(ownHand_[3], ownHand_[4], ownHand_[0],
+                                         ownHand_[1], ownHand_[2]);
+    }
+
+    float anchorDist(const ScenarioContext& ctx) {
+        Character* c = ownLeader(ctx);
+        float x = 0, y = 0, z = 0;
+        if (!c || !engine::readPos(c, &x, &y, &z)) return -1.0f;
+        float dx = x - ax_, dz = z - az_;
+        return (float)sqrt((double)(dx * dx + dz * dz));
+    }
+
+    static const float MAX_STEP; // per-sample step treated as real movement
+
+    const bool    mint_;
+    unsigned long lastLogMs_;
+    unsigned long lastOrderMs_;
+    unsigned long lastWalkMs_;
+    unsigned long lastNearMs_;
+    bool          haveOwn_;
+    bool          havePeer_;
+    bool          haveVic_;
+    bool          issued_;
+    bool          pickFailLogged_;
+    bool          outbound_;
+    bool          spawned_;
+    bool          spedUp_;
+    bool          hold_;
+    unsigned long lastPickMs_;
+    unsigned long lastApproachMs_;
+    unsigned int  nFar_;
+    unsigned int  farHands_[FAR_N][5];
+    bool          haveAnchor_;
+    float         ax_, ay_, az_;
+    bool          havePrev_;
+    float         px_, py_, pz_;
+    float         moved_;
+    unsigned int  ownHand_[5];
+    unsigned int  peerHand_[5];
+    unsigned int  vic_[5];      // the victim's hand HERE (what we order onto)
+    unsigned int  vicCanon_[5]; // the hand the peer streams that body by
+};
+
+const float AssaultTravelScenario::LEG_DIST    = 900.0f;
+const float AssaultTravelScenario::ARRIVE_DIST = 60.0f;
+const float AssaultTravelScenario::WALK_SPEED  = 18.0f;
+const float AssaultTravelScenario::MIN_TRAVEL  = 300.0f;
+const float AssaultTravelScenario::MAX_STEP    = 150.0f;
+// Inside the 600 u default mint radius (KENSHICOOP_SPAWN_MINT_RADIUS) and well
+// outside the ~200 u stream bubble: the join has to mint from the census, which
+// is the path the field session took.
+const float AssaultTravelScenario::MINT_DIST   = 450.0f;
+const float AssaultTravelScenario::MINT_FIGHT_DIST = 60.0f;
+const float AssaultTravelScenario::TRAVEL_SPEED_MULT = 5.0f;
+
 } // namespace
 
 Scenario* makeCombatScenario(const std::string& name) {
@@ -1612,6 +2071,8 @@ Scenario* makeCombatScenario(const std::string& name) {
     if (name == "combat_kill")  return new CombatKillScenario();
     if (name == "player_combat") return new PlayerCombatScenario();
     if (name == "assault_town") return new AssaultTownScenario();
+    if (name == "assault_travel") return new AssaultTravelScenario("assault_travel", false);
+    if (name == "assault_mint")   return new AssaultTravelScenario("assault_mint", true);
     if (name == "player_ko")    return new PlayerKoScenario();
     if (name == "combat_crowd") return new CombatCrowdScenario();
     if (name == "combat_battle") return new CombatBattleScenario();

@@ -96,6 +96,21 @@ public:
         return (ownHands_.find(k) != ownHands_.end()) ? 1 : 2;
     }
 
+    // Scenario support (assault_mint): the hand of the MINTED proxy nearest the
+    // body at refHand - a body this client had no local copy of and had to create
+    // from the peer's spawn INFO. Only the proxy table knows this; the arm-time
+    // NPC census cannot stand in for it, because a resident that wanders into
+    // range later is also "new" and picking one of those quietly turns the
+    // reproduction back into assault_town (measured, run 20260805_224826).
+    // outLocal is the hand that RESOLVES HERE (what an attack order needs);
+    // outCanon is the peer's key the body is streamed by (what the logs and the
+    // oracle pair on) - a proxy has both, and they are never the same. outDist
+    // is the planar distance to the reference body. Hands are readObjectHand
+    // layout [type,container,containerSerial,index,serial].
+    bool pickMintedProxyNear(GameWorld* gw, const unsigned int refHand[5],
+                             unsigned int outLocal[5], unsigned int outCanon[5],
+                             float* outDist) const;
+
     // AI-gating probe (join side): recruit diverged NPCs into the player squad to
     // validate the "inhabit" lever (stops self-tasking + becomes drivable).
     void setProbeRecruit(bool v) { probeRecruit_ = v; }

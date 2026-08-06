@@ -28,6 +28,15 @@ struct ScenarioContext {
     // any time-sensitive host action (e.g. a live spawn) that the join must witness.
     // Always false in HostOnly runs (no peer) - gate with a timeout fallback there.
     bool          peerReady;
+    // assault_mint: describes the MINTED proxy nearest the body at refHand -
+    // outLocal[5] is the hand that resolves on THIS client (what an order needs),
+    // outCanon[5] the peer's key it is streamed by, outDist the planar distance.
+    // Only the replicator's proxy table can answer this, and a scenario must not
+    // reach into the replicator, so Plugin.cpp supplies the adapter (0 when
+    // unavailable - always check).
+    bool        (*pickMintedProxy)(const unsigned int refHand[5],
+                                   unsigned int outLocal[5],
+                                   unsigned int outCanon[5], float* outDist);
 };
 
 class Scenario {

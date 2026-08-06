@@ -78,6 +78,17 @@ static int coopInvOwnerClass(const unsigned int h[5]) {
     return g_repl.ownerClassForHand(h);
 }
 
+// assault_mint's victim query (ScenarioContext::pickMintedProxy). Same shape and
+// same reason as the classifier above: the scenario layer must not know about the
+// Replicator, and only the Replicator knows which local bodies are mints.
+static bool coopScenarioPickMintedProxy(const unsigned int refHand[5],
+                                        unsigned int outLocal[5],
+                                        unsigned int outCanon[5],
+                                        float* outDist) {
+    if (!g_lastGw) return false;
+    return g_repl.pickMintedProxyNear(g_lastGw, refHand, outLocal, outCanon, outDist);
+}
+
 // SessionController (Phase 3): the mutable per-session lifecycle state that used
 // to live as ~18 loose file globals - peer presence, the gameplay-start edge,
 // the title auto-load gate, and the coordinated save/load (protocol 31/32)
@@ -1251,6 +1262,7 @@ void tickScenarioStart(GameWorld* gw) {
             pctx.gw = gw; pctx.isHost = g_cfg.isHost; pctx.localId = g_net.localId();
             pctx.elapsedMs = waitedMs; pctx.tick = g_scenarioTick;
             pctx.peerReady = peerReady;
+            pctx.pickMintedProxy = &coopScenarioPickMintedProxy;
             g_scenario->onGameplay(pctx);
         }
         if (peerReady || fallback) {
@@ -1260,6 +1272,7 @@ void tickScenarioStart(GameWorld* gw) {
             ctx.gw = gw; ctx.isHost = g_cfg.isHost; ctx.localId = g_net.localId();
             ctx.elapsedMs = 0; ctx.tick = g_scenarioTick;
             ctx.peerReady = peerReady;
+            ctx.pickMintedProxy = &coopScenarioPickMintedProxy;
             char m[200];
             _snprintf(m, sizeof(m) - 1, "SCENARIO arm trigger=%s waitedMs=%lu",
                       peerReady ? "peer-ready" : "timeout", (unsigned long)waitedMs);
@@ -1446,6 +1459,7 @@ void tickScenarioTick(GameWorld* gw) {
         ctx.elapsedMs = GetTickCount() - g_scenarioStartTick;
         ctx.tick = ++g_scenarioTick;
         ctx.peerReady = g_inbound.sawRemoteEntity();
+        ctx.pickMintedProxy = &coopScenarioPickMintedProxy;
         if (g_scenario->onTick(ctx)) {
             // Stage 2: the receiver emits its interpolation smoothness summary
             // alongside the verdict so the runner can assert per-frame gliding.

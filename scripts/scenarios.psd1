@@ -447,6 +447,39 @@
             Advisory = @('smoothness', 'anim_truth', 'march', 'lifecycle')
             Tier = 'full'; WanVariant = $false
         }
+        # assault_travel: assault_town's fight re-run while both squads TRAVEL -
+        # the ingredient behind the 2026-08-05 report ("an enemy was attacking my
+        # character on the join client, but not the host", after a long run). The
+        # paired logs of that session showed the join running a 22 s fight the
+        # host never staged: the host took the order (r=2) and its copy never
+        # engaged while the two worlds' copies drifted 31 -> 60 u apart. The
+        # oracle walks assault_town's chain AND gates per-hand fight parity, so a
+        # FAIL says whether the intent, the apply, the local fight or the
+        # symmetry is what broke. The host window is 66 s from arm, inside the
+        # default 150 s self-exit and 90 s kill grace, so no Seconds override.
+        assault_travel = @{
+            Save = 'sync'; Setup = ''; Tolerance = 18.0
+            PrimaryGate = 'assault_travel'
+            Gating   = @('assault_travel', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march', 'combat_snap_rate', 'lifecycle')
+            Tier = 'full'; WanVariant = $false
+        }
+        # assault_mint: the closer reproduction of the 2026-08-05 report. Same
+        # script as assault_travel, but the victim is a body the join never had
+        # at load - the host spawns the enemy squad at census range (450 u, inside
+        # the mint radius, outside the stream bubble), the join picks a victim
+        # absent from its own arm-time NPC census (so: a minted proxy) and the
+        # attack order's pathing runs its PC out to it. The field bandit arrived
+        # exactly this way, and 47% of that session's combat orders came back r=1
+        # ("the victim hand does not resolve here"), so link 0 of the oracle
+        # asserts the mint really happened before judging the fight.
+        assault_mint = @{
+            Save = 'sync'; Setup = ''; Tolerance = 18.0
+            PrimaryGate = 'assault_mint'
+            Gating   = @('assault_mint', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march', 'combat_snap_rate', 'lifecycle', 'mint_dist')
+            Tier = 'full'; WanVariant = $false
+        }
         # player_ko: players as VICTIMS both directions - scaffold KO + revive on
         # each side's OWN member; edges must cross as reliable EVT_KNOCKOUT/EVT_REVIVE
         # and the peer's driven copy must lie down / stand up.

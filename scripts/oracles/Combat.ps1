@@ -1,6 +1,7 @@
 # oracles/Combat.ps1 - combat oracles (monolith split of CoopOracles.psm1,
 # 2026-07-12): Test-CombatProbe/CombatOrder/CombatKill, Test-DamageGuard,
-# Test-PlayerCombat, Test-AssaultTown, Test-PlayerKo, Test-CombatCrowd.
+# Test-PlayerCombat, Test-AssaultTown, Test-AssaultTravel, Test-PlayerKo,
+# Test-CombatCrowd.
 # Dot-sourced by CoopOracles.psm1 (module scope).
 # Must NOT: change gate names or the "[combat]"/PCOMBAT/ASSAULT marker
 # regexes - they are the C++ log contract (resources/CODE_MAP.md).
@@ -319,6 +320,217 @@ function Test-AssaultTown {
     }
     Write-Host ("  ASSAULT-TOWN PASS - atk=$atk vic=$vic cap=$capAll (vic-match $capVic) host-orders=$ordOk (vic-match $ordVic) hostview-fight=$fight")
     return (Add-GateResult -Name "assault_town" -Status PASS -Metrics $m)
+}
+
+# assault_travel: assault_town's chain, re-run while both squads TRAVEL - the one
+# ingredient the 2026-08-05 free-play report added ("an enemy was attacking my
+# character on the join client, but not the host", after a long run). Links 1-4
+# are assault_town's; links 5-6 are the asymmetry the standing test cannot see:
+#   1. issued   - join ordered its leader onto a victim (scenario marker)
+#   2. travelled- the leg actually moved on BOTH sides (else the premise failed
+#                 and a PASS would mean nothing)
+#   3. cap      - the join streamed the combat intent ("[combat] CAP hand=<atk>")
+#   4. applied  - the host ordered its join-PC copy ("[combat] order ... r=2";
+#                 r=1 = the victim hand never resolved there)
+#   5. fight    - the host's local engine ran it ("hostview fight=1" samples)
+#   6. parity   - per NPC hand, how many 1 Hz samples show a body fighting on the
+#                 join while the host has it at peace. The field log's signature
+#                 was a 22 s one-sided fight, so this is the gate that names it.
+# Parity reads the MEMBER (host) / RECV (join) entity series, whose task= field is
+# each client's own truth, keyed on the hand's INDEX,SERIAL only: a body pulled
+# into a local runtime squad mid-fight keeps its index/serial but changes its hand
+# CONTAINER, and that rewrite is exactly what happens to a victim on the client
+# that is really fighting it.
+# assault_mint shares this oracle (-RequireMint adds link 0: the victim must be a
+# body the join MINTED, which is what makes the run a reproduction of the field
+# episode rather than a re-run of assault_town under motion).
+function Test-AssaultTravel {
+    param([string]$HostFile, [string]$JoinFile, [int]$MinFight = 3,
+          [int]$MinTravel = 300, [double]$MaxJoinOnlyFrac = 0.25, [int]$MinPairs = 8,
+          [string]$GateName = 'assault_travel', [switch]$RequireMint)
+    $label = $GateName.ToUpper().Replace('_', '-')
+    $mi = Select-String -Path $JoinFile -Pattern 'SCENARIO TRAVELFIGHT issued atk=(\d+),(\d+) vic=(\d+),(\d+)(?: local=\d+,\d+)? ok=(\d)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $mi) {
+        Write-Host "  $label FAIL - join never issued the assault (no victim pick?)"
+        return (Add-GateResult -Name $GateName -Status FAIL -Detail "no assault order (link 1)")
+    }
+    $atk = $mi.Matches[0].Groups[1].Value + ',' + $mi.Matches[0].Groups[2].Value
+    $vic = $mi.Matches[0].Groups[3].Value + ',' + $mi.Matches[0].Groups[4].Value
+
+    # 2. Travel: the largest path length either side reported.
+    $hostMoved = Get-TravelMoved -File $HostFile
+    $joinMoved = Get-TravelMoved -File $JoinFile
+
+    # 3/4. Intent crossing (same regexes as assault_town - one log contract).
+    $capAll  = @(Select-String -Path $JoinFile -Pattern ('\[combat\] CAP hand=' + $atk + ' ') -ErrorAction SilentlyContinue).Count
+    $ordOk   = @(Select-String -Path $HostFile -Pattern ('\[combat\] order hand=' + $atk + ' tgt=\d+,\d+ .*r=2') -ErrorAction SilentlyContinue).Count
+    $ordMiss = @(Select-String -Path $HostFile -Pattern ('\[combat\] order hand=' + $atk + ' tgt=\d+,\d+ .*r=1') -ErrorAction SilentlyContinue).Count
+
+    # 5. The host's own combat read of the driven join-PC copy.
+    $fight = @(Select-String -Path $HostFile -Pattern 'SCENARIO TRAVELFIGHT hostview fight=1' -ErrorAction SilentlyContinue).Count
+
+    # 6. Per-hand fight parity from the NPC entity series, and - when the victim
+    # is a mint, whose local hand differs per client - from the enemy-state
+    # series the scenario publishes under the shared canonical hand.
+    $par = Get-FightTaskParity -HostFile $HostFile -JoinFile $JoinFile
+    if ($RequireMint) {
+        $epar = Get-EnemyStateParity -HostFile $HostFile -JoinFile $JoinFile
+        if ($epar.pairs -gt 0) { $par = $epar }
+    }
+
+    # 0. Mint variant: the victim must be a body this join had to create locally.
+    $minted = @(Select-String -Path $JoinFile -Pattern ('\[spawn\] proxy BOUND hand=\d+,\d+,\d+,' + $vic + ' ') -ErrorAction SilentlyContinue).Count
+
+    $m = @{ atk = $atk; vic = $vic; hostMoved = $hostMoved; joinMoved = $joinMoved
+            cap = $capAll; ordered = $ordOk; orderMiss = $ordMiss; hostFight = $fight
+            minted = $minted
+            pairs = $par.pairs; agree = $par.agree
+            joinOnly = $par.joinOnly; joinOnlyFrac = $par.joinOnlyFrac
+            hostOnly = $par.hostOnly; worstHand = $par.worstHand
+            worstJoinOnly = $par.worstJoinOnly }
+    $bad = @()
+    if ($RequireMint -and $minted -lt 1) {
+        $bad += "the victim $vic was not a minted body on the join (no [spawn] proxy BOUND; link 0: the run did not reproduce the field setup)"
+    }
+    if ($hostMoved -lt $MinTravel -or $joinMoved -lt $MinTravel) {
+        $bad += "the travel leg never ran (host moved $hostMoved u, join moved $joinMoved u, need >= $MinTravel; link 2)"
+    }
+    if ($capAll -lt 1) { $bad += "join never streamed a combat intent for $atk (link 3: capture)" }
+    elseif ($ordOk -lt 1) {
+        if ($ordMiss -ge 1) { $bad += "host saw the intent but the victim hand never resolved there ($ordMiss r=1 orders; link 4: target resolve)" }
+        else                { $bad += "host never ordered the join-PC copy (link 4: apply)" }
+    }
+    if ($fight -lt $MinFight) { $bad += "host-side fight never ran (hostview fight=1 x$fight, need >= $MinFight; link 5)" }
+    if ($par.pairs -ge $MinPairs -and $par.joinOnlyFrac -gt $MaxJoinOnlyFrac) {
+        $worst = if ($par.worstHand) { " (worst hand $($par.worstHand), $($par.worstJoinOnly) samples)" } else { "" }
+        $bad += ("one-sided fighting: $($par.joinOnly)/$($par.pairs) paired samples ($($par.joinOnlyFrac)) " +
+                 "have a body fighting on the join while the host has it at peace" + $worst +
+                 "; link 6: parity")
+    }
+    if ($bad.Count -gt 0) {
+        Write-Host ("  $label FAIL - " + ($bad -join "; ") +
+                    " [moved h=$hostMoved j=$joinMoved minted=$minted cap=$capAll ord=$ordOk miss=$ordMiss fight=$fight " +
+                    "pairs=$($par.pairs) joinOnly=$($par.joinOnly) hostOnly=$($par.hostOnly)]")
+        return (Add-GateResult -Name $GateName -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    Write-Host ("  $label PASS - atk=$atk vic=$vic travelled h=$hostMoved j=$joinMoved u; " +
+                "minted=$minted cap=$capAll host-orders=$ordOk hostview-fight=$fight; " +
+                "fight parity $($par.agree)/$($par.pairs) agree (join-only $($par.joinOnly), host-only $($par.hostOnly))")
+    return (Add-GateResult -Name $GateName -Status PASS -Metrics $m)
+}
+
+# The largest "moved=<u>" the travel series reported in one log (cumulative path
+# length of that client's own leader, snap steps excluded by the scenario).
+function Get-TravelMoved {
+    param([string]$File)
+    $best = 0
+    foreach ($m in (Select-String -Path $File -Pattern 'SCENARIO TRAVELFIGHT \w+ .*moved=(\d+)' -ErrorAction SilentlyContinue)) {
+        $v = [int]$m.Matches[0].Groups[1].Value
+        if ($v -gt $best) { $best = $v }
+    }
+    return $best
+}
+
+# Pair the host's MEMBER series against the join's RECV series per NPC hand and
+# count the samples where the two clients disagree about whether that body is
+# FIGHTING (task 65024 melee / 65025 waiting-in-the-ring). Keyed on index,serial
+# so a mid-fight container rewrite still pairs. Returns counts + the worst hand.
+function Get-FightTaskParity {
+    param([string]$HostFile, [string]$JoinFile, [int]$TolMs = 1500)
+    $hostMap = Convert-ToFightSeries -Series (Get-ScenarioSeries -File $HostFile -Kind 'MEMBER')
+    $joinMap = Convert-ToFightSeries -Series (Get-ScenarioSeries -File $JoinFile -Kind 'RECV')
+    $pairs = 0; $agree = 0; $joinOnly = 0; $hostOnly = 0
+    $worstHand = ''; $worstJoinOnly = 0
+    foreach ($hand in $joinMap.Keys) {
+        if (-not $hostMap.ContainsKey($hand)) { continue }
+        $jSamples = @($joinMap[$hand] | Sort-Object t)
+        $hSamples = @($hostMap[$hand] | Sort-Object t)
+        $handJoinOnly = 0
+        foreach ($jr in $jSamples) {
+            $best = $null; $bd = [int]::MaxValue
+            foreach ($hr in $hSamples) {
+                $dd = [Math]::Abs([int]$hr.t - [int]$jr.t)
+                if ($dd -lt $bd) { $bd = $dd; $best = $hr }
+            }
+            if ($null -eq $best -or $bd -gt $TolMs) { continue }
+            $pairs++
+            if ($jr.fight -eq $best.fight) { $agree++ }
+            elseif ($jr.fight -eq 1) { $joinOnly++; $handJoinOnly++ }
+            else { $hostOnly++ }
+        }
+        if ($handJoinOnly -gt $worstJoinOnly) { $worstJoinOnly = $handJoinOnly; $worstHand = $hand }
+    }
+    $frac = if ($pairs -gt 0) { [Math]::Round($joinOnly / $pairs, 3) } else { 0 }
+    return [pscustomobject]@{
+        pairs = $pairs; agree = $agree; joinOnly = $joinOnly; hostOnly = $hostOnly
+        joinOnlyFrac = $frac; worstHand = $worstHand; worstJoinOnly = $worstJoinOnly
+    }
+}
+
+# The same disagreement count for the ENEMY specifically, from the scenario's
+# "enemystate canon=<i,s> fight=<0|1>" samples. Needed because a minted body has
+# a different LOCAL hand on each client, so the entity series cannot pair it -
+# and the enemy's own state is what the field report was about.
+function Get-EnemyStateParity {
+    param([string]$HostFile, [string]$JoinFile, [int]$TolMs = 1500)
+    $rx = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO TRAVELFIGHT enemystate canon=(\d+,\d+) fight=(\d)'
+    $hostMap = @{}; $joinMap = @{}
+    foreach ($pair in @(@($HostFile, $hostMap), @($JoinFile, $joinMap))) {
+        $file = $pair[0]; $map = $pair[1]
+        $off = Get-LogClockOffsetMs -File $file
+        foreach ($m in (Select-String -Path $file -Pattern $rx -ErrorAction SilentlyContinue)) {
+            $g = $m.Matches[0].Groups
+            $key = $g[5].Value
+            if (-not $map.ContainsKey($key)) { $map[$key] = New-Object System.Collections.ArrayList }
+            [void]$map[$key].Add([pscustomobject]@{
+                t = (Convert-StampToMs -Groups $g -OffsetMs $off); fight = [int]$g[6].Value })
+        }
+    }
+    $pairs = 0; $agree = 0; $joinOnly = 0; $hostOnly = 0
+    $worstHand = ''; $worstJoinOnly = 0
+    foreach ($hand in $joinMap.Keys) {
+        if (-not $hostMap.ContainsKey($hand)) { continue }
+        $jSamples = @($joinMap[$hand] | Sort-Object t)
+        $hSamples = @($hostMap[$hand] | Sort-Object t)
+        $handJoinOnly = 0
+        foreach ($jr in $jSamples) {
+            $best = $null; $bd = [int]::MaxValue
+            foreach ($hr in $hSamples) {
+                $dd = [Math]::Abs([int]$hr.t - [int]$jr.t)
+                if ($dd -lt $bd) { $bd = $dd; $best = $hr }
+            }
+            if ($null -eq $best -or $bd -gt $TolMs) { continue }
+            $pairs++
+            if ($jr.fight -eq $best.fight) { $agree++ }
+            elseif ($jr.fight -eq 1) { $joinOnly++; $handJoinOnly++ }
+            else { $hostOnly++ }
+        }
+        if ($handJoinOnly -gt $worstJoinOnly) { $worstJoinOnly = $handJoinOnly; $worstHand = $hand }
+    }
+    $frac = if ($pairs -gt 0) { [Math]::Round($joinOnly / $pairs, 3) } else { 0 }
+    return [pscustomobject]@{
+        pairs = $pairs; agree = $agree; joinOnly = $joinOnly; hostOnly = $hostOnly
+        joinOnlyFrac = $frac; worstHand = $worstHand; worstJoinOnly = $worstJoinOnly
+    }
+}
+
+# Reduce a Get-ScenarioSeries map (hand 'i,s,t,c,cs' -> samples with task) to
+# 'i,s' -> @{ t; fight }. 65024 = melee, 65025 = queued by the AttackSlotManager;
+# both are "this client has the body in a fight".
+function Convert-ToFightSeries {
+    param($Series)
+    $out = @{}
+    foreach ($full in $Series.Keys) {
+        $parts = $full.Split(',')
+        if ($parts.Count -lt 2) { continue }
+        $key = $parts[0] + ',' + $parts[1]
+        if (-not $out.ContainsKey($key)) { $out[$key] = New-Object System.Collections.ArrayList }
+        foreach ($s in $Series[$full]) {
+            $fight = if ($s.task -eq 65024 -or $s.task -eq 65025) { 1 } else { 0 }
+            [void]$out[$key].Add([pscustomobject]@{ t = [int]$s.t; fight = $fight })
+        }
+    }
+    return $out
 }
 
 # player_ko BIDIRECTIONAL: each side KOs then revives its OWN squad member; the
