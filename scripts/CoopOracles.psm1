@@ -156,6 +156,7 @@ function Invoke-OneOracle {
         "sneak_pose"    { return (Test-SneakPose       -HostFile $HostLog -JoinFile $JoinLog) }
         "sneak_detect"  { return (Test-SneakDetect     -HostFile $HostLog -JoinFile $JoinLog) }
         "body_state"    { return (Test-NpcBodyState    -HostFile $HostLog -JoinFile $JoinLog) }
+        "crawl_move"    { return (Test-CrawlMove       -HostFile $HostLog -JoinFile $JoinLog) }
         "craft_order"   { return (Test-CraftOrder      -HostFile $HostLog -JoinFile $JoinLog) }
         "down_order"    { return (Test-DownOrder       -HostFile $HostLog -JoinFile $JoinLog) }
         "death_order"   { return (Test-DeathOrder      -HostFile $HostLog -JoinFile $JoinLog) }
@@ -411,6 +412,7 @@ Export-ModuleMember -Function @(
     "Test-CombatSnapRate", "Test-CombatBattle", "Test-CombatWin", "Test-DeathParity",
     "Get-VitalsSeries", "Test-PlayerCombat", "Test-AssaultTown", "Test-PcAssault", "Get-CombatParity", "Test-PlayerKo", "Test-MedicOrder",
     "Test-MedicPose", "Test-LimbLoss", "Test-NpcVitals",
+    "Get-CrawlSeries", "Get-CrawlProbeSeries", "Test-CrawlMove",
     "Get-StatsSeries", "Test-StatsSync",
     "Get-CarrySeries", "Test-CarryOrder", "Test-NpcCarry",
     "Get-FurnSeries", "Test-FurnPut", "Test-ChainPut", "Test-PolePut", "Test-CagePeer",

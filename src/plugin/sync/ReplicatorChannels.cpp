@@ -20,7 +20,7 @@ namespace coop {
 // Protocol 16: covers the FULL anatomy (flesh+stun+bandage+juryRig per part)
 // plus the 4 LimbStates - a stun hit or a limb loss re-fingerprints too.
 static coop::u32 medicalHash(const engine::MedicalRead& m) {
-    long q[4 + 12 * 4 + 4 + 2];
+    long q[4 + 12 * 4 + 4 + 3];
     memset(q, 0, sizeof(q));
     q[0] = (long)(m.blood * 2.0f);
     q[1] = (long)(m.bleedRate * 20.0f);
@@ -31,6 +31,11 @@ static coop::u32 medicalHash(const engine::MedicalRead& m) {
     // 3 s safety resend - the fold-in adds no traffic).
     q[4 + 12 * 4 + 4 + 0] = (long)(m.hunger * 10.0f);
     q[4 + 12 * 4 + 4 + 1] = (long)(m.fed * 10.0f);
+    // Protocol 53: crippled must be IN the fingerprint or the cripple/heal
+    // transition is a change no send is triggered by - limb flesh moves with it
+    // in the usual case, but a jury-rig or a heal can flip the flag while the
+    // quantized part values stay in their buckets.
+    q[4 + 12 * 4 + 4 + 2] = m.crippled ? 1 : 0;
     unsigned int n = m.nParts; if (n > 12) n = 12;
     for (unsigned int i = 0; i < n; ++i) {
         const engine::MedPartRead& p = m.parts[i];
@@ -79,7 +84,8 @@ static void fillMedicalPacket(MedicalPacket& pkt, const unsigned int subj[5],
     pkt.bleedRate = mr.bleedRate;
     pkt.hunger    = mr.hunger; // -1 when not carried (hungerSync off)
     pkt.fed       = mr.fed;
-    pkt.flags = (mr.unconscious ? MED_UNCONSCIOUS : 0) | (mr.dead ? MED_DEAD : 0);
+    pkt.flags = (mr.unconscious ? MED_UNCONSCIOUS : 0) | (mr.dead ? MED_DEAD : 0) |
+                (mr.crippled ? MED_CRIPPLED : 0);
     unsigned int n = mr.nParts; if (n > MED_PARTS_MAX) n = MED_PARTS_MAX;
     pkt.nParts = (u8)n;
     for (unsigned int i = 0; i < n; ++i) {
@@ -259,6 +265,11 @@ void Replicator::applyMedical(GameWorld* gw, Inbound& in, NetLink& net, u32 owne
         }
         w.unconscious = (p.flags & MED_UNCONSCIOUS) != 0;
         w.dead        = (p.flags & MED_DEAD) != 0;
+        // Protocol 53: unlike its two neighbours in this byte, crippled is
+        // AUTHORITATIVE rather than advisory - no event channel owns the
+        // transition, and writeMedical applies it so the copy's crawl gait can
+        // engage (the posture apply in applyTargets is the other half).
+        w.crippled    = (p.flags & MED_CRIPPLED) != 0;
         engine::writeMedical(c, w);
         // Limb-state self-heal (Phase C/D): reconcile stump/crushed/robotic
         // state with the owner's. The reliable EVT_AMPUTATE/EVT_CRUSH events

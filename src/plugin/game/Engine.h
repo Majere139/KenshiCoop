@@ -1024,7 +1024,77 @@ bool readPoseState(Character* c, float* pelvis, int* idle, int* crouched, int* t
 
 // SEH-guarded: read the body-state bit-flags (BODY_* in Wire.h) off a rendered
 // Character - down/KO, ragdoll, dead, crawl. 0 = upright/normal (also on fault).
+// Also carries the protocol-53 PRONE FIELD (bits 9-11): the body's exact
+// ProneState, so capture and the local-vs-streamed compare share one read.
 unsigned short readBodyState(Character* c);
+
+// ---- Protocol 53: prone posture -------------------------------------------
+// Character::_currentProneState (0xE0) is a plain member, read directly like
+// stealthMode (0xD4). -1 = unreadable/null; otherwise a kenshi ProneState value
+// (PS_NORMAL..PS_KO, mirrored by PRONE_* in Wire.h).
+int readProneState(Character* c);
+// Pose the LOCAL body via Character::setProneState. That entry point is VIRTUAL
+// (vtable offset 0x370) unlike the non-virtual setStealthMode beside it, so it is
+// dispatched directly through the header rather than resolved via GetRealAddress -
+// nothing to add to the capability table. Caller compares against readProneState
+// first (this does not check); SEH-guarded. p = a kenshi ProneState value.
+bool applyProneState(Character* c, int p);
+
+// ---- Crawl-drive transform probe (protocol 53, diagnostic) ------------------
+// A crawler driven with applyRaw tracks its owner in Character::getPosition -
+// measured to ~0.2 u, and the nametag moves with it - while the MODEL stays where
+// the body collapsed. No engine-reported field explains that: the copy reads
+// conscious, un-ragdolled, correctly posed and correctly positioned. So read the
+// candidate transforms a body actually has and let a run say which one the mesh
+// follows, instead of guessing at internals. All plain members (CharMovement at
+// 0xC4/0x320/0x37C/0x380, HavokCharacter::position at 0x20) - no entry point to
+// resolve. Read-only; safe to log at scenario cadence.
+struct DriveProbe {
+    float mvX, mvY, mvZ;    // CharMovement::pos - what applyRaw writes
+    float hkX, hkY, hkZ;    // HavokCharacter::position - navmesh/collision body
+    bool  haveHk;           // false when the character has no havok character
+    int   movementMode;     // MovementMode: 0 NORMAL, 1 COMBAT, 2 DIRECTION
+    bool  animOverride;     // CharMovement::animationOverride
+    float tavX, tavY, tavZ; // trackingAnimRelocationVector - anim-owned motion
+    float motX, motY, motZ; // CharMovement::currentMotion
+    // The body's MOTION as the engine itself sees it, which is a different
+    // question from where the body IS. A teleported body arrives without ever
+    // having moved: the physics character's velocity and directionMoved stay
+    // zero, and a clip that advances with real movement has nothing to advance
+    // on - the body slides along the ground in a frozen pose. Read them beside
+    // the mirror we write (curMoving/curSpeed) to tell "the engine moved it"
+    // from "we placed it there".
+    float hkVelX, hkVelY, hkVelZ;
+    float hkMovedX, hkMovedY, hkMovedZ;
+    bool  curMoving;        // CharMovement::currentlyMoving as it stands now
+    float curSpeed;         // CharMovement::currentSpeed as it stands now
+};
+bool readDriveProbe(Character* c, DriveProbe* out);
+
+// True when the body still has its movement controller's physics character
+// (CharMovement::havokCharacter). The engine tears that down while a body is
+// collapsed and re-creates it on recovery, so a body that is up-and-about
+// WITHOUT one is being rendered from a stale transform.
+bool hasPhysicsBody(Character* c);
+// Re-create it (CharMovement::restore). The recovery a driven copy never runs
+// for itself, because it is AI-suspended. No-op (false) if the entry point is
+// unresolved (CAP_MOVE_RESTORE off) or the body already has one - restore()
+// is the counterpart to destroy(), not something to call on a healthy body.
+bool restoreMovement(Character* c);
+
+// Mirror a body's MOTION onto its physics character, which is where the crawl
+// clip reads it from. applyMotion writes the same truth onto CharMovement
+// (currentlyMoving/currentSpeed/currentMotion) and that is enough for an upright
+// copy's walk/run selection, but it does NOT advance a crawler's clip: measured
+// (run 20260805_164254) with the copy's mirror correct at mot=3.83 cur=1:5.21
+// while its physics velocity sat at zero and the body slid along the ground in a
+// frozen pose. The owner's, crawling, read hkvel=0.35,0.04,0.35 over
+// hkmoved=0.705,0.075,0.705 - a unit direction with velocity = direction x
+// speed. So present the same pair: a body whose translation is host-authoritative
+// should report the motion that translation represents.
+// 'dir' need not be normalised (it is normalised here); 'speed' is in world
+// units/sec and is converted to physics units. Zero speed writes a clean stop.
+bool applyPhysMotion(Character* c, float dirX, float dirY, float dirZ, float speed);
 
 // ---- Stage 5 rest-pose reproduction ----------------------------------------
 
@@ -1182,6 +1252,11 @@ struct MedicalRead {
     float limbMax[4];   // HealthPartStatus::_maxHealth (-1 = part missing)
     bool  unconscious;  // medical.unconcious
     bool  dead;         // medical.dead
+    bool  crippled;     // medical.crippled (protocol 53): the CAUSE behind an
+                        // injured crawl. Unlike unconscious/dead this one IS
+                        // written on a driven copy - no event channel owns the
+                        // crippled transition, and the engine's crawl
+                        // locomotion/animation paths key on this bool.
     // ---- protocol 16: full anatomy ----
     unsigned int nParts;      // filled parts[] slots (MedicalSystem::anatomy order)
     MedPartRead  parts[12];   // coop::MED_PARTS_MAX slots
@@ -1207,7 +1282,9 @@ bool writeHungerByHand(const unsigned int hand[5], float hunger, float fed);
 // flesh/fleshStun/bandaging/juryRig when in.nParts > 0, else the legacy 4-limb
 // arrays; -1 fields skipped; a part is only written when the local anatomy slot
 // agrees on partType+side). unconscious/dead are NOT written - the reliable
-// event channel owns those transitions. Returns false on fault/null.
+// event channel owns those transitions. crippled IS written (protocol 53): it has
+// no event channel, and it is what the engine's crawl gait keys on. Returns false
+// on fault/null.
 bool writeMedical(Character* c, const MedicalRead& in);
 
 // Phase-2 treatment forwarding, owner side: raise-only per-limb bandaging apply

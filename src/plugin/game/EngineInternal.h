@@ -47,6 +47,7 @@
 #include <kenshi/SaveInfo.h>        // SaveInfo (the in-game load menu's load(SaveInfo&) overload)
 #include <kenshi/Character.h>       // Character (handle/getPosition/getOrientation/movement)
 #include <kenshi/CharMovement.h>    // CharMovement::_setPositionDirectionAndTeleport/setDestination
+#include <kenshi/HavokCharacter.h>  // HavokCharacter::position (crawl-drive transform probe)
 #include <kenshi/Enums.h>           // itemType, MoveSpeed { RUN }
 #include <kenshi/RootObject.h>      // RootObject base (getCharactersWithinSphere out type)
 #include <kenshi/RootObjectBase.h>  // getGameData/getFaction (spawn template + owner)
@@ -142,6 +143,9 @@ typedef void      (__fastcall* AddJobFn)(Character* self, int t, RootObject* sub
 typedef Platoon*  (__fastcall* SeparateSquadFn)(Character* self, bool permanent);
 typedef void      (__fastcall* EndActionFn)(void* charBody);
 typedef void      (__fastcall* RagdollModeFn)(Character* self, bool on, int part);
+// CharMovement::restore - the counterpart to destroy(), which re-creates the
+// movement controller's physics side (the HavokCharacter + collision hull).
+typedef void      (__fastcall* MoveRestoreFn)(CharMovement* self);
 typedef void      (__fastcall* MedFloatFn)(MedicalSystem* self, float v);
 typedef void      (__fastcall* MedAmputateFn)(MedicalSystem* self, int limb,
                                               bool createSeveredItem,
@@ -364,6 +368,7 @@ extern AddJobFn        g_addJobFn;
 extern SeparateSquadFn g_separateSquadFn;
 extern EndActionFn     g_endActionFn;
 extern RagdollModeFn   g_ragdollModeFn;
+extern MoveRestoreFn   g_moveRestoreFn;
 extern MedFloatFn      g_knockoutFn;
 extern MedFloatFn      g_knockoutForceFn;
 extern MedAmputateFn     g_medAmputateFn;

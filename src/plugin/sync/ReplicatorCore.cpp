@@ -40,10 +40,11 @@ Replicator::Replicator()
       nextWorldNetId_(1), worldSeeded_(false),
       nextDropId_(1), nextPickupId_(1), nextXferId_(1),
       xferScanMs_(0), nextTreatId_(1),
-      quietRelapse_(0), sitOrders_(0), detachUses_(0), noDetach_(false),
+      quietRelapse_(0), crawlPhysRestore_(0),
+      sitOrders_(0), detachUses_(0), noDetach_(false),
       dmgGuard_(false), reportCombat_(false), nextHitId_(1),
       carrySync_(true), furnSync_(true), chainSync_(true),
-      stealthSync_(true),
+      stealthSync_(true), proneSync_(true),
       gateAuthority_(false), trustLogTick_(0),
       trustGrants_(0), trustRevokes_(0),
       authSuppresses_(0), authRestores_(0), authReassertMs_(0), authPruned_(0),
@@ -557,8 +558,10 @@ void Replicator::logSmoothSummary() {
     // KENSHICOOP_NO_DETACH A/B decision.
     char q[160];
     _snprintf(q, sizeof(q) - 1,
-              "SCENARIO QUIET relapse=%lu sitOrders=%lu detach=%lu noDetach=%d",
-              quietRelapse_, sitOrders_, detachUses_, noDetach_ ? 1 : 0);
+              "SCENARIO QUIET relapse=%lu sitOrders=%lu detach=%lu noDetach=%d "
+              "crawlPhys=%lu",
+              quietRelapse_, sitOrders_, detachUses_, noDetach_ ? 1 : 0,
+              crawlPhysRestore_);
     q[sizeof(q) - 1] = '\0';
     coop::logLine(q);
 

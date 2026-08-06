@@ -219,6 +219,7 @@ void loadConfig(Config& c) {
     // just the chain kind (beds/cages keep working).
     c.chainSync = envOr("KENSHICOOP_CHAIN_SYNC", "1") != "0";
     c.stealthSync = envOr("KENSHICOOP_STEALTH_SYNC", "1") != "0";
+    c.proneSync   = envOr("KENSHICOOP_PRONE_SYNC", "1") != "0";
     c.moneySync   = envOr("KENSHICOOP_MONEY_SYNC", "1") != "0";
     c.spawnSync   = envOr("KENSHICOOP_SPAWN_SYNC", "1") != "0";
     c.recruitSync = envOr("KENSHICOOP_RECRUIT_SYNC", "1") != "0";
@@ -388,7 +389,8 @@ std::string describeConfig(const Config& c) {
         { "speedCombatCap", c.speedCombatCap },
         { "stats",   c.statsSync },    { "carry",   c.carrySync },
         { "furn",    c.furnSync },     { "chain",   c.chainSync },
-        { "stealth", c.stealthSync },  { "money",   c.moneySync },
+        { "stealth", c.stealthSync },  { "prone",   c.proneSync },
+        { "money",   c.moneySync },
         { "spawn",   c.spawnSync },    { "recruit", c.recruitSync },
         { "faction", c.factionSync },  { "time",    c.timeSync },
         { "door",    c.doorSync },     { "build",   c.buildSync },

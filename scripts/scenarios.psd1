@@ -483,6 +483,23 @@
             Advisory = @('smoothness', 'anim_truth', 'march')
             Tier = 'full'; WanVariant = $true
         }
+        # crawl_move: protocol-53 prone posture + crippled cause, both
+        # directions - each side amputates a LEG on ITS OWN tab leader (A: host
+        # member LEFT_LEG, B: join member RIGHT_LEG) and then keeps that body
+        # moving on a short alternating leg. Gates that the copy reaches the
+        # owner's prone POSTURE and crippled FLAG within budget, never reverts,
+        # and tracks position while crawling. The hole limb_loss left: it cuts
+        # arms and judges a body standing still, so nothing ever watched an
+        # injured character walk - which is where a crippled crawler was being
+        # driven as an upright walker. WanVariant: the crippled cause rides the
+        # reliable medical channel and must converge under loss.
+        crawl_move = @{
+            Save = 'squad1'; Setup = ''; Tolerance = 3.0
+            PrimaryGate = 'crawl_move'
+            Gating   = @('crawl_move', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $true
+        }
         # stats_sync: protocol-17 character-stats replication both directions -
         # each side raises stats on ITS OWN tab leader via the raise-only
         # scaffold (A: host raises Strength+Stealth, B: join raises Dexterity+

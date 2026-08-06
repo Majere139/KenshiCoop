@@ -209,6 +209,90 @@ static void testSizes() {
     CHECK("!bodySneaking(BODY_CRAWL)",      !bodySneaking(BODY_CRAWL));
     CHECK("sneak+crawl still reads sneak",  bodySneaking((u16)(BODY_SNEAK | BODY_CRAWL)));
 
+    // Prone posture (protocol 53). The prone value is a FIELD sharing the
+    // bodyState word with the flag bits, so the two must not be able to corrupt
+    // each other: the mask must miss every flag, a stamp must preserve the flags,
+    // and a re-stamp must REPLACE the previous posture rather than OR into it.
+    CHECK("prone mask clears every BODY_ flag",
+          (BODY_PRONE_MASK & (BODY_DOWN | BODY_RAGDOLL | BODY_DEAD | BODY_CRAWL |
+                              BODY_CARRIED | BODY_IN_BED | BODY_IN_CAGE |
+                              BODY_SNEAK | BODY_CHAINED)) == 0);
+    CHECK("prone field fits u16",           (BODY_PRONE_MASK >> BODY_PRONE_SHIFT) == 7);
+    CHECK("prone round-trip NORMAL",        bodyProne(bodyWithProne(0, PRONE_NORMAL)) == PRONE_NORMAL);
+    CHECK("prone round-trip CRIPPLED",      bodyProne(bodyWithProne(0, PRONE_CRIPPLED)) == PRONE_CRIPPLED);
+    CHECK("prone round-trip KO (max)",      bodyProne(bodyWithProne(0, PRONE_KO)) == PRONE_KO);
+    CHECK("prone values are distinct",
+          PRONE_NORMAL != PRONE_STAYING_LOW && PRONE_STAYING_LOW != PRONE_CRIPPLED &&
+          PRONE_CRIPPLED != PRONE_PLAYING_DEAD && PRONE_PLAYING_DEAD != PRONE_KO);
+    {
+        // A crippled crawler as the wire really carries it: BODY_CRAWL (which
+        // cannot say WHICH posture) alongside the posture that can.
+        u16 s = bodyWithProne((u16)BODY_CRAWL, PRONE_CRIPPLED);
+        CHECK("prone stamp preserves flags",    (s & BODY_CRAWL) != 0);
+        CHECK("prone stamp reads back",         bodyProne(s) == PRONE_CRIPPLED);
+        CHECK("crippled crawler is not down",   !bodyIsDown(s));
+        CHECK("crippled crawler is not sneaking", !bodySneaking(s));
+        CHECK("bodyFlags strips the posture",   bodyFlags(s) == BODY_CRAWL);
+        // Re-stamp: PS_CRIPPLED -> PS_NORMAL must leave 0, not 2|0.
+        u16 up = bodyWithProne(s, PRONE_NORMAL);
+        CHECK("prone re-stamp replaces",        bodyProne(up) == PRONE_NORMAL);
+        CHECK("prone re-stamp keeps flags",     (up & BODY_CRAWL) != 0);
+        // Out-of-range degrades to upright rather than corrupting the flags.
+        u16 bad = bodyWithProne(s, (u8)7);
+        CHECK("prone out-of-range = NORMAL",    bodyProne(bad) == PRONE_NORMAL);
+        CHECK("prone out-of-range keeps flags", (bad & BODY_CRAWL) != 0);
+    }
+    // A posture must never make a body read as down/dead: that is what the
+    // `bodyState != 0` call sites (victim pick, downed-enemy count) test.
+    CHECK("bodyFlags(prone only) == 0",     bodyFlags(bodyWithProne(0, PRONE_CRIPPLED)) == 0);
+    CHECK("prone KO alone is not down",     !bodyIsDown(bodyWithProne(0, PRONE_KO)));
+    CHECK("down+prone still reads down",
+          bodyIsDown(bodyWithProne((u16)BODY_DOWN, PRONE_KO)));
+
+    // The crawl carve-out, on the EXACT words the engine was measured to stream
+    // (run 20260805_152546, leg amputation): 2051 = DOWN|RAGDOLL|PS_KO for the
+    // ~2 s collapse, then 1033 = DOWN|CRAWL|PS_CRIPPLED with unc=0 for the crawl.
+    // Both are "down" to Character::isDown(), and treating the second as such is
+    // what pinned the copy to the ground while its owner crawled away.
+    {
+        const u16 COLLAPSED = 2051; // DOWN|RAGDOLL, prone=PS_KO
+        const u16 CRAWLING  = 1033; // DOWN|CRAWL,   prone=PS_CRIPPLED
+        CHECK("measured collapsed word decodes",
+              bodyIsDown(COLLAPSED) && bodyProne(COLLAPSED) == PRONE_KO &&
+              (COLLAPSED & BODY_RAGDOLL) != 0);
+        CHECK("measured crawling word decodes",
+              bodyIsDown(CRAWLING) && bodyProne(CRAWLING) == PRONE_CRIPPLED &&
+              (CRAWLING & BODY_CRAWL) != 0);
+        CHECK("collapsed is not crawling",      !bodyIsCrawling(COLLAPSED));
+        CHECK("crawling is crawling",           bodyIsCrawling(CRAWLING));
+        CHECK("collapsed is down-not-crawling", bodyDownNotCrawling(COLLAPSED));
+        CHECK("crawler is NOT down-not-crawling", !bodyDownNotCrawling(CRAWLING));
+        // The four KO/REVIVE edges the publisher derives from that predicate.
+        // Getting any of these backwards is how the copy stayed pinned.
+        CHECK("upright -> crawl is no KO",
+              !(bodyDownNotCrawling(CRAWLING) && !bodyDownNotCrawling(0)));
+        CHECK("crawl -> upright is no REVIVE",
+              !(!bodyDownNotCrawling(0) && bodyDownNotCrawling(CRAWLING)));
+        CHECK("crawl -> collapse IS a KO",
+              bodyDownNotCrawling(COLLAPSED) && !bodyDownNotCrawling(CRAWLING));
+        CHECK("collapse -> crawl IS a REVIVE",
+              !bodyDownNotCrawling(CRAWLING) && bodyDownNotCrawling(COLLAPSED));
+        // A dead body is never a crawler, whatever the posture field says.
+        CHECK("dead crawler is not crawling",
+              !bodyIsCrawling((u16)(CRAWLING | BODY_DEAD)));
+        CHECK("dead crawler stays down-not-crawling",
+              bodyDownNotCrawling((u16)(CRAWLING | BODY_DEAD)));
+        // A sneaker must not be mistaken for a crawler (PS_STAYING_LOW, upright).
+        CHECK("low-crouch sneaker is not crawling",
+              !bodyIsCrawling(bodyWithProne((u16)(BODY_SNEAK | BODY_CRAWL),
+                                            PRONE_STAYING_LOW)));
+    }
+
+    // Protocol 53: the crippled CAUSE flag on the medical packet's flags byte.
+    CHECK("MED_CRIPPLED distinct bit",
+          MED_CRIPPLED != MED_UNCONSCIOUS && MED_CRIPPLED != MED_DEAD &&
+          (MED_CRIPPLED & (MED_UNCONSCIOUS | MED_DEAD)) == 0);
+
     // Recruitment sync (protocol 23): the new reliable event is distinct from
     // the whole existing set (it rides the EventPacket shape unchanged).
     CHECK("EVT_RECRUIT distinct",
@@ -224,8 +308,8 @@ static void testSizes() {
     CHECK_EQ("EVT_SQUAD_MOVE id", (int)EVT_SQUAD_MOVE, 11);
     CHECK("EVT_SQUAD_MOVE distinct", EVT_SQUAD_MOVE != EVT_RECRUIT &&
           EVT_SQUAD_MOVE != EVT_NONE && EVT_SQUAD_MOVE != EVT_EXIT_FURNITURE);
-    CHECK_EQ("PROTOCOL_VERSION (v52: shared money pool)",
-             (int)PROTOCOL_VERSION, 52);
+    CHECK_EQ("PROTOCOL_VERSION (v53: prone posture + crippled cause)",
+             (int)PROTOCOL_VERSION, 53);
 
     // Protocol 52: the shared money pool. The two players spend from ONE wallet,
     // so the join reports CHANGES and the host the authoritative TOTAL - swap

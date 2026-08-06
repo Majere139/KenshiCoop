@@ -1243,10 +1243,126 @@ unsigned short readBodyState(Character* c) {
         // Stealth (protocol 20): the mode bool exactly (0xD4), NOT the
         // crawl-inclusive isStealthModeOrCrawling that feeds BODY_CRAWL.
         if (c->stealthMode) s |= BODY_SNEAK;
+        // Prone posture (protocol 53): the engine's own ProneState (0xE0) as a
+        // 3-bit field, because BODY_CRAWL cannot say WHICH posture - it is
+        // isStealthModeOrCrawling, true for both the sneak toggle and an injured
+        // crawl. bodyWithProne masks the field, so an out-of-range value degrades
+        // to PRONE_NORMAL rather than corrupting the flag bits below it.
+        s = bodyWithProne(s, (u8)c->_currentProneState);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return 0;
     }
     return s;
+}
+
+// Protocol 53: prone-posture read/apply. _currentProneState is a plain member
+// (0xE0), so the read needs no resolved entry point; setProneState is VIRTUAL
+// (vtable offset 0x370), so it is dispatched directly through the header - the
+// repo's rule for virtuals (GetRealAddress is for the non-virtual entry points).
+int readProneState(Character* c) {
+    if (!c) return -1;
+    __try {
+        return (int)c->_currentProneState;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+
+bool applyProneState(Character* c, int p) {
+    if (!c || p < 0) return false;
+    __try {
+        c->setProneState((ProneState)p);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool readDriveProbe(Character* c, DriveProbe* out) {
+    if (!c || !out) return false;
+    memset(out, 0, sizeof(*out));
+    __try {
+        CharMovement* mv = c->movement;
+        if (!mv) return false;
+        out->mvX = mv->pos.x; out->mvY = mv->pos.y; out->mvZ = mv->pos.z;
+        out->movementMode = (int)mv->movementMode;
+        out->animOverride = mv->animationOverride;
+        out->tavX = mv->trackingAnimRelocationVector.x;
+        out->tavY = mv->trackingAnimRelocationVector.y;
+        out->tavZ = mv->trackingAnimRelocationVector.z;
+        out->motX = mv->currentMotion.x;
+        out->motY = mv->currentMotion.y;
+        out->motZ = mv->currentMotion.z;
+        out->curMoving = mv->currentlyMoving;
+        out->curSpeed  = mv->currentSpeed;
+        HavokCharacter* hk = mv->havokCharacter;
+        if (hk) {
+            // hkVector4f is a single __m128 (m_quad at 0x0), so the lanes ARE
+            // x,y,z,w - read them as floats rather than pulling in Havok's
+            // accessors (all of which are RVA entry points we would have to
+            // resolve for a diagnostic).
+            const float* q = reinterpret_cast<const float*>(&hk->position);
+            out->hkX = q[0]; out->hkY = q[1]; out->hkZ = q[2];
+            const float* v = reinterpret_cast<const float*>(&hk->velocity);
+            out->hkVelX = v[0]; out->hkVelY = v[1]; out->hkVelZ = v[2];
+            const float* d = reinterpret_cast<const float*>(&hk->directionMoved);
+            out->hkMovedX = d[0]; out->hkMovedY = d[1]; out->hkMovedZ = d[2];
+            out->haveHk = true;
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool hasPhysicsBody(Character* c) {
+    if (!c) return false;
+    __try {
+        CharMovement* mv = c->movement;
+        return mv && mv->havokCharacter != 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool restoreMovement(Character* c) {
+    if (!c || !g_moveRestoreFn) return false;
+    __try {
+        CharMovement* mv = c->movement;
+        if (!mv || mv->havokCharacter) return false; // already has one: leave it
+        g_moveRestoreFn(mv);
+        return mv->havokCharacter != 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Havok space is world space / 10: the crawl probe measured HavokCharacter::
+// position as exactly one tenth of CharMovement::pos on the same body, and the
+// owner's physics velocity as one tenth of its world crawl speed.
+static const float PHYS_UNIT_SCALE = 0.1f;
+
+bool applyPhysMotion(Character* c, float dirX, float dirY, float dirZ, float speed) {
+    if (!c) return false;
+    __try {
+        CharMovement* mv = c->movement;
+        if (!mv || !mv->havokCharacter) return false;
+        HavokCharacter* hk = mv->havokCharacter;
+        float len = (float)sqrt(dirX * dirX + dirY * dirY + dirZ * dirZ);
+        float ux = 0.0f, uy = 0.0f, uz = 0.0f;
+        if (len > 0.0001f) { ux = dirX / len; uy = dirY / len; uz = dirZ / len; }
+        // Physics space is world/10 (the probe measured hk position as exactly
+        // one tenth of CharMovement::pos), so the speed converts but the unit
+        // direction does not. Lane 3 (w) is left alone: only x,y,z are ours.
+        const float ps = speed * PHYS_UNIT_SCALE;
+        float* vel = reinterpret_cast<float*>(&hk->velocity);
+        vel[0] = ux * ps; vel[1] = uy * ps; vel[2] = uz * ps;
+        float* moved = reinterpret_cast<float*>(&hk->directionMoved);
+        moved[0] = ux; moved[1] = uy; moved[2] = uz;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
 }
 
 bool readPoseState(Character* c, float* pelvis, int* idle, int* crouched, int* task) {
@@ -1501,6 +1617,9 @@ bool readMedical(Character* c, MedicalRead* out) {
         out->bleedRate   = med->currentBleedRate;
         out->unconscious = med->unconcious;
         out->dead        = med->dead;
+        // Protocol 53: the crippled flag (0x160) - the cause behind an injured
+        // crawl, and what the engine's crawl gait/animation paths key on.
+        out->crippled    = med->crippled;
         // Protocol 29: the hunger scalars ride the same snapshot; dazedOrAlert
         // is read for probe diagnostics only (unlabeled semantics).
         out->hunger = med->hunger;
@@ -1616,6 +1735,12 @@ bool writeMedical(Character* c, const MedicalRead& in) {
         if (in.fed    >= 0.0f) med->fed    = in.fed;
         // unconscious/dead deliberately NOT written: the reliable KO/death/revive
         // event channel (+ bodyState latches) owns those transitions.
+        // crippled IS written (protocol 53): no event channel owns that
+        // transition, so this snapshot is its only authority, and the engine's
+        // crawl locomotion/animation paths read this bool rather than the
+        // streamed motion floats - a driven copy left with crippled=false is
+        // walked upright no matter what posture we pose it into.
+        med->crippled = in.crippled;
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -1990,7 +2115,9 @@ bool pickCombatVictim(GameWorld* gw, const unsigned int refHand[5],
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     Character* best = 0; float bestD = 1e18f;
     for (unsigned int i = 0; i < nc; ++i) {
-        if (readBodyState(cand[i]) != 0) continue; // down/dead/ragdoll = not a victim
+        // down/dead/ragdoll/carried/occupied = not a victim. bodyFlags strips the
+        // protocol-53 prone field, which is a posture value and not a flag.
+        if (bodyFlags(readBodyState(cand[i])) != 0) continue;
         CombatRead cr; // already fighting = someone else's victim (window A's)
         if (readCombat(cand[i], &cr) && cr.inCombat) continue;
         unsigned int h[5];

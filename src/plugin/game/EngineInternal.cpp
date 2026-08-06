@@ -373,6 +373,7 @@ AddJobFn        g_addJobFn        = 0;
 SeparateSquadFn g_separateSquadFn = 0;
 EndActionFn     g_endActionFn     = 0;
 RagdollModeFn   g_ragdollModeFn   = 0;
+MoveRestoreFn   g_moveRestoreFn   = 0;
 MedFloatFn      g_knockoutFn      = 0;
 MedFloatFn      g_knockoutForceFn = 0;
 MedAmputateFn     g_medAmputateFn     = 0;
@@ -1548,6 +1549,15 @@ void resolve() {
         &Character::separateIntoMyOwnSquad);
     g_endActionFn = (EndActionFn)KenshiLib::GetRealAddress(&CharBody::endAction);
     g_ragdollModeFn = (RagdollModeFn)KenshiLib::GetRealAddress(&Character::ragdollMode);
+    // Protocol 53: re-create a driven crawler's physics side. The engine DESTROYS
+    // the movement controller's HavokCharacter when a body collapses and re-creates
+    // it when the body recovers - measured on the owner, which reports hk=0 for
+    // exactly the 5 samples it spent in PS_KO and hk=1 for the 120 after. A driven
+    // copy is AI-suspended, so its recovery never runs: it keeps hk=0 forever, and
+    // since the MODEL follows the physics character while getPosition follows
+    // CharMovement::pos, the mesh stays where the body collapsed while the nametag
+    // walks away with the stream.
+    g_moveRestoreFn = (MoveRestoreFn)KenshiLib::GetRealAddress(&CharMovement::restore);
     g_knockoutFn      = (MedFloatFn)KenshiLib::GetRealAddress(&MedicalSystem::knockout);
     g_knockoutForceFn = (MedFloatFn)KenshiLib::GetRealAddress(&MedicalSystem::knockoutForceTimer);
 
@@ -1777,7 +1787,8 @@ void resolve() {
             { (void**)&g_ownSetMoneyFn,     "Ownerships::setMoney",          CAP_WALLET,        true },
             { (void**)&g_relGetFn,          "FactionRelations::getRelation", CAP_FACTION,       true },
             { (void**)&g_relSetFn,          "FactionRelations::setRelation", CAP_FACTION,       true },
-            { (void**)&g_attackTargetFn,    "Character::attackTarget",       CAP_COMBAT_ESCALATE,true }
+            { (void**)&g_attackTargetFn,    "Character::attackTarget",       CAP_COMBAT_ESCALATE,true },
+            { (void**)&g_moveRestoreFn,     "CharMovement::restore",         CAP_MOVE_RESTORE,  true }
         };
         const int nRows = (int)(sizeof(kCapRows) / sizeof(kCapRows[0]));
         capEvaluate(kCapRows, nRows, g_capAvail);

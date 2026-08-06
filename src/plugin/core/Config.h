@@ -329,6 +329,14 @@ struct Config {
     // "0" is the A/B escape hatch.
     bool          stealthSync;
 
+    // KENSHICOOP_PRONE_SYNC (default ON): prone-posture sync (protocol 53) -
+    // the owner's exact ProneState rides bodyState bits 9-11 and driven copies
+    // are posed with Character::setProneState, so a crippled crawler is not
+    // driven as an upright walker. The MedicalSystem::crippled half (the cause
+    // the engine's crawl gait keys on) rides the medical channel. "0" is the A/B
+    // escape hatch.
+    bool          proneSync;
+
     // KENSHICOOP_MONEY_SYNC (default ON): the shared money pool (protocol 52).
     // Kenshi keeps ONE player wallet per save, so both players spend from one
     // purse with the HOST as authority: the join reports each local change as a

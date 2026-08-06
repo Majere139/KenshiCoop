@@ -177,6 +177,10 @@ const float FURN_MATCH_DIST = 6.0f;       // self-heal fixture search radius aro
 // frame. The detection feedback publishes at ~4 Hz while a driven sneaker's
 // map is non-empty (arrows animate progress; 4 Hz tracks it acceptably).
 const unsigned long SNEAK_APPLY_MS   = 1000; // min gap between setStealthMode applies
+// Protocol 53: same reasoning for the prone posture. A copy whose engine keeps
+// re-deriving the posture (or an AI-suspended one whose medical model has not
+// caught up yet) must be re-posed at 1 Hz, never fought per frame.
+const unsigned long PRONE_APPLY_MS   = 1000; // min gap between setProneState applies
 const unsigned long STEALTH_SEND_MS  = 250;  // detection snapshot cadence (~4 Hz)
 const unsigned long STEALTH_RESEND_MS = 2000; // unchanged-map safety resend (unreliable channel)
 // Step 4 divergence-gated authority (doctrine 18, behind KENSHICOOP_GATE_AUTHORITY).

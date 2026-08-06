@@ -61,6 +61,7 @@ enum Capability {
     CAP_WALLET,         // platoon/money accessors (money sync)
     CAP_FACTION,        // faction-relation get/set (faction sync)
     CAP_COMBAT_ESCALATE,// Character::attackTarget (combat force-escalation)
+    CAP_MOVE_RESTORE,   // CharMovement::restore (re-create a crawler's physics body)
     CAP_COUNT
 };
 
@@ -87,7 +88,7 @@ inline const char* capName(Capability c) {
         "saveload", "savepath", "hand_resolve", "npc_stream", "limb", "stats",
         "carry", "furniture", "chain", "shackle", "slave", "stealth", "camera",
         "speed", "quiet_speed", "door", "build", "machine", "time", "wallet",
-        "faction", "combat_escalate"
+        "faction", "combat_escalate", "move_restore"
     };
     if (c < 0 || c >= CAP_COUNT) return "unknown";
     return kNames[c];

@@ -162,6 +162,263 @@ function Test-LimbLoss {
     return (Add-GateResult -Name "limb_loss" -Status PASS -Metrics $m)
 }
 
+# Parse the "SCENARIO CRAWL hand=i,s t=.. prone=.. crip=.. pos=x,y,z bs=.. mv=..
+# spd=.." series (protocol 53) for one hand into a time-ordered list of
+# @{t; prone; crip; x; y; z; bs; mv; spd}. prone/crip are -1 when unreadable.
+# Timestamps are clock-offset corrected into the host frame like every other
+# cross-log series.
+function Get-CrawlSeries {
+    param([string]$File, [string]$HandIS)
+    $list = New-Object System.Collections.ArrayList
+    if (-not (Test-Path $File)) { return ,$list }
+    $off = Get-LogClockOffsetMs -File $File
+    $pat = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO CRAWL hand=' + [regex]::Escape($HandIS) +
+           ' t=(\d+) prone=(-?\d+) crip=(-?\d+)' +
+           ' pos=(-?[\d\.]+),(-?[\d\.]+),(-?[\d\.]+) bs=(\d+) mv=(\d) spd=(-?[\d\.]+)'
+    foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups
+        [void]$list.Add([pscustomobject]@{
+            t     = (Convert-StampToMs -Groups $g -OffsetMs $off)
+            rawT  = [long]$g[5].Value
+            prone = [int]$g[6].Value
+            crip  = [int]$g[7].Value
+            x     = [double]$g[8].Value
+            y     = [double]$g[9].Value
+            z     = [double]$g[10].Value
+            bs    = [int]$g[11].Value
+            mv    = [int]$g[12].Value
+            spd   = [double]$g[13].Value
+        })
+    }
+    return ,$list
+}
+
+# Parse the "SCENARIO CRAWLPROBE hand=i,s t=.. mv=x,y,z hk=N:x,y,z ..." series
+# (protocol 53) for one hand. hk = whether the body still has its movement
+# controller's physics character, which is the ONLY log-visible witness for a
+# purely VISUAL desync: the model renders from the physics body while
+# Character::getPosition (and the nametag, and every position oracle) reads
+# CharMovement::pos. A copy can therefore track its owner perfectly on paper with
+# its mesh stranded where it collapsed - measured, and invisible to every other
+# check here.
+function Get-CrawlProbeSeries {
+    param([string]$File, [string]$HandIS)
+    $list = New-Object System.Collections.ArrayList
+    if (-not (Test-Path $File)) { return ,$list }
+    $off = Get-LogClockOffsetMs -File $File
+    $pat = '\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*SCENARIO CRAWLPROBE hand=' + [regex]::Escape($HandIS) +
+           ' t=(\d+) mv=(-?[\d\.]+),(-?[\d\.]+),(-?[\d\.]+) hk=(\d):'
+    foreach ($m in (Select-String -Path $File -Pattern $pat -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups
+        [void]$list.Add([pscustomobject]@{
+            t    = (Convert-StampToMs -Groups $g -OffsetMs $off)
+            rawT = [long]$g[5].Value
+            mvx  = [double]$g[6].Value
+            mvz  = [double]$g[8].Value
+            hk   = [int]$g[9].Value
+        })
+    }
+    return ,$list
+}
+
+# crawl_move (protocol 53): a body prone from a lost leg must CRAWL on the peer,
+# not be driven as an upright walker. Per direction (A = host-owned subject,
+# B = join-owned), gates four things against the OWNER's own reading:
+#   1. the copy reaches the owner's prone POSTURE within budget,
+#   2. the copy reaches the owner's crippled FLAG within budget,
+#   3. neither reverts afterwards (allowing the 1 Hz re-apply throttle),
+#   4. the copy TRACKS position while the injured body is being moved.
+# Posture parity is what distinguishes this from limb_loss and from any position
+# gate: a copy walking upright toward the right coordinates passes those.
+# SKIPs (loudly - it is the primary gate) when the owner never became crippled at
+# all, since then the scaffold produced no signal to judge rather than the sync
+# having failed.
+function Test-CrawlMove {
+    param([string]$HostFile, [string]$JoinFile,
+          [int]$MaxLatencyMs = 12000, [int]$SettleMs = 4000,
+          [double]$MaxGap = 12.0, [int]$MaxDt = 800, [int]$MinPaired = 6,
+          [double]$MinSpan = 6.0, [double]$MinSpanFrac = 0.5,
+          [double]$MinPhysFrac = 0.8)
+    $dirs = @(
+        @{ tag = "A"; ownerLog = $HostFile; copyLog = $JoinFile },
+        @{ tag = "B"; ownerLog = $JoinFile; copyLog = $HostFile }
+    )
+    $m = @{}; $bad = @(); $noSignal = @()
+    foreach ($d in $dirs) {
+        $t = $d.tag
+        $mk = Select-String -Path $d.ownerLog -Pattern ('SCENARIO CRAWL ' + $t + ' amputate issued hand=(\d+),(\d+) limb=(\d) ok=1') -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -eq $mk) { $bad += "${t}: no amputate marker (ok=1)"; continue }
+        $handIS = "$($mk.Matches[0].Groups[1].Value),$($mk.Matches[0].Groups[2].Value)"
+        $Tc = Get-MarkerTimeMs -File $d.ownerLog -Pattern ('SCENARIO CRAWL ' + $t + ' amputate issued')
+        # No @() wrapper: Get-CrawlSeries returns ",$list" (the ArrayList guard
+        # against an empty result unrolling away), so wrapping would nest it.
+        $O = Get-CrawlSeries -File $d.ownerLog -HandIS $handIS
+        $C = Get-CrawlSeries -File $d.copyLog  -HandIS $handIS
+        if ($O.Count -lt 1) { $bad += "${t}: owner logged no CRAWL series"; continue }
+        if ($C.Count -lt 1) { $bad += "${t}: copy logged no CRAWL series"; continue }
+
+        # Owner ground truth. The engine decides whether a lost leg cripples; if
+        # it never did, there is nothing to replicate and nothing to judge.
+        $oCrip  = @($O | Where-Object { $_.t -ge $Tc -and $_.crip -eq 1 })
+        $oProne = @($O | Where-Object { $_.t -ge $Tc -and $_.prone -gt 0 })
+        if ($oCrip.Count -lt 1 -and $oProne.Count -lt 1) {
+            $noSignal += "${t}: owner never became crippled or prone after the cut"
+            continue
+        }
+        # The posture the owner actually settled on (mode of its post-cut values),
+        # rather than assuming PS_CRIPPLED - the copy must match the OWNER.
+        $want = 0
+        if ($oProne.Count -gt 0) {
+            $want = ($oProne | Group-Object -Property prone |
+                     Sort-Object -Property Count -Descending | Select-Object -First 1).Name
+            $want = [int]$want
+        }
+        $m["${t}OwnerProne"] = $want
+        $m["${t}OwnerCrip"]  = $(if ($oCrip.Count -gt 0) { 1 } else { 0 })
+
+        # 1. Posture crossed.
+        if ($want -gt 0) {
+            $hit = @($C | Where-Object { $_.t -ge $Tc -and $_.prone -eq $want })
+            if ($hit.Count -lt 1) {
+                $bad += "${t}: prone=$want never reached the copy (posture does not cross)"
+            } else {
+                $lat = [int]($hit[0].t - $Tc)
+                $m["${t}ProneLatMs"] = $lat
+                if ($lat -gt $MaxLatencyMs) { $bad += "${t}: prone latency ${lat}ms > $MaxLatencyMs" }
+                # 3a. Sticky: past the settle window the copy stays posed. The
+                # apply is throttled to 1 Hz, so judge the settled tail only.
+                $tail = @($C | Where-Object { $_.t -ge ($hit[0].t + $SettleMs) })
+                if ($tail.Count -ge 4) {
+                    $held = @($tail | Where-Object { $_.prone -eq $want }).Count
+                    $ratio = [Math]::Round($held / $tail.Count, 3)
+                    $m["${t}ProneHoldRatio"] = $ratio
+                    if ($ratio -lt 0.8) { $bad += "${t}: copy held prone=$want for only $ratio of the settled tail" }
+                }
+            }
+        }
+
+        # 2. Crippled cause crossed (the flag the engine's crawl gait reads).
+        if ($oCrip.Count -gt 0) {
+            $hitC = @($C | Where-Object { $_.t -ge $Tc -and $_.crip -eq 1 })
+            if ($hitC.Count -lt 1) {
+                $bad += "${t}: crippled never reached the copy (cause does not cross)"
+            } else {
+                $latC = [int]($hitC[0].t - $Tc)
+                $m["${t}CripLatMs"] = $latC
+                if ($latC -gt $MaxLatencyMs) { $bad += "${t}: crippled latency ${latC}ms > $MaxLatencyMs" }
+                # 3b. Sticky: the medical channel is change-gated, so a revert
+                # means something WROTE crippled=false, not that a send was lost.
+                $rev = @($C | Where-Object { $_.t -gt ($hitC[0].t + $SettleMs) -and $_.crip -eq 0 }).Count
+                $m["${t}CripReverts"] = $rev
+                if ($rev -gt 0) { $bad += "${t}: copy reverted to crippled=0 $rev time(s)" }
+            }
+        }
+
+        # 4. Position tracked while the injured body is under a move order. The
+        # gap is judged on the owner's MOVING samples: a crawler driven as an
+        # upright walker is exactly where the two positions separate.
+        $oMove = @($O | Where-Object { $_.t -ge $Tc -and $_.mv -eq 1 })
+        if ($oMove.Count -lt $MinPaired) {
+            $noSignal += "${t}: owner never reported $MinPaired moving samples after the cut"
+            continue
+        }
+        $gaps = New-Object System.Collections.ArrayList
+        foreach ($os in $oMove) {
+            $best = $null; $bestDt = [int]::MaxValue
+            foreach ($cs in $C) {
+                $dt = [Math]::Abs([int]($cs.t - $os.t))
+                if ($dt -lt $bestDt) { $bestDt = $dt; $best = $cs }
+            }
+            if ($bestDt -le $MaxDt -and $null -ne $best) {
+                $dx = $best.x - $os.x; $dz = $best.z - $os.z
+                [void]$gaps.Add([Math]::Sqrt($dx * $dx + $dz * $dz))
+            }
+        }
+        if ($gaps.Count -lt $MinPaired) {
+            $noSignal += "${t}: only $($gaps.Count) paired moving sample(s) (need $MinPaired)"
+            continue
+        }
+        $sorted = @($gaps | Sort-Object)
+        $med = [Math]::Round($sorted[[int]([Math]::Floor($sorted.Count / 2))], 2)
+        $m["${t}GapMed"] = $med
+        $m["${t}GapPairs"] = $gaps.Count
+        if ($med -gt $MaxGap) { $bad += "${t}: median crawl gap ${med}u > $MaxGap" }
+
+        # 5. The copy actually TRAVELLED. The gap check alone is not enough to
+        # judge tracking: it is a distance between two positions, so a copy frozen
+        # where the owner started scores a small gap whenever the owner stays near
+        # its own start. That is not hypothetical - run 20260805_153425 passed at
+        # gap=3.68u with the copy's position BYTE-IDENTICAL across the whole move
+        # window ("crawls in place while the camera follows the real position").
+        # Span = how far each body ever got from its own first post-cut sample.
+        $oPost = @($O | Where-Object { $_.t -ge $Tc })
+        $cPost = @($C | Where-Object { $_.t -ge $Tc })
+        $span = {
+            param($s)
+            if ($s.Count -lt 2) { return 0.0 }
+            $x0 = $s[0].x; $z0 = $s[0].z; $mx = 0.0
+            foreach ($p in $s) {
+                $dx = $p.x - $x0; $dz = $p.z - $z0
+                $dd = [Math]::Sqrt($dx * $dx + $dz * $dz)
+                if ($dd -gt $mx) { $mx = $dd }
+            }
+            return $mx
+        }
+        $oSpan = [Math]::Round((& $span $oPost), 2)
+        $cSpan = [Math]::Round((& $span $cPost), 2)
+        $m["${t}OwnerSpan"] = $oSpan
+        $m["${t}CopySpan"]  = $cSpan
+        if ($oSpan -lt $MinSpan) {
+            # The owner never crawled anywhere, so the copy standing still proves
+            # nothing. Report it rather than passing on an unexercised check.
+            $noSignal += "${t}: owner only travelled ${oSpan}u after the cut (< ${MinSpan}u); tracking unexercised"
+        } elseif ($cSpan -lt ($oSpan * $MinSpanFrac)) {
+            $bad += ("${t}: copy travelled only ${cSpan}u of the owner's ${oSpan}u " +
+                     "(crawling in place, not tracking)")
+        }
+
+        # 6. The copy can still be RENDERED where it is. Everything above reads
+        # Character::getPosition, and the model does not: it follows the movement
+        # controller's physics character, which the engine tears down when a body
+        # collapses. A driven copy is AI-suspended, so it never runs the recovery
+        # that re-creates it - leaving a body whose position, posture, medical
+        # state and animation are all correct and whose MESH is stranded at the
+        # collapse spot. Nothing else in this gate can see that, so judge the
+        # witness directly over the owner's moving window.
+        $P = Get-CrawlProbeSeries -File $d.copyLog -HandIS $handIS
+        if ($P.Count -lt 1) {
+            $noSignal += "${t}: copy logged no CRAWLPROBE series (physics witness absent)"
+        } else {
+            $t0 = $oMove[0].t; $t1 = $oMove[$oMove.Count - 1].t
+            $win = @($P | Where-Object { $_.t -ge $t0 -and $_.t -le $t1 })
+            if ($win.Count -lt $MinPaired) {
+                $noSignal += "${t}: only $($win.Count) CRAWLPROBE sample(s) in the move window"
+            } else {
+                $have = @($win | Where-Object { $_.hk -eq 1 }).Count
+                $frac = [Math]::Round($have / $win.Count, 3)
+                $m["${t}PhysFrac"] = $frac
+                if ($frac -lt $MinPhysFrac) {
+                    $bad += ("${t}: copy had no physics body for $(1 - $frac) of the move " +
+                             "window (physFrac=$frac); the model renders from it, so it " +
+                             "stays where the body collapsed while the position tracks")
+                }
+            }
+        }
+    }
+    if ($bad.Count -gt 0) {
+        Write-Host ("  CRAWL-MOVE FAIL - " + ($bad -join "; "))
+        return (Add-GateResult -Name "crawl_move" -Status FAIL -Metrics $m -Detail ($bad -join "; "))
+    }
+    if ($noSignal.Count -gt 0 -and $m.Count -eq 0) {
+        Write-Host ("  CRAWL-MOVE SKIP - " + ($noSignal -join "; "))
+        return (Add-GateResult -Name "crawl_move" -Status SKIP -Metrics $m -Detail ($noSignal -join "; "))
+    }
+    foreach ($n in $noSignal) { Write-Host "    FINDING: $n" }
+    Write-Host ("  CRAWL-MOVE PASS - A: prone=$($m.AOwnerProne) crossed in $($m.AProneLatMs)ms, crippled in $($m.ACripLatMs)ms, gap=$($m.AGapMed)u, travel=$($m.ACopySpan)/$($m.AOwnerSpan)u, phys=$($m.APhysFrac); " +
+                "B: prone=$($m.BOwnerProne) crossed in $($m.BProneLatMs)ms, crippled in $($m.BCripLatMs)ms, gap=$($m.BGapMed)u, travel=$($m.BCopySpan)/$($m.BOwnerSpan)u, phys=$($m.BPhysFrac)")
+    return (Add-GateResult -Name "crawl_move" -Status PASS -Metrics $m)
+}
+
 # Parse the "SCENARIO STATS hand=i,s t=.. str=.. stealth=.. dex=.. athl=..
 # tough=.. xp=.." series (protocol-17 stats sync) for one hand into a
 # time-ordered list of @{t; str; stealth; dex; athl; tough; xp}. Timestamps are

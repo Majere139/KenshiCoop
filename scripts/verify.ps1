@@ -65,10 +65,36 @@ if (Test-Path $fixtures) {
     $overall = $false
 }
 
+# ---- 3. Per-oracle fixtures on synthetic logs (zero game) ----------------------
+# An oracle judged only by its own green runs is unfalsifiable: these feed each
+# gate a log pair shaped like the BUG it exists for and require a FAIL, so a
+# passing regression run means the gate looked rather than that it cannot look.
+Write-Host ""
+Write-Host "############################################################"
+Write-Host "# verify: oracle fixtures (synthetic logs)"
+Write-Host "############################################################"
+$oracleOk = $true
+foreach ($f in @("tests\CrawlMove.Fixture.ps1")) {
+    $p = Join-Path $scriptDir $f
+    if (-not (Test-Path $p)) {
+        Write-Host "ORACLE FIXTURE: FAIL - scripts\$f not found"
+        $oracleOk = $false
+        continue
+    }
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $p
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host ("ORACLE FIXTURE ${f}: FAIL (exit $LASTEXITCODE)")
+        $oracleOk = $false
+    }
+}
+Write-Host ("ORACLE FIXTURES: " + $(if ($oracleOk) { "PASS" } else { "FAIL" }))
+if (-not $oracleOk) { $overall = $false }
+
 # ---- summary -------------------------------------------------------------------
 Write-Host ""
 Write-Host "================= VERIFY SUMMARY ================="
 Write-Host ("  unit layer (prototest):   " + $(if ($unitOk) { "PASS" } else { "FAIL" }))
 Write-Host ("  contract fixtures:        " + $(if ($fixOk)  { "PASS" } else { "FAIL" }))
+Write-Host ("  oracle fixtures:          " + $(if ($oracleOk) { "PASS" } else { "FAIL" }))
 Write-Host ("OVERALL: " + $(if ($overall) { "PASS" } else { "FAIL" }))
 if ($overall) { exit 0 } else { exit 1 }

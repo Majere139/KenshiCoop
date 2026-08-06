@@ -2017,6 +2017,11 @@ void configureReplicator() {
     g_repl.setChainSync(g_cfg.chainSync);
     g_repl.setStealthSync(g_cfg.stealthSync);
 
+    // Prone posture sync (protocol 53, default ON): driven copies are posed with
+    // the owner's exact ProneState so an injured crawler is not walk-driven
+    // upright. KENSHICOOP_PRONE_SYNC=0 is the A/B escape hatch.
+    g_repl.setProneSync(g_cfg.proneSync);
+
     // Shared money pool (protocol 52, default ON): one host-authoritative purse
     // both players spend from. KENSHICOOP_MONEY_SYNC=0 is the A/B escape hatch
     // (and the shop_probe baseline).

@@ -992,7 +992,9 @@ private:
         EntityState npcs[MAX_LOG];
         unsigned int n = engine::captureNpcs(ctx.gw, npcs, MAX_LOG);
         for (unsigned int i = 0; i < n && nStrikers_ < MAX_CROWD; ++i) {
-            if (npcs[i].bodyState != 0) continue;           // down/dead/ragdoll
+            // down/dead/ragdoll. bodyFlags strips the protocol-53 prone field,
+            // which is a posture value sharing the word, not a flag.
+            if (bodyFlags(npcs[i].bodyState) != 0) continue;
             if (taskIsCombat(npcs[i].task)) continue;       // already brawling
             handFromEntity(npcs[i], striker_[nStrikers_]);
             char b[96];
@@ -1324,6 +1326,8 @@ private:
     }
 
     // Count spawned enemies currently down/dead on this side; log the running peak.
+    // bodyFlags strips the protocol-53 prone field: a crippled or crouching enemy
+    // is not down, and counting it as such would inflate the win metric.
     void countDowned(const ScenarioContext& ctx) {
         unsigned int down = 0;
         if (ctx.isHost) {
@@ -1331,12 +1335,12 @@ private:
                 Character* c = engine::resolveCharByHand(enemy_[i][3], enemy_[i][4],
                                                          enemy_[i][0], enemy_[i][1],
                                                          enemy_[i][2]);
-                if (c && engine::readBodyState(c) != 0) ++down;
+                if (c && bodyFlags(engine::readBodyState(c)) != 0) ++down;
             }
         } else {
             for (unsigned int s = 0; s < nSeen_; ++s) {
                 Character* c = engine::resolve(seen_[s]);
-                if (c && engine::readBodyState(c) != 0) ++down;
+                if (c && bodyFlags(engine::readBodyState(c)) != 0) ++down;
             }
         }
         if (down > maxDown_) {

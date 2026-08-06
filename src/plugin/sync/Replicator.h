@@ -150,6 +150,12 @@ public:
     // indicator feedback stream. KENSHICOOP_STEALTH_SYNC=0 disables.
     void setStealthSync(bool v) { stealthSync_ = v; }
 
+    // Prone posture sync (protocol 53, default ON): continuous ProneState apply
+    // on driven copies (engine-native setProneState), so an injured crawler is
+    // posed as one instead of being walk-driven upright. The crippled FLAG (the
+    // cause) rides the medical channel. KENSHICOOP_PRONE_SYNC=0 disables.
+    void setProneSync(bool v) { proneSync_ = v; }
+
     // Runtime-spawn proxy replication (protocol 21, default ON): the join
     // requests a description for any streamed hand it cannot resolve (a host
     // RUNTIME spawn) and mints a local proxy body bound at the applyTargets
@@ -793,6 +799,9 @@ private:
         unsigned long chainHealTick;
         // Stealth sync (protocol 20):
         unsigned long sneakTick;      // last setStealthMode apply (mode-flap throttle)
+        // Prone posture sync (protocol 53):
+        unsigned long proneTick;      // last setProneState apply (posture-flap throttle)
+        bool          crawlDrive;     // in the kinematic crawl regime (regime-edge log)
         // Velocity-aware snap gate (2026-07-11): slow-decaying peak of the
         // source's wall-clock speed. The instantaneous 2-sample estimate
         // collapses to ~0 the moment the source halts, deflating the snap
@@ -835,7 +844,8 @@ private:
                    carryHealTick(0), carryNoSeeTick(0),
                    furnHealTick(0), furnNoSeeTick(0), furnPeerTick(0),
                    haveChainOwner(false), chainHealTick(0),
-                   sneakTick(0), velPeak(0.0f), moveSeenMs(0), wasMoving(false),
+                   sneakTick(0), proneTick(0), crawlDrive(false),
+                   velPeak(0.0f), moveSeenMs(0), wasMoving(false),
                    restEnterMs(0), walkBranchPrev(false),
                    zeroF(0), activeF(0), midSeenMs(0) {
             chainOwner[0] = chainOwner[1] = chainOwner[2] = chainOwner[3] = chainOwner[4] = 0;
@@ -1553,6 +1563,11 @@ private:
     // MEASURE that claim per run ("SCENARIO QUIET ..." in logSmoothSummary) so the
     // eventual deletion is evidence-gated rather than hopeful.
     unsigned long        quietRelapse_;   // I11: endAction re-fired on a march relapse
+    // Protocol 53: CharMovement::restore calls on a driven crawler whose physics
+    // character the engine tore down at collapse and (being AI-suspended) never
+    // re-created. Nonzero means the "mesh frozen at the collapse spot while the
+    // nametag follows the stream" repair actually fired.
+    unsigned long        crawlPhysRestore_;
     unsigned long        sitOrders_;      // applyTaskOrder issues (the sit/work APPLY lever)
     unsigned long        detachUses_;     // detachFromTownAI calls from applyRest (sitter path)
     bool                 noDetach_;       // KENSHICOOP_NO_DETACH=1: skip sitter detach (A/B experiment)
@@ -1578,6 +1593,8 @@ private:
     bool                 chainSync_;
     // Stealth sync (protocol 20): master enable (KENSHICOOP_STEALTH_SYNC).
     bool                 stealthSync_;
+    // Prone posture sync (protocol 53): master enable (KENSHICOOP_PRONE_SYNC).
+    bool                 proneSync_;
     // Host-side detection-feedback publish state per DRIVEN sneaker: last sent
     // map fingerprint + send time (~4 Hz change-gated), and whether the last
     // snapshot was ACTIVE (so the end of a sneak authors exactly one clearing

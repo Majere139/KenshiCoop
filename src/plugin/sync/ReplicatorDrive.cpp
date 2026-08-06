@@ -626,10 +626,14 @@ void Replicator::applyTargets(GameWorld* gw) {
                 // owner (buffered; publishOwned sends), HOLD the self-heal
                 // exit while it crosses, and re-author every FURN_PEER_MS
                 // until the owner's stream carries the bit. KO'd/down bodies
-                // only - a conscious voluntary use stays owner-authored.
-                bool downish = coop::bodyIsDown(out.bodyState) || d.koLatched ||
-                               d.deathLatched ||
-                               coop::bodyIsDown(engine::readBodyState(c));
+                // only - a conscious voluntary use stays owner-authored, which
+                // (protocol 53) is why the crawlers are excluded by name: a
+                // crippled body reads Character::isDown() while conscious, so
+                // plain bodyIsDown would have us author bed-enters for someone
+                // who crawled past a bed under their own control.
+                bool downish = coop::bodyDownNotCrawling(out.bodyState) ||
+                               d.koLatched || d.deathLatched ||
+                               coop::bodyDownNotCrawling(engine::readBodyState(c));
                 if (streamNpcs_ && isSquad && downish) {
                     if (d.furnPeerTick == 0 || (now - d.furnPeerTick) >= FURN_PEER_MS) {
                         d.furnPeerTick = now;
@@ -668,13 +672,28 @@ void Replicator::applyTargets(GameWorld* gw) {
                 d.furnNoSeeTick = 0;
             }
         }
+        // ---- Crawl carve-out (protocol 53) -------------------------------------
+        // A crippled body is DOWN by Character::isDown() but CONSCIOUS and moving
+        // under its own power. Without this it took the down path below, which
+        // knockDown/holdDown-pins it and teleport-co-locates it every tick, so the
+        // copy lay motionless while its owner crawled away - the reported bug -
+        // and it never reached the posture apply or the walk drive at all.
+        // Same shape as the carried/furniture carve-outs above: decided BEFORE the
+        // down test, from the streamed prone field rather than a local guess.
+        // It also overrides a stale koLatched on purpose: the crawler IS the proof
+        // that the body woke up, and the latch would otherwise hold it down until
+        // an EVT_REVIVE that the pre-53 edge detector never sent. deathLatched
+        // still wins absolutely - a corpse does not crawl.
+        bool crawling = proneSync_ && coop::bodyIsCrawling(out.bodyState) &&
+                        !d.deathLatched;
         // A latched EVT_DEATH/EVT_KNOCKOUT forces the down treatment every tick,
         // which is what keeps a corpse pinned. That latch lives on this Driven
         // record, so it MUST survive a hand re-key - rekeyPeerBody carries
         // deathLatched/koLatched from the old key onto the new one (2026-07-15);
         // without that carry a dead body that re-containers would fall through
         // to the drive path below and the local AI would stand it back up.
-        if (coop::bodyIsDown(out.bodyState) || d.deathLatched || d.koLatched) {
+        if (!crawling &&
+            (coop::bodyIsDown(out.bodyState) || d.deathLatched || d.koLatched)) {
             unsigned short localBs = engine::readBodyState(c);
             if (!coop::bodyIsDown(localBs)) engine::knockDown(c, true);
             else                            engine::holdDown(c);
@@ -713,6 +732,39 @@ void Replicator::applyTargets(GameWorld* gw) {
                 char b[128]; _snprintf(b, sizeof(b) - 1,
                     "[sneak] APPLY hand=%u,%u on=%d ok=%d",
                     out.hIndex, out.hSerial, want ? 1 : 0, ok ? 1 : 0);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+        }
+
+        // ---- Prone posture (protocol 53) ---------------------------------------
+        // The streamed prone FIELD is the owner's Character::_currentProneState
+        // exactly, so a difference on the local copy just re-runs the engine's own
+        // setProneState. This is the half BODY_CRAWL could never supply: that bit
+        // is isStealthModeOrCrawling, true for the sneak toggle AND an injured
+        // crawl, so it names no posture to apply - and it must never be routed to
+        // setStealthMode (that would put a crawler in sneak MODE, changing who can
+        // see it, and its own next capture would then publish a fake BODY_SNEAK).
+        // Without this a crippled crawler fails the down test (correctly - it moves
+        // under its own power), fails the sneak test, and is driven by the upright
+        // walk path below.
+        //
+        // Reached only by an upright-ish, un-carried, un-occupied, un-chained body
+        // (every branch above continues out), so PS_KO / PS_PLAYING_DEAD bodies
+        // stay the down path's property along with its death/KO latches. Throttled
+        // like the sneak apply: a copy whose engine re-derives the posture from its
+        // own medical model re-poses at 1 Hz rather than being fought per frame.
+        // The crippled FLAG that gait selection actually reads is applied by the
+        // medical channel (MED_CRIPPLED); posing without it renders upright.
+        if (proneSync_) {
+            u8  want  = coop::bodyProne(out.bodyState);
+            int local = engine::readProneState(c);
+            if (local >= 0 && local != (int)want &&
+                (d.proneTick == 0 || (now - d.proneTick) >= PRONE_APPLY_MS)) {
+                d.proneTick = now;
+                bool ok = engine::applyProneState(c, (int)want);
+                char b[128]; _snprintf(b, sizeof(b) - 1,
+                    "[prone] APPLY hand=%u,%u want=%u was=%d ok=%d",
+                    out.hIndex, out.hSerial, (unsigned)want, local, ok ? 1 : 0);
                 b[sizeof(b) - 1] = '\0'; coop::logLine(b);
             }
         }
@@ -1441,6 +1493,65 @@ void Replicator::applyTargets(GameWorld* gw) {
                             gapNewest, vlen, snapGate, d.haveDest);
             }
             d.parked = false; d.haveDest = false;
+        } else if (genuinelyMoving && crawling) {
+            // ---- Crawl drive (protocol 53) --------------------------------------
+            // A crawler obeys no move-order: the engine will not locomote a body
+            // that reports Character::isDown(), so the walkTo below is issued and
+            // silently does nothing (run 20260805_153425: the interp measured
+            // zero=1206 of active=1209 driven ticks moving the body 0 units, while
+            // the streamed mv/cSpeed mirror landed and played the crawl clip - the
+            // body crawled in place as its owner crawled away). So this regime
+            // drives the body itself, in the three parts the engine keeps separate.
+            //
+            // 1. The physics character it is RENDERED from. The engine destroys it
+            // on collapse and re-creates it on recovery; an AI-suspended copy never
+            // runs that recovery, so it is left without one - measured as hk=0 for
+            // 95 of the copy's samples against exactly the 5 the OWNER spent in
+            // PS_KO. Placing such a body moves CharMovement::pos (so getPosition,
+            // the nametag and every position oracle track) while the mesh stays
+            // where the controller died.
+            if (!engine::hasPhysicsBody(c) && engine::restoreMovement(c)) {
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[prone] CRAWL-PHYS restore hand=%u,%u", out.hIndex, out.hSerial);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                ++crawlPhysRestore_;
+            }
+            // 2. The PLACEMENT, per tick against the interpolated sample, which is
+            // what makes the follow smooth (gap 0.25 u, zeroFrac 0.008) rather than
+            // a gap-triggered teleport. applyRaw is the no-halt placement, so it
+            // does not reset the clip phase.
+            // CharMovement::manualMovement was tried here first, on the theory that
+            // asking the engine to MOVE the body would let physics, mesh and
+            // animation all follow from one act. It moved nothing: the copy's
+            // physics velocity stayed at zero and the body only advanced on the
+            // reconciliation teleports, which cost gap 0.25 -> 2.22 u and failed
+            // the smoothness gate (run 20260805_164254). A body the local AI is
+            // suspended on does not consume a desired motion.
+            engine::applyRaw(c, out);
+            // 3. The MOTION, mirrored at BOTH layers, because they answer to
+            // different consumers. applyMotion's CharMovement fields drive an
+            // upright copy's walk/run selection; a crawler's clip instead advances
+            // on its physics character's motion, which a PLACED body never has -
+            // that is the "slides along the ground frozen" half, and it is the same
+            // fact as the earlier "animates but cannot move" half seen from the
+            // other side (that body had no physics character for the clip to read,
+            // so the mirror alone drove it).
+            if (isSquad)
+                engine::applyMotion(c, true, out.cSpeed,
+                                    out.cMotionX, out.cMotionY, out.cMotionZ);
+            engine::applyPhysMotion(c, out.cMotionX, out.cMotionY, out.cMotionZ,
+                                    out.cSpeed);
+            // No destination is outstanding: clear it so a body that HEALS back
+            // upright re-issues a fresh walk target instead of inheriting a stale
+            // lead point from before it was crippled.
+            d.parked = false; d.haveDest = false;
+            if (!d.crawlDrive) {
+                d.crawlDrive = true;
+                char b[160]; _snprintf(b, sizeof(b) - 1,
+                    "[prone] CRAWL-DRIVE enter hand=%u,%u spd=%.2f",
+                    out.hIndex, out.hSerial, (double)out.cSpeed);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
         } else if (genuinelyMoving) {
             float tx = newest.x, ty = newest.y, tz = newest.z;
             // Lead only while the instantaneous velocity is meaningful: the
@@ -1495,6 +1606,19 @@ void Replicator::applyTargets(GameWorld* gw) {
             if (d.walkBranchPrev || d.restEnterMs == 0) d.restEnterMs = now;
             applyRest(c, d, out, haveActual, ax, ay, az, now, isSquad);
             d.haveDest = false;
+        }
+        // A crawler that STOPS must stop reporting motion, or the clip keeps
+        // crawling on the spot. The rest path zeroes the CharMovement mirror for
+        // every body; this zeroes the physics pair, and only for a crawler - a body
+        // the engine moves itself owns those fields.
+        if (crawling && !genuinelyMoving)
+            engine::applyPhysMotion(c, 0.0f, 0.0f, 0.0f, 0.0f);
+        if (d.crawlDrive && !crawling) {
+            d.crawlDrive = false;
+            char b[160]; _snprintf(b, sizeof(b) - 1,
+                "[prone] CRAWL-DRIVE exit hand=%u,%u bs=%u",
+                out.hIndex, out.hSerial, (unsigned)out.bodyState);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
         d.walkBranchPrev = genuinelyMoving;
 

@@ -397,7 +397,16 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
         u16 prev = (pit != hostBody_.end()) ? pit->second.bs : 0;
         u16 cur  = e.bodyState;
         if (cur != prev) {
-            bool wasDown = bodyIsDown(prev), isDownNow = bodyIsDown(cur);
+            // Protocol 53: the KO/REVIVE edges are computed on "down and NOT
+            // crawling". A crippled body sets BODY_DOWN while fully conscious
+            // (measured: bs 0->1033, unc=0), so on plain bodyIsDown losing a leg
+            // emitted EVT_KNOCKOUT and the peer latched KO permanently - which
+            // pins the body down for good, since the recovery edge (PS_KO ->
+            // PS_CRIPPLED) is down->down and emitted no REVIVE to clear it.
+            // With the carve-out all four transitions read correctly: upright ->
+            // crawl and crawl -> upright are non-events, crawl -> PS_KO is a real
+            // KNOCKOUT, and PS_KO -> crawl is a REVIVE (it regained consciousness).
+            bool wasDown = bodyDownNotCrawling(prev), isDownNow = bodyDownNotCrawling(cur);
             bool wasDead = (prev & BODY_DEAD) != 0, isDeadNow = (cur & BODY_DEAD) != 0;
             u8 evType = EVT_NONE;
             if (isDeadNow && !wasDead)       evType = EVT_DEATH;

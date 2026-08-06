@@ -25,7 +25,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 52;
+const u16 PROTOCOL_VERSION = 53;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -260,6 +260,9 @@ struct EntityState {
     // - down/KO, ragdoll, dead, crawling. 0 = upright/normal. The join reproduces the
     // down/dead posture from these (locomotion/task sync alone can't express a body
     // lying on the ground), and a body that is down must NOT be walk-driven/parked.
+    // Bits 9-11 are the protocol-53 PRONE FIELD (BODY_PRONE_*), not a flag: the
+    // owner's exact ProneState, which the join applies via setProneState so a
+    // crippled crawler is not driven as an upright walker.
     u16 bodyState;
 };
 
@@ -326,6 +329,24 @@ const u16 BODY_SNEAK   = 1 << 7;
 // Rides the furniture pipeline as kind=3 (the actor hand carries the OWNER).
 const u16 BODY_CHAINED = 1 << 8;
 
+// Prone posture (protocol 53): Character::_currentProneState EXACTLY, as a 3-bit
+// FIELD in bits 9-11 (the bit-flags above stop at 1 << 8, so the field is free
+// headroom rather than an EntityState resize). BODY_CRAWL alone cannot express
+// this: it is isStealthModeOrCrawling, which conflates the sneak toggle with an
+// INJURED crawl, so a receiver reading it can only guess which posture to apply -
+// and guessing PS_CRIPPLED mis-posts a merely low-crouching body. The engine's
+// own value crosses instead, so the join applies exactly what the owner has.
+// Values match kenshi's ProneState enum; 0 (PS_NORMAL) is both "upright" and the
+// value a fault yields, matching readBodyState's "a fault returns 0 (treated as
+// upright)" contract.
+const u16 BODY_PRONE_SHIFT = 9;
+const u16 BODY_PRONE_MASK  = 7 << 9;
+const u8  PRONE_NORMAL       = 0; // PS_NORMAL
+const u8  PRONE_STAYING_LOW  = 1; // PS_STAYING_LOW
+const u8  PRONE_CRIPPLED     = 2; // PS_CRIPPLED (the injured crawl this fixes)
+const u8  PRONE_PLAYING_DEAD = 3; // PS_PLAYING_DEAD
+const u8  PRONE_KO           = 4; // PS_KO
+
 // True if the body should be treated as lying down (suppress walk-drive / parking).
 // Deliberately ignores BODY_CARRIED (and the occupancy bits): the receiver checks
 // bodyIsCarried/bodyInFurniture FIRST and skips the down path entirely for them.
@@ -334,6 +355,42 @@ inline bool bodyIsCarried(u16 s) { return (s & BODY_CARRIED) != 0; }
 inline bool bodyInFurniture(u16 s) { return (s & (BODY_IN_BED | BODY_IN_CAGE | BODY_CHAINED)) != 0; }
 inline bool bodyChained(u16 s)   { return (s & BODY_CHAINED) != 0; }
 inline bool bodySneaking(u16 s)  { return (s & BODY_SNEAK) != 0; }
+// Prone posture accessors (protocol 53). bodyWithProne REPLACES any prone value
+// already in s, so a re-stamp cannot OR two postures into a nonsense field; a
+// value that does not fit 3 bits is stamped as PRONE_NORMAL (fail-upright).
+inline u8  bodyProne(u16 s) { return (u8)((s & BODY_PRONE_MASK) >> BODY_PRONE_SHIFT); }
+// The FLAG bits with the prone field stripped. For the call sites that mean "any
+// non-upright flag is set" and test the whole word against 0: once a posture
+// FIELD shares the word, a bare `bodyState != 0` reads a crouching or crippled
+// body as down/dead.
+inline u16 bodyFlags(u16 s) { return (u16)(s & ~BODY_PRONE_MASK); }
+
+// A body that reads DOWN but is a CONSCIOUS, self-propelled crawler rather than a
+// collapsed one. BODY_DOWN is Character::isDown(), which is true for a crippled
+// body dragging itself along the ground as well as for an unconscious one - and
+// the two need OPPOSITE treatment, so every "is it down" test that drives
+// enforcement has to know which it has. Nothing before protocol 53 could tell
+// them apart: BODY_CRAWL is set for a sneaker too, and the medical flags say
+// nothing about posture. The prone field does (PS_CRIPPLED = under its own power,
+// PS_KO = out cold), which is the second reason it is on the wire.
+// Measured (run 20260805_152546): a leg amputation streams bs=2051
+// (DOWN|RAGDOLL|PS_KO) for ~2 s of collapse, then settles at bs=1033
+// (DOWN|CRAWL|PS_CRIPPLED) with unc=0 dead=0 for the rest of the run.
+// Dead wins unconditionally: a corpse is never a crawler.
+inline bool bodyIsCrawling(u16 s) {
+    return bodyProne(s) == PRONE_CRIPPLED && (s & BODY_DEAD) == 0;
+}
+// bodyIsDown() minus the conscious crawlers. This is the predicate that the
+// KO/REVIVE edge detector and the receiver's down ENFORCEMENT must use: with
+// plain bodyIsDown, losing a leg reads as a knockout (so the peer latches KO)
+// and the crawler is then knockDown/holdDown-pinned to the ground for the rest
+// of the session instead of crawling after its owner.
+inline bool bodyDownNotCrawling(u16 s) { return bodyIsDown(s) && !bodyIsCrawling(s); }
+inline u16 bodyWithProne(u16 s, u8 p) {
+    u16 keep = (u16)(s & ~BODY_PRONE_MASK);
+    if (p > PRONE_KO) return keep;
+    return (u16)(keep | ((u16)p << BODY_PRONE_SHIFT));
+}
 
 // An entity batch is: [EntityBatchHeader][EntityState * count]. ownerId tags the
 // streaming peer; the receiver attributes every contained hand to that owner so
@@ -742,6 +799,13 @@ const u32 WORLD_ITEM_NETID_NONE = 0u;
 // NPC renders true health on the join instead of pristine.
 const u8 MED_UNCONSCIOUS = 1 << 0;
 const u8 MED_DEAD        = 1 << 1;
+// Protocol 53: MedicalSystem::crippled - the CAUSE behind an injured crawl, and
+// unlike unconscious/dead it is NOT advisory here: no event channel owns the
+// crippled transition, so this flag is the authority and the receiver writes it.
+// The engine's crawl locomotion/animation paths key on this bool
+// (CharMovement::combatMovementUpdate_crippleMode, combatMovementAnimationUpdate),
+// so replicating the prone POSTURE without it leaves the copy walking upright.
+const u8 MED_CRIPPLED    = 1 << 2;
 
 // Protocol 16: one anatomy part's full damage model. Parts are keyed by their
 // ANATOMY INDEX (MedicalSystem::anatomy order) - both clients load the same
