@@ -333,9 +333,12 @@ function Test-AssaultTown {
 #   4. applied  - the host ordered its join-PC copy ("[combat] order ... r=2";
 #                 r=1 = the victim hand never resolved there)
 #   5. fight    - the host's local engine ran it ("hostview fight=1" samples)
-#   6. parity   - per NPC hand, how many 1 Hz samples show a body fighting on the
-#                 join while the host has it at peace. The field log's signature
-#                 was a 22 s one-sided fight, so this is the gate that names it.
+#   6. parity   - per NPC hand, how many 1 Hz samples show a body fighting on one
+#                 client while the other has it at peace. The field log's
+#                 signature was a 22 s one-sided fight, so this is the gate that
+#                 names it. Gated in BOTH directions: cell claims can hand a
+#                 world NPC to either client, so either screen can be the one
+#                 running a fight the body's owner never authored.
 # Parity reads the MEMBER (host) / RECV (join) entity series, whose task= field is
 # each client's own truth, keyed on the hand's INDEX,SERIAL only: a body pulled
 # into a local runtime squad mid-fight keeps its index/serial but changes its hand
@@ -386,8 +389,9 @@ function Test-AssaultTravel {
             minted = $minted
             pairs = $par.pairs; agree = $par.agree
             joinOnly = $par.joinOnly; joinOnlyFrac = $par.joinOnlyFrac
-            hostOnly = $par.hostOnly; worstHand = $par.worstHand
-            worstJoinOnly = $par.worstJoinOnly }
+            hostOnly = $par.hostOnly; hostOnlyFrac = $par.hostOnlyFrac
+            worstHand = $par.worstHand; worstJoinOnly = $par.worstJoinOnly
+            worstHostHand = $par.worstHostHand; worstHostOnly = $par.worstHostOnly }
     $bad = @()
     if ($RequireMint -and $minted -lt 1) {
         $bad += "the victim $vic was not a minted body on the join (no [spawn] proxy BOUND; link 0: the run did not reproduce the field setup)"
@@ -405,6 +409,16 @@ function Test-AssaultTravel {
         $worst = if ($par.worstHand) { " (worst hand $($par.worstHand), $($par.worstJoinOnly) samples)" } else { "" }
         $bad += ("one-sided fighting: $($par.joinOnly)/$($par.pairs) paired samples ($($par.joinOnlyFrac)) " +
                  "have a body fighting on the join while the host has it at peace" + $worst +
+                 "; link 6: parity")
+    }
+    # The mirror case. A world NPC belongs to whichever client claimed its cell,
+    # so a join squad alone in a cell owns the bodies there and the HOST is the
+    # driven side - then the invented fight is the host's. Same defect, same
+    # gate: neither screen may run a fight its owner is not running.
+    if ($par.pairs -ge $MinPairs -and $par.hostOnlyFrac -gt $MaxJoinOnlyFrac) {
+        $worst = if ($par.worstHostHand) { " (worst hand $($par.worstHostHand), $($par.worstHostOnly) samples)" } else { "" }
+        $bad += ("one-sided fighting: $($par.hostOnly)/$($par.pairs) paired samples ($($par.hostOnlyFrac)) " +
+                 "have a body fighting on the host while the join has it at peace" + $worst +
                  "; link 6: parity")
     }
     if ($bad.Count -gt 0) {
@@ -439,32 +453,7 @@ function Get-FightTaskParity {
     param([string]$HostFile, [string]$JoinFile, [int]$TolMs = 1500)
     $hostMap = Convert-ToFightSeries -Series (Get-ScenarioSeries -File $HostFile -Kind 'MEMBER')
     $joinMap = Convert-ToFightSeries -Series (Get-ScenarioSeries -File $JoinFile -Kind 'RECV')
-    $pairs = 0; $agree = 0; $joinOnly = 0; $hostOnly = 0
-    $worstHand = ''; $worstJoinOnly = 0
-    foreach ($hand in $joinMap.Keys) {
-        if (-not $hostMap.ContainsKey($hand)) { continue }
-        $jSamples = @($joinMap[$hand] | Sort-Object t)
-        $hSamples = @($hostMap[$hand] | Sort-Object t)
-        $handJoinOnly = 0
-        foreach ($jr in $jSamples) {
-            $best = $null; $bd = [int]::MaxValue
-            foreach ($hr in $hSamples) {
-                $dd = [Math]::Abs([int]$hr.t - [int]$jr.t)
-                if ($dd -lt $bd) { $bd = $dd; $best = $hr }
-            }
-            if ($null -eq $best -or $bd -gt $TolMs) { continue }
-            $pairs++
-            if ($jr.fight -eq $best.fight) { $agree++ }
-            elseif ($jr.fight -eq 1) { $joinOnly++; $handJoinOnly++ }
-            else { $hostOnly++ }
-        }
-        if ($handJoinOnly -gt $worstJoinOnly) { $worstJoinOnly = $handJoinOnly; $worstHand = $hand }
-    }
-    $frac = if ($pairs -gt 0) { [Math]::Round($joinOnly / $pairs, 3) } else { 0 }
-    return [pscustomobject]@{
-        pairs = $pairs; agree = $agree; joinOnly = $joinOnly; hostOnly = $hostOnly
-        joinOnlyFrac = $frac; worstHand = $worstHand; worstJoinOnly = $worstJoinOnly
-    }
+    return (Measure-FightDisagreement -HostMap $hostMap -JoinMap $joinMap -TolMs $TolMs)
 }
 
 # The same disagreement count for the ENEMY specifically, from the scenario's
@@ -486,13 +475,25 @@ function Get-EnemyStateParity {
                 t = (Convert-StampToMs -Groups $g -OffsetMs $off); fight = [int]$g[6].Value })
         }
     }
+    return (Measure-FightDisagreement -HostMap $hostMap -JoinMap $joinMap -TolMs $TolMs)
+}
+
+# Nearest-sample pairing of two 'hand -> @{t; fight}' maps, counting the fight
+# disagreements in BOTH directions. Direction matters for the diagnosis but not
+# for the verdict: whoever OWNS a body is its combat authority, and cell claims
+# hand ownership of world NPCs to either client (Replicator::authorityFor - the
+# host only wins ties), so "fighting here, at peace over there" is the same
+# defect whichever screen is the one inventing the fight.
+function Measure-FightDisagreement {
+    param($HostMap, $JoinMap, [int]$TolMs = 1500)
     $pairs = 0; $agree = 0; $joinOnly = 0; $hostOnly = 0
     $worstHand = ''; $worstJoinOnly = 0
-    foreach ($hand in $joinMap.Keys) {
-        if (-not $hostMap.ContainsKey($hand)) { continue }
-        $jSamples = @($joinMap[$hand] | Sort-Object t)
-        $hSamples = @($hostMap[$hand] | Sort-Object t)
-        $handJoinOnly = 0
+    $worstHostHand = ''; $worstHostOnly = 0
+    foreach ($hand in $JoinMap.Keys) {
+        if (-not $HostMap.ContainsKey($hand)) { continue }
+        $jSamples = @($JoinMap[$hand] | Sort-Object t)
+        $hSamples = @($HostMap[$hand] | Sort-Object t)
+        $handJoinOnly = 0; $handHostOnly = 0
         foreach ($jr in $jSamples) {
             $best = $null; $bd = [int]::MaxValue
             foreach ($hr in $hSamples) {
@@ -503,14 +504,18 @@ function Get-EnemyStateParity {
             $pairs++
             if ($jr.fight -eq $best.fight) { $agree++ }
             elseif ($jr.fight -eq 1) { $joinOnly++; $handJoinOnly++ }
-            else { $hostOnly++ }
+            else { $hostOnly++; $handHostOnly++ }
         }
         if ($handJoinOnly -gt $worstJoinOnly) { $worstJoinOnly = $handJoinOnly; $worstHand = $hand }
+        if ($handHostOnly -gt $worstHostOnly) { $worstHostOnly = $handHostOnly; $worstHostHand = $hand }
     }
-    $frac = if ($pairs -gt 0) { [Math]::Round($joinOnly / $pairs, 3) } else { 0 }
+    $jFrac = if ($pairs -gt 0) { [Math]::Round($joinOnly / $pairs, 3) } else { 0 }
+    $hFrac = if ($pairs -gt 0) { [Math]::Round($hostOnly / $pairs, 3) } else { 0 }
     return [pscustomobject]@{
         pairs = $pairs; agree = $agree; joinOnly = $joinOnly; hostOnly = $hostOnly
-        joinOnlyFrac = $frac; worstHand = $worstHand; worstJoinOnly = $worstJoinOnly
+        joinOnlyFrac = $jFrac; hostOnlyFrac = $hFrac
+        worstHand = $worstHand; worstJoinOnly = $worstJoinOnly
+        worstHostHand = $worstHostHand; worstHostOnly = $worstHostOnly
     }
 }
 
