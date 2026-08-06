@@ -1369,7 +1369,11 @@ function Test-PcAssault {
     # while the host reports peace" fraction. Reported as a FINDING, NOT gated: with
     # the decoupled damage channel the join's local fight is cosmetic while the host
     # copy holds POSITION PARITY (deliberately at peace), so a moderate joinOnlyFrac
-    # is EXPECTED and healthy here (measured 0.08-0.27 across clean runs). The real
+    # is EXPECTED and healthy here. The 0.08-0.27 originally quoted from the three
+    # protocol-45 validation runs understates the spread: the recorded verdicts for
+    # unmodified builds read 0.038 (2026-07-22), 0.32 (07-29), 0.325 (08-01) and
+    # 0.314 (08-03), with churn up to 30.9/min - so read this number as a wide
+    # 0.04-0.33 and do not treat a shift inside it as a signal. The real
     # warp/redirect-churn regression guard is combat_snap_rate on combat_crowd/
     # combat_battle/combat_win (it measures the driven-copy snap teleports directly);
     # an upper bound on joinOnlyFrac would both flake and point the wrong way (the
