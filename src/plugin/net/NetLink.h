@@ -134,6 +134,10 @@ public:
     // MAIN thread: queue a reliable host-authoritative known-research row
     // (protocol 38). First-sight sent + safety-resent by the caller.
     void queueResearch(const ResearchPacket& pkt);
+    // MAIN thread: queue a reliable property-deed ownership row (protocol 54).
+    // Symmetric (either client may buy); first-sight sent + safety-resent by the
+    // caller, so a party that buys nothing is silent after the baseline.
+    void queueDeed(const DeedPacket& pkt);
     void queueBuildPlace(const BuildPlacePacket& pkt);
     void queueBuildState(const BuildStatePacket& pkt);
     void queueBuildDoor(const BuildDoorPacket& pkt);
@@ -294,6 +298,8 @@ private:
     std::vector<ProdPacket>      outProd_;
     // Reliable known-research rows (protocol 38). Guarded by outCs_.
     std::vector<ResearchPacket>  outResearch_;
+    // Reliable property-deed ownership rows (protocol 54). Guarded by outCs_.
+    std::vector<DeedPacket>      outDeed_;
     std::vector<BuildPlacePacket> outBuildPlace_;
     std::vector<BuildStatePacket> outBuildState_;
     std::vector<BuildDoorPacket>  outBuildDoor_;

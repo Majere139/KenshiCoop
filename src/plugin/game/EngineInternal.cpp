@@ -667,6 +667,23 @@ BuyItemFn     g_buyItemFn     = 0;
 PlatoonRefreshInvFn g_platoonRefreshInvFn = 0;
 ShopGetTraderFn     g_shopGetTraderFn     = 0;
 
+// Property deeds (protocol 54). Buying a house/shop adds the building's hand to
+// the PLAYER FACTION's owned-object set (Faction::factionOwnerships) and moves
+// the building's owner faction; these are the set half. The faction half is
+// RootObjectBase::setFaction, which is virtual and needs no resolved pointer.
+OwnAddObjFn   g_ownAddObjFn   = 0;
+OwnRemObjFn   g_ownRemObjFn   = 0;
+OwnIsOwnedFn  g_ownIsOwnedFn  = 0;
+OwnCanUseBldFn      g_ownCanUseBldFn      = 0;
+BldIsThePlayerFn    g_bldIsThePlayerFn    = 0;
+BldResidentLeaderFn g_bldResidentLeaderFn = 0;
+BldNumInternalFn    g_bldNumInternalFn    = 0;
+BldNotifyChangeFn   g_bldNotifyChangeFn   = 0;
+BldGetRealTownFn     g_bldGetRealTownFn     = 0;
+TownSetPlayerBldgsFn g_townSetPlayerBldgsFn = 0;
+TownRecalcLevelFn    g_townRecalcLevelFn    = 0;
+TownIsPlayerBldgsFn  g_townIsPlayerBldgsFn  = 0;
+
 // Purchase observability detour (protocol 22, 1c groundwork). Inventory::
 // buyItem is the engine's ONE real purchase path (a trade-UI drag lands here),
 // but automation cannot reach it in the test save (vendor inventories are lazy
@@ -1666,6 +1683,29 @@ void resolve() {
     g_platoonRefreshInvFn =
         (PlatoonRefreshInvFn)KenshiLib::GetRealAddress(&ActivePlatoon::refreshInventory);
     g_shopGetTraderFn = (ShopGetTraderFn)KenshiLib::GetRealAddress(&ShopTrader::getTrader);
+    // Property deeds (protocol 54; non-fatal: unresolved -> CAP_DEED off and the
+    // deed channel refuses to write, which the deed_probe reports).
+    g_ownAddObjFn  = (OwnAddObjFn)KenshiLib::GetRealAddress(&Ownerships::addOwnedObject);
+    g_ownRemObjFn  = (OwnRemObjFn)KenshiLib::GetRealAddress(&Ownerships::removeOwnedObject);
+    g_ownIsOwnedFn = (OwnIsOwnedFn)KenshiLib::GetRealAddress(&Ownerships::isOwned);
+    g_ownCanUseBldFn =
+        (OwnCanUseBldFn)KenshiLib::GetRealAddress(&Ownerships::canIUseThisBuilding);
+    g_bldIsThePlayerFn =
+        (BldIsThePlayerFn)KenshiLib::GetRealAddress(&Building::isThePlayer);
+    g_bldResidentLeaderFn =
+        (BldResidentLeaderFn)KenshiLib::GetRealAddress(&Building::getResidentSquadLeader);
+    g_bldNumInternalFn =
+        (BldNumInternalFn)KenshiLib::GetRealAddress(&Building::getNumInternalBuildings);
+    g_bldNotifyChangeFn =
+        (BldNotifyChangeFn)KenshiLib::GetRealAddress(&Building::notifyChange);
+    g_bldGetRealTownFn =
+        (BldGetRealTownFn)KenshiLib::GetRealAddress(&Building::getRealTown);
+    g_townSetPlayerBldgsFn =
+        (TownSetPlayerBldgsFn)KenshiLib::GetRealAddress(&Town::setPlayerBuildingsInThisTown);
+    g_townRecalcLevelFn =
+        (TownRecalcLevelFn)KenshiLib::GetRealAddress(&Town::recalculatePlayerTownLevel);
+    g_townIsPlayerBldgsFn =
+        (TownIsPlayerBldgsFn)KenshiLib::GetRealAddress(&Town::isPlayerBuildingsInThisTown);
     // Test-scene spawn fns (non-fatal: only used by the host-side setup step).
     g_createCharFn = (CreateCharFn)KenshiLib::GetRealAddress(
         &RootObjectFactory::createRandomCharacter);
@@ -1788,7 +1828,23 @@ void resolve() {
             { (void**)&g_relGetFn,          "FactionRelations::getRelation", CAP_FACTION,       true },
             { (void**)&g_relSetFn,          "FactionRelations::setRelation", CAP_FACTION,       true },
             { (void**)&g_attackTargetFn,    "Character::attackTarget",       CAP_COMBAT_ESCALATE,true },
-            { (void**)&g_moveRestoreFn,     "CharMovement::restore",         CAP_MOVE_RESTORE,  true }
+            { (void**)&g_moveRestoreFn,     "CharMovement::restore",         CAP_MOVE_RESTORE,  true },
+            { (void**)&g_ownAddObjFn,       "Ownerships::addOwnedObject",    CAP_DEED,          true },
+            { (void**)&g_ownRemObjFn,       "Ownerships::removeOwnedObject", CAP_DEED,          true },
+            { (void**)&g_ownIsOwnedFn,      "Ownerships::isOwned",           CAP_DEED,          true },
+            // Audit-only: diagnostic depth, never a gate on the write path.
+            { (void**)&g_ownCanUseBldFn,    "Ownerships::canIUseThisBuilding",CAP_DEED,         false },
+            { (void**)&g_bldIsThePlayerFn,  "Building::isThePlayer",         CAP_DEED,          false },
+            { (void**)&g_bldResidentLeaderFn,"Building::getResidentSquadLeader",CAP_DEED,       false },
+            { (void**)&g_bldNumInternalFn,  "Building::getNumInternalBuildings",CAP_DEED,       false },
+            { (void**)&g_bldNotifyChangeFn, "Building::notifyChange",         CAP_DEED,          false },
+            // The town half of a purchase: REQUIRED, because without it the peer
+            // owns a building that never becomes part of a base (the field
+            // report - no research level, no power, no panel).
+            { (void**)&g_bldGetRealTownFn,  "Building::getRealTown",         CAP_DEED,          true },
+            { (void**)&g_townSetPlayerBldgsFn,"Town::setPlayerBuildingsHere", CAP_DEED,         true },
+            { (void**)&g_townRecalcLevelFn, "Town::recalcPlayerTownLevel",   CAP_DEED,          true },
+            { (void**)&g_townIsPlayerBldgsFn,"Town::isPlayerBuildingsHere",  CAP_DEED,          false }
         };
         const int nRows = (int)(sizeof(kCapRows) / sizeof(kCapRows[0]));
         capEvaluate(kCapRows, nRows, g_capAvail);

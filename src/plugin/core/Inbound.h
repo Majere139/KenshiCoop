@@ -239,6 +239,14 @@ struct InboundResearch {
     ResearchPacket pkt;
 };
 
+// One received property-deed row (protocol 54): a peer reports that a BAKED
+// building is (or is no longer) owned by the shared player faction. Applied as
+// a pure state write - never the buy path, which would charge the cats twice.
+struct InboundDeed {
+    u32        ownerId;
+    DeedPacket pkt;
+};
+
 // One received stealth detection-map snapshot (protocol 20): the detection
 // AUTHORITY (the host's world, where the sneaker is a driven copy) streams who
 // notices the sneaker; the sneaker's OWNER replays the entries between its
@@ -413,7 +421,8 @@ public:
         stats_(worldReset_),      money_(worldReset_),      moneyDelta_(worldReset_),
         faction_(worldReset_),
         time_(worldReset_),       door_(worldReset_),       prod_(worldReset_),
-        research_(worldReset_),   buildPlace_(worldReset_), buildState_(worldReset_),
+        research_(worldReset_),   deed_(worldReset_),
+        buildPlace_(worldReset_), buildState_(worldReset_),
         buildDoor_(worldReset_),  buildRemove_(worldReset_), stealth_(worldReset_, 512),
         spawnReq_(worldReset_),   spawnInfo_(worldReset_),  camHint_(worldReset_, 64),
         cellClaim_(worldReset_, 64) {
@@ -578,6 +587,11 @@ public:
         InboundResearch ir; ir.ownerId = ownerId; ir.pkt = pkt;
         EnterCriticalSection(&cs_); research_.push_back(ir); LeaveCriticalSection(&cs_);
     }
+    // NET thread: one received property-deed row (protocol 54), owner-tagged.
+    void pushDeed(u32 ownerId, const DeedPacket& pkt) {
+        InboundDeed id; id.ownerId = ownerId; id.pkt = pkt;
+        EnterCriticalSection(&cs_); deed_.push_back(id); LeaveCriticalSection(&cs_);
+    }
     // NET thread: one received placed-building announcement (protocol 27), owner-tagged.
     void pushBuildPlace(u32 ownerId, const BuildPlacePacket& pkt) {
         InboundBuildPlace ibp; ibp.ownerId = ownerId; ibp.pkt = pkt;
@@ -736,6 +750,9 @@ public:
     void drainResearch(std::deque<InboundResearch>& out) {
         EnterCriticalSection(&cs_); out.swap(research_); LeaveCriticalSection(&cs_);
     }
+    void drainDeed(std::deque<InboundDeed>& out) {
+        EnterCriticalSection(&cs_); out.swap(deed_); LeaveCriticalSection(&cs_);
+    }
     void drainBuildPlace(std::deque<InboundBuildPlace>& out) {
         EnterCriticalSection(&cs_); out.swap(buildPlace_); LeaveCriticalSection(&cs_);
     }
@@ -855,6 +872,7 @@ private:
     WorldQ<InboundDoor>            door_;
     WorldQ<InboundProd>            prod_;
     WorldQ<InboundResearch>        research_;
+    WorldQ<InboundDeed>            deed_;
     WorldQ<InboundBuildPlace>      buildPlace_;
     WorldQ<InboundBuildState>      buildState_;
     WorldQ<InboundBuildDoor>       buildDoor_;

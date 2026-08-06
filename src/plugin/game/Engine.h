@@ -1709,6 +1709,94 @@ bool readDoorByHand(const unsigned int dHand[5], DoorRead* out);
 bool writeDoorByHand(const unsigned int dHand[5], int wantOpen, int wantLocked,
                      DoorRead* outAfter);
 
+// ---- Protocol 54: property-deed (building ownership) sync --------------------
+// Buying a house/shop is a state change on a BAKED building: the engine moves
+// the building's owner faction (RootObjectBase::setFaction) and adds its hand to
+// the PLAYER FACTION's owned-object set (Faction::factionOwnerships, the same
+// Ownerships block that holds the protocol-52 wallet). Both clients loaded the
+// same save, so the building's hand is the cross-client identity - the door
+// precedent, not the protocol-27 runtime-mint one.
+struct DeedRead {
+    unsigned int hand[5]; // [type, container, containerSerial, index, serial]
+    int   owned;          // 1 = owner faction IS the player faction
+    int   forSale;        // Building::isForSale() (-1 = object not resolvable here)
+    int   shop;           // Building::isAShop() (-1 = not resolvable)
+    int   resolved;       // 1 = the hand resolves to a live local Building
+    char  ownerSid[48];   // owning faction's GameData stringID ('' = none/unknown)
+    char  name[40];       // GameData name (diagnostics)
+    float x, y, z;        // world position (diagnostics)
+};
+// SEH-guarded enumeration of the player faction's OWNED BUILDINGS - the deed
+// publisher's sample. Read off the owned-object set rather than a spatial query
+// ON PURPOSE: ownership is a latched fact that must keep publishing after the
+// buyer walks away, and the set is memory-resident whether or not the building's
+// zone is loaded. Rows whose hand does not resolve locally are still returned
+// (resolved=0, sentinel detail fields). Returns the count written.
+unsigned int enumOwnedBuildings(GameWorld* gw, DeedRead* out, unsigned int maxOut);
+// SEH-guarded enumeration of BUILDINGS near the interest centers (dual-interest,
+// deduped) with their ownership/for-sale state. Diagnostics only (the deed
+// probe's census + sentinel picker); the channel never samples this.
+unsigned int enumBuildingsNear(GameWorld* gw, float radius, DeedRead* out,
+                               unsigned int maxOut);
+// SEH-guarded single-building read by hand. Returns false when the hand does not
+// resolve locally or is not a building.
+bool readDeedByHand(GameWorld* gw, const unsigned int bHand[5], DeedRead* out);
+// SEH-guarded ownership write - the deed apply lever. wantOwned=1 moves the
+// building to the PLAYER faction and adds it to the player's owned set;
+// wantOwned=0 moves it to the faction named by ownerSid (left untouched when
+// that sid does not resolve) and drops it from the owned set. This is a pure
+// STATE write: it never runs Building::buyMeCallback, which would charge the
+// cats a second time (the payer's spend already rides protocol 52). Returns
+// false on resolve failure or fault; *outAfter reports the post-write DeedRead.
+bool writeDeedByHand(GameWorld* gw, const unsigned int bHand[5], int wantOwned,
+                     const char* ownerSid, DeedRead* outAfter);
+
+// The WIDE ownership state of one building, for diffing a REAL purchase against
+// an applied deed row. Moving the owner faction is only the part of buying a
+// house that the market sees; the field report is that the peer's copy leaves
+// the market but does not come online as a base (no datapanel, no access, no
+// research level), so this dumps every state a purchase could plausibly also
+// touch. Each side logs it for the same hand and the DIFF names what the apply
+// still has to write. -1 = not readable here (unresolved hand / missing lever).
+struct DeedAudit {
+    unsigned int hand[5];
+    int resolved;
+    int isPlayer;      // Building::isThePlayer (the engine's own predicate)
+    int ownedSet;      // Ownerships::isOwned (the set half)
+    int forSale, shop, isPublic, designation;
+    int residentHand;  // 1 = residentSquad hand is set (the evicted-family half)
+    int residentLeader;// 1 = that squad still has a live leader here
+    int townHand;      // 1 = Building::_town is set
+    int townMgr;       // 1 = buildingsManager is bound
+    int interior;      // 1 = myInterior is bound
+    int internals;     // Building::getNumInternalBuildings
+    int doors, doorsPlayer, doorsSet;   // door group: total / player-owned / in set
+    int furn, furnPlayer, furnSet;      // interior+furniture group, same three
+    int canUse;        // Ownerships::canIUseThisBuilding(b, player leader)
+    int homeIsThis;    // 1 = Ownerships::_homeBuilding IS this building
+    int homeSet;       // 1 = _homeBuilding is set to something
+    int homeTown;      // 1 = _homeTown is bound
+    int stuffSize;     // Ownerships::stuff entry count
+    int wallet;        // the shared purse (the double-charge witness)
+    // The per-SQUAD ownership blocks. Ownerships exists twice over: once on the
+    // player FACTION (where the shared purse lives, and the only one the deed
+    // write touches) and once per PLATOON. If buying also registers the house on
+    // the buying SQUAD, the peer would read owned at faction level - which it
+    // does - while every squad-scoped question still answers no.
+    int squads;        // distinct player platoons seen
+    int squadsOwn;     // ...that report isOwned(this building)
+    int squadsHome;    // ...whose _homeBuilding IS this building
+    int curOwn;        // the CURRENT platoon's isOwned (-1 = unreadable)
+    int curHome;       // the CURRENT platoon's _homeBuilding is this (-1 = same)
+    int townPlayer;    // Town::isPlayerBuildingsInThisTown (the base switch)
+    int townLevel;     // Town::playerTownLevel (what the base panel prints)
+    char ownerSid[48];
+    char name[40];
+};
+// SEH-guarded wide audit of one building by hand. Returns false when the hand
+// does not resolve locally (out is still zero-filled with resolved=0).
+bool auditDeed(GameWorld* gw, const unsigned int bHand[5], DeedAudit* out);
+
 // ---- Protocol 27: placed-building sync ---------------------------------------
 // One placed-building/construction-site row. The template GameData stringID is
 // the cross-client identity (protocol 21's sid precedent); the local hand is

@@ -1138,6 +1138,181 @@ void Replicator::applyResearch(const SyncContext& ctx) {
     }
 }
 
+void Replicator::publishDeeds(const SyncContext& ctx) {
+    GameWorld* gw = ctx.gw; NetLink& net = *ctx.net; u32 ownerId = ctx.localId;
+    if (!deedSync_) return;
+    const unsigned long SAMPLE_MS = tuning_.deedSampleMs; // purchases are rare
+    const unsigned long RESEND_MS = tuning_.deedResendMs; // lost-row AND not-yet-resolvable corrector
+    unsigned long now = nowMs();
+    if (!sync::gateSampleDue(now, deedSampleMs_, SAMPLE_MS)) return;
+    deedSampleMs_ = now;
+
+    // A party owning more than this many buildings is far past the two-player
+    // design target; the cap only bounds the scratch, and the set is read off
+    // Ownerships rather than a spatial query so an unloaded deed still ships.
+    const unsigned int MAX_DEEDS = 128;
+    static engine::DeedRead rows[MAX_DEEDS]; // main-thread only
+    unsigned int n = engine::enumOwnedBuildings(gw, rows, MAX_DEEDS);
+
+    // Pass 1 - OWN. Set membership is the authority, so a hand in the set
+    // publishes owned=1 on first sight and on the safety resend (no silent
+    // seed, hence resendUnsent=true - the research shape).
+    std::set<Key> live;
+    for (unsigned int i = 0; i < n; ++i) {
+        const engine::DeedRead& r = rows[i];
+        Key k; k.t = r.hand[0]; k.c = r.hand[1]; k.cs = r.hand[2];
+        k.i = r.hand[3]; k.s = r.hand[4];
+        live.insert(k);
+        DeedRow& dr = deedRows_[k];
+        bool changed = (dr.knownOwned != 1);
+        if (!sync::gateShouldSend(changed, now, dr.lastSendMs, /*minSendMs*/ 0,
+                                  RESEND_MS, /*resendUnsent*/ true))
+            continue;
+        dr.sent = true; dr.knownOwned = 1; dr.lastSendMs = now;
+        DeedPacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.type    = (u8)PKT_DEED;
+        pkt.ownerId = ownerId;
+        pkt.seq     = deedSeqOut_++;
+        for (unsigned int h = 0; h < 5; ++h) pkt.hand[h] = r.hand[h];
+        pkt.owned   = 1;
+        strncpy(pkt.ownerSid, r.ownerSid, sizeof(pkt.ownerSid) - 1);
+        net.queueDeed(pkt);
+        if (changed) { // resends stay silent; the new deed is the signal
+            char b[208];
+            _snprintf(b, sizeof(b) - 1,
+                      "[deed] SEND hand=%u.%u.%u.%u.%u owned=1 owner='%s' "
+                      "name='%s' seq=%u",
+                      pkt.hand[0], pkt.hand[1], pkt.hand[2], pkt.hand[3],
+                      pkt.hand[4], pkt.ownerSid, r.name, pkt.seq);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
+
+    // Pass 2 - UN-OWN, additive-only. A row we have latched at owned=1 that is
+    // no longer in the set is only a SALE if the building still resolves here
+    // and the engine agrees it is not ours. A hand that merely stopped
+    // resolving means "that zone is unloaded", never "sold", and publishing
+    // owned=0 for it would DELETE the partner's deed.
+    for (std::map<Key, DeedRow>::iterator it = deedRows_.begin();
+         it != deedRows_.end(); ++it) {
+        DeedRow& dr = it->second;
+        if (dr.knownOwned != 1) continue;
+        if (live.find(it->first) != live.end()) continue;
+        unsigned int hand[5];
+        hand[0] = it->first.t; hand[1] = it->first.c; hand[2] = it->first.cs;
+        hand[3] = it->first.i; hand[4] = it->first.s;
+        engine::DeedRead cur;
+        if (!engine::readDeedByHand(gw, hand, &cur)) continue; // unloaded: stay latched
+        if (cur.owned != 0) continue;                          // engine disagrees
+        dr.sent = true; dr.knownOwned = 0; dr.lastSendMs = now;
+        DeedPacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.type    = (u8)PKT_DEED;
+        pkt.ownerId = ownerId;
+        pkt.seq     = deedSeqOut_++;
+        for (unsigned int h = 0; h < 5; ++h) pkt.hand[h] = hand[h];
+        pkt.owned   = 0;
+        // The seller, carried explicitly: the receiver has no baseline town
+        // owner to restore for a building that was already ours in the save.
+        strncpy(pkt.ownerSid, cur.ownerSid, sizeof(pkt.ownerSid) - 1);
+        net.queueDeed(pkt);
+        char b[208];
+        _snprintf(b, sizeof(b) - 1,
+                  "[deed] SEND hand=%u.%u.%u.%u.%u owned=0 owner='%s' "
+                  "name='%s' seq=%u",
+                  pkt.hand[0], pkt.hand[1], pkt.hand[2], pkt.hand[3],
+                  pkt.hand[4], pkt.ownerSid, cur.name, pkt.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // The AUDIT pass. Moving the owner faction is the part of a purchase the
+    // MARKET sees, and the field report is that it is not the whole of what
+    // makes a building a base: the buyer gets the datapanel, the access and the
+    // research level, the peer only gets "no longer for sale". Both sides dump
+    // the same wide state for the same hand, so the buyer-vs-peer DIFF names
+    // exactly which of those states the apply still has to write. Diagnostic
+    // only - nothing here writes.
+    const unsigned long AUDIT_MS = 5000;
+    if (!sync::gateSampleDue(now, deedAuditMs_, AUDIT_MS)) return;
+    deedAuditMs_ = now;
+    int audited = 0;
+    for (std::map<Key, DeedRow>::iterator it = deedRows_.begin();
+         it != deedRows_.end() && audited < 8; ++it) {
+        if (it->second.knownOwned != 1) continue;
+        unsigned int hand[5];
+        hand[0] = it->first.t; hand[1] = it->first.c; hand[2] = it->first.cs;
+        hand[3] = it->first.i; hand[4] = it->first.s;
+        engine::DeedAudit a;
+        if (!engine::auditDeed(gw, hand, &a)) continue; // unloaded here
+        ++audited;
+        char b[400];
+        _snprintf(b, sizeof(b) - 1,
+                  "[deed] AUDIT hand=%u.%u.%u.%u.%u isPlayer=%d set=%d sale=%d "
+                  "shop=%d public=%d desig=%d resident=%d/%d town=%d/%d "
+                  "interior=%d internals=%d doors=%d/%d/%d furn=%d/%d/%d "
+                  "canUse=%d home=%d/%d/%d stuff=%d wallet=%d "
+                  "squads=%d/%d/%d cur=%d/%d base=%d/%d owner='%s' name='%s'",
+                  hand[0], hand[1], hand[2], hand[3], hand[4],
+                  a.isPlayer, a.ownedSet, a.forSale, a.shop, a.isPublic,
+                  a.designation, a.residentHand, a.residentLeader,
+                  a.townHand, a.townMgr, a.interior, a.internals,
+                  a.doors, a.doorsPlayer, a.doorsSet,
+                  a.furn, a.furnPlayer, a.furnSet, a.canUse,
+                  a.homeIsThis, a.homeSet, a.homeTown, a.stuffSize, a.wallet,
+                  a.squads, a.squadsOwn, a.squadsHome, a.curOwn, a.curHome,
+                  a.townPlayer, a.townLevel, a.ownerSid, a.name);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
+void Replicator::applyDeeds(const SyncContext& ctx) {
+    GameWorld* gw = ctx.gw; Inbound& in = *ctx.in;
+    std::deque<InboundDeed> got;
+    in.drainDeed(got);
+    if (got.empty()) return;
+    if (!deedSync_) return;
+    unsigned long now = nowMs();
+    for (std::deque<InboundDeed>::iterator it = got.begin(); it != got.end(); ++it) {
+        const DeedPacket& p = it->pkt;
+        Key k; k.t = p.hand[0]; k.c = p.hand[1]; k.cs = p.hand[2];
+        k.i = p.hand[3]; k.s = p.hand[4];
+        DeedRow& dr = deedRows_[k];
+        if (!sync::gateSeqAccept(dr.seqSeen, p.seq)) continue; // stale/dup row
+        dr.seqSeen = p.seq;
+        int want = p.owned ? 1 : 0;
+        if (dr.applied && dr.knownOwned == want) continue; // converged; resend no-op
+        engine::DeedRead cur;
+        if (!engine::readDeedByHand(gw, p.hand, &cur)) {
+            // THE difference from the door channel: an unresolvable hand is not
+            // an accepted edge here, it is the common case (the buyer is at the
+            // building, we may be a continent away). Leave the row unapplied so
+            // the sender's safety resend brings it back once the zone loads.
+            continue;
+        }
+        if (cur.owned == want) { // already converged (our own echo, or the save)
+            dr.applied = true; dr.knownOwned = want;
+            continue;
+        }
+        // Baseline BEFORE the engine write, and count it as sent: the ownership
+        // change this causes must not be re-detected as a local purchase and
+        // bounced straight back at the author.
+        dr.knownOwned = want; dr.sent = true; dr.lastSendMs = now;
+        engine::DeedRead post;
+        bool ok = engine::writeDeedByHand(gw, p.hand, want, p.ownerSid, &post);
+        if (ok && post.owned == want) dr.applied = true;
+        char b[224];
+        _snprintf(b, sizeof(b) - 1,
+                  "[deed] RECV hand=%u.%u.%u.%u.%u owned=%d->%d ok=%d "
+                  "forSale=%d->%d owner='%s' name='%s' seq=%u",
+                  p.hand[0], p.hand[1], p.hand[2], p.hand[3], p.hand[4],
+                  cur.owned, ok ? post.owned : cur.owned, ok ? 1 : 0,
+                  cur.forSale, ok ? post.forSale : cur.forSale,
+                  p.ownerSid, cur.name, p.seq);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+}
+
 // Build-site pose subject translation. A construction site is created at RUNTIME,
 // so unlike every other pose fixture its hand is client-local: a placement logged
 // 0.3409.11111.2.3348877056 on the placer and ...2871948288 on the peer. A streamed
@@ -1419,7 +1594,8 @@ void Replicator::driveSampledChannels(const SyncContext& ctx) {
         { &Replicator::buildSync_,    0,                     &Replicator::publishBuilds,     &Replicator::applyBuilds,     false },
         { &Replicator::buildSync_,    &Replicator::bdoorSync_, &Replicator::publishBuildDoors, &Replicator::applyBuildDoors, false },
         { &Replicator::prodSync_,     0,                     &Replicator::publishProd,       &Replicator::applyProd,       true  },
-        { &Replicator::researchSync_, 0,                     &Replicator::publishResearch,   &Replicator::applyResearch,   true  }
+        { &Replicator::researchSync_, 0,                     &Replicator::publishResearch,   &Replicator::applyResearch,   true  },
+        { &Replicator::deedSync_,     0,                     &Replicator::publishDeeds,      &Replicator::applyDeeds,      false }
     };
     const int n = (int)(sizeof(kCh) / sizeof(kCh[0]));
     for (int i = 0; i < n; ++i) {
@@ -1481,7 +1657,7 @@ void Replicator::onPeerConnected(NetLink& net, u32 ownerId) {
     // hostBody_, stealthPub_) are left alone: re-seeding them would author
     // phantom drop/KO edges rather than heal state.
     unsigned int nFac = 0, nDoor = 0, nBdoor = 0, nMed = 0, nStats = 0,
-                 nMoney = 0, nInv = 0, nWorld = 0, nProd = 0;
+                 nMoney = 0, nInv = 0, nWorld = 0, nProd = 0, nDeed = 0;
     for (std::map<std::string, FacRow>::iterator it = facRows_.begin();
          it != facRows_.end(); ++it)
         if (it->second.lastSendMs != 0) { it->second.lastSendMs = 1; ++nFac; }
@@ -1509,13 +1685,19 @@ void Replicator::onPeerConnected(NetLink& net, u32 ownerId) {
     for (std::map<std::pair<int, Key>, ProdRow>::iterator it = prodRows_.begin();
          it != prodRows_.end(); ++it)
         if (it->second.lastSendMs != 0) { it->second.lastSendMs = 1; ++nProd; }
+    // Deeds send with resendUnsent, so a fresh peer would learn the owned set
+    // on the next 1 Hz sample regardless; ageing the stamps just means it does
+    // not wait out the 15 s resend window for deeds already published.
+    for (std::map<Key, DeedRow>::iterator it = deedRows_.begin();
+         it != deedRows_.end(); ++it)
+        if (it->second.lastSendMs != 0) { it->second.lastSendMs = 1; ++nDeed; }
 
-    char b[224];
+    char b[240];
     _snprintf(b, sizeof(b) - 1,
               "[latejoin] RESYNC place=%u remove=%u fac=%u door=%u bdoor=%u "
-              "med=%u stats=%u money=%u inv=%u world=%u prod=%u",
+              "med=%u stats=%u money=%u inv=%u world=%u prod=%u deed=%u",
               nPlace, nRemove, nFac, nDoor, nBdoor, nMed, nStats, nMoney,
-              nInv, nWorld, nProd);
+              nInv, nWorld, nProd, nDeed);
     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
 }
 

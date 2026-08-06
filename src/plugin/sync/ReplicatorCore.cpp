@@ -77,6 +77,7 @@ Replicator::Replicator()
       hungerSync_(true),
       prodSeqOut_(1), prodSampleMs_(0), prodSync_(true),
       researchSeqOut_(1), researchSampleMs_(0), researchSync_(true),
+      deedSeqOut_(1), deedSampleMs_(0), deedAuditMs_(0), deedSync_(true),
       storeSync_(false), contCensusMs_(0),
       timeSync_(true), timeSlew_(1.0f), timeSeqOut_(1), timeSeqSeen_(0),
       timeLastSendMs_(0), timeLastLogMs_(0), timeSlewApplied_(-1.0f),
@@ -230,6 +231,7 @@ void Replicator::resetSession() {
     doorRows_.clear();
     prodRows_.clear();
     researchRows_.clear(); // protocol 38: re-baselined from the new world's store
+    deedRows_.clear();     // protocol 54: re-baselined from the new world's owned set
     facRows_.clear();
     invPub_.clear();
     invRecv_.clear();
@@ -304,6 +306,8 @@ void Replicator::resetSession() {
     facSampleMs_ = doorSampleMs_ = buildSampleMs_ = bdoorSampleMs_ = 0;
     prodSampleMs_ = 0;
     researchSampleMs_ = 0;
+    deedSampleMs_ = 0;
+    deedAuditMs_ = 0;
     contCensusMs_ = 0;
     authReassertMs_ = 0;
     // Config gates, ownRanks_ and every OUTBOUND seq counter are deliberately

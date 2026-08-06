@@ -1,7 +1,7 @@
 // ScenarioBuildings.cpp - door/building/production scenarios (monolith split
-// from Scenario.cpp, 2026-07-12): door_probe/door_sync, build_probe/
-// build_sync, bdoor_probe/bdoor_sync, prod_probe/prod_sync, research_probe/
-// research_sync, store_probe/store_sync. Classes are TU-private (anonymous
+// from Scenario.cpp, 2026-07-12): door_probe/door_sync, deed_probe/deed_sync,
+// build_probe/build_sync, bdoor_probe/bdoor_sync, prod_probe/prod_sync,
+// research_probe/research_sync, store_probe/store_sync. Classes are TU-private (anonymous
 // namespace); only makeBuildingScenario (ScenarioSupport.h) is exported.
 // Must NOT: change any SCENARIO log string (oracle API, resources/CODE_MAP.md).
 
@@ -139,6 +139,249 @@ private:
     bool          wrote_;
     bool          writeOk_;
     unsigned int  censusLogged_;
+    unsigned int  sentinelHand_[5];
+};
+
+// deed_probe (protocol 54 phase 0, probe tier; deedSync forced OFF) /
+// deed_sync (probe=false, full tier; deedSync ON). Buying a house or shop runs
+// entirely inside the local engine (Building::buyMeCallback: cats debited,
+// setFaction, Ownerships::addOwnedObject) and touches nothing that crosses - so
+// the buyer owns the building and the partner still sees it for sale. The
+// probe's DESIGN questions:
+//   * do BAKED building hands intersect across clients (the DEEDNEAR census
+//     rows answer it; the door precedent says yes and the wire identity rides
+//     on it)?
+//   * does the pure STATE write - setFaction + addOwnedObject, no buy path -
+//     make the engine treat the building as player-owned (owned 0->1) and drop
+//     it out of the for-sale set? DEEDWRITE carries before/after for both.
+//   * is isForSale settable or derived from the owning faction? If DEEDWRITE
+//     shows forSale flipping 1->0 with no explicit write, it is derived and
+//     never needs to go on the wire.
+//   * does the WALLET stay put across the state write (the double-charge
+//     guard: applying a peer's deed must never re-spend, because
+//     publishMoneyPool samples the wallet and would re-publish the deduction)?
+//   * negative control: with the hatch off, nothing crosses.
+// Script: BOTH sides snapshot the nearby-building census at t=8s - BEFORE any
+// deed can cross - sort it by (serial, index) and pick the first NOT-owned
+// building; host takes candidate 0, join takes candidate 1, so the two claims
+// are distinct and the pick cannot be perturbed by the wire. Host claims at
+// t=12s, join at t=24s, both via writeDeedByHand(owned=1). 1 Hz census of the
+// owned SET plus nearby buildings plus the wallet on both sides to run end.
+// Both tiers gate the LOCAL legs only (picked + write ok + still owned at run
+// end + wallet unmoved by our own write); crossing is the sync oracle's job.
+class DeedProbeScenario : public TimedScenario {
+public:
+    explicit DeedProbeScenario(bool probe)
+        : TimedScenario(probe ? "deed_probe" : "deed_sync", /*evidenceMs=*/1000),
+          probe_(probe), picked_(false), pickOk_(false), wrote_(false),
+          writeOk_(false), walletMoved_(false), censusLogged_(0),
+          lastWallet_(-1), lastOwnedN_(0) {
+        memset(sentinelHand_, 0, sizeof(sentinelHand_));
+    }
+
+    virtual void onStart(const ScenarioContext& ctx) {
+        char b[96];
+        _snprintf(b, sizeof(b) - 1, "SCENARIO DEEDPROBE start host=%d probe=%d",
+                  ctx.isHost ? 1 : 0, probe_ ? 1 : 0);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    virtual bool onTick(const ScenarioContext& ctx) {
+        if (!picked_ && ctx.elapsedMs >= PICK_AT_MS) {
+            picked_ = true;
+            doPick(ctx);
+        }
+        if (evidenceDue(ctx.elapsedMs))
+            logCensus(ctx);
+        unsigned long writeAt = ctx.isHost ? HOST_WRITE_AT_MS : JOIN_WRITE_AT_MS;
+        if (picked_ && pickOk_ && !wrote_ && ctx.elapsedMs >= writeAt) {
+            wrote_ = true;
+            doClaim(ctx);
+        }
+        if (ctx.elapsedMs >= DURATION_MS) {
+            engine::DeedRead fin;
+            int owned = -1;
+            if (pickOk_ && engine::readDeedByHand(ctx.gw, sentinelHand_, &fin))
+                owned = fin.owned;
+            passed_ = pickOk_ && writeOk_ && owned == 1 &&
+                      censusLogged_ > 0 && !walletMoved_;
+            char b[240];
+            _snprintf(b, sizeof(b) - 1,
+                      "SCENARIO DEEDRESULT who=%s pick=%d write=%d owned=%d "
+                      "ownedN=%u wallet=%d walletMoved=%d pass=%d "
+                      "hand=%u.%u.%u.%u.%u",
+                      ctx.isHost ? "host" : "join", pickOk_ ? 1 : 0,
+                      writeOk_ ? 1 : 0, owned, lastOwnedN_, lastWallet_,
+                      walletMoved_ ? 1 : 0, passed_ ? 1 : 0,
+                      sentinelHand_[0], sentinelHand_[1], sentinelHand_[2],
+                      sentinelHand_[3], sentinelHand_[4]);
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            return true;
+        }
+        return false;
+    }
+
+private:
+    // 1 Hz evidence: the owned SET (the publisher's own sample - radius
+    // independent), the nearby-building census (hand-intersection evidence and
+    // the peer-side "did the deed land" witness), and the wallet.
+    void logCensus(const ScenarioContext& ctx) {
+        int money = -1;
+        engine::readPlayerWallet(ctx.gw, &money);
+        lastWallet_ = money;
+
+        engine::DeedRead ownedRows[MAX_ROWS];
+        unsigned int no = engine::enumOwnedBuildings(ctx.gw, ownedRows, MAX_ROWS);
+        lastOwnedN_ = no;
+        engine::DeedRead nearRows[MAX_ROWS]; // NOT "near" - MSVC keyword
+        unsigned int nn = engine::enumBuildingsNear(ctx.gw, (float)CENSUS_RADIUS,
+                                                    nearRows, MAX_ROWS);
+        unsigned int forSale = 0;
+        for (unsigned int i = 0; i < nn; ++i)
+            if (nearRows[i].forSale == 1) ++forSale;
+
+        char c[144];
+        _snprintf(c, sizeof(c) - 1,
+                  "SCENARIO DEEDCOUNT who=%s owned=%u near=%u forSale=%u "
+                  "wallet=%d t=%lu",
+                  ctx.isHost ? "host" : "join", no, nn, forSale, money,
+                  ctx.elapsedMs);
+        c[sizeof(c) - 1] = '\0'; coop::logLine(c);
+
+        // The owned set logs in FULL and uncapped: it is the witness for "did
+        // the peer's deed land here", so a cap that hid the one row under test
+        // would make the oracle unable to see a crossing. It is also tiny (the
+        // buildings a party owns), unlike the nearby census.
+        for (unsigned int i = 0; i < no; ++i)
+            logRow("DEED", ownedRows[i], ctx.elapsedMs);
+        // The nearby census IS capped, so log a deterministic slice: sorted by
+        // (serial, index) both clients pick the same subset, which is what
+        // makes the cross-client hand-intersection count meaningful.
+        unsigned int order[MAX_ROWS];
+        sortByHand(nearRows, nn, order);
+        for (unsigned int i = 0; i < nn && i < MAX_LOG_ROWS; ++i)
+            logRow("DEEDNEAR", nearRows[order[i]], ctx.elapsedMs);
+        ++censusLogged_;
+    }
+
+    // Selection sort of row indices by (serial, index) ascending - tiny n. The
+    // deterministic cross-client order both the log slice and the pick use.
+    static void sortByHand(const engine::DeedRead* rows, unsigned int n,
+                           unsigned int* order) {
+        for (unsigned int i = 0; i < n; ++i) order[i] = i;
+        for (unsigned int i = 0; i + 1 < n; ++i)
+            for (unsigned int j = i + 1; j < n; ++j) {
+                const engine::DeedRead& a = rows[order[i]];
+                const engine::DeedRead& b = rows[order[j]];
+                if (b.hand[4] < a.hand[4] ||
+                    (b.hand[4] == a.hand[4] && b.hand[3] < a.hand[3])) {
+                    unsigned int t = order[i]; order[i] = order[j]; order[j] = t;
+                }
+            }
+    }
+
+    void logRow(const char* kind, const engine::DeedRead& r, unsigned long t) {
+        char b[248];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO %s hand=%u.%u.%u.%u.%u owned=%d forSale=%d shop=%d "
+                  "res=%d owner='%s' name='%s' pos=(%.0f,%.0f,%.0f) t=%lu",
+                  kind, r.hand[0], r.hand[1], r.hand[2], r.hand[3], r.hand[4],
+                  r.owned, r.forSale, r.shop, r.resolved, r.ownerSid, r.name,
+                  r.x, r.y, r.z, t);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // Deterministic cross-client pick from a snapshot taken BEFORE any deed can
+    // have crossed: buildings sorted by (serial, index) ascending, filtered to
+    // the ones the player does not already own, host takes the first and join
+    // the second. Snapshotting early is what keeps the two sides agreeing - a
+    // pick made after t=12s would see the host's claim on one side only.
+    void doPick(const ScenarioContext& ctx) {
+        engine::DeedRead rows[MAX_ROWS];
+        unsigned int n = engine::enumBuildingsNear(ctx.gw, (float)CENSUS_RADIUS, rows,
+                                                   MAX_ROWS);
+        unsigned int sorted[MAX_ROWS];
+        sortByHand(rows, n, sorted);
+        unsigned int order[MAX_ROWS];
+        unsigned int m = 0;
+        for (unsigned int i = 0; i < n; ++i)
+            if (rows[sorted[i]].owned == 0) order[m++] = sorted[i];
+        unsigned int want = ctx.isHost ? 0u : 1u;
+        const char* name = "";
+        int forSale = -1, shop = -1;
+        if (want < m) {
+            const engine::DeedRead& p = rows[order[want]];
+            memcpy(sentinelHand_, p.hand, sizeof(sentinelHand_));
+            name = p.name; forSale = p.forSale; shop = p.shop;
+            pickOk_ = true;
+        }
+        char b[224];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO DEEDPICK who=%s ok=%d cand=%u of=%u "
+                  "hand=%u.%u.%u.%u.%u forSale=%d shop=%d name='%s' t=%lu",
+                  ctx.isHost ? "host" : "join", pickOk_ ? 1 : 0, want, m,
+                  sentinelHand_[0], sentinelHand_[1], sentinelHand_[2],
+                  sentinelHand_[3], sentinelHand_[4], forSale, shop, name,
+                  ctx.elapsedMs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    // The claim: a pure state write, never buyMeCallback. wallet0/wallet1
+    // bracket it because "the cats did not move" is the load-bearing property
+    // the apply path must share with it.
+    void doClaim(const ScenarioContext& ctx) {
+        int before = -1, after = -1, saleBefore = -1, saleAfter = -1;
+        int w0 = -1, w1 = -1, ok = 0;
+        char ownerBefore[48]; ownerBefore[0] = '\0';
+        char ownerAfter[48];  ownerAfter[0] = '\0';
+        engine::readPlayerWallet(ctx.gw, &w0);
+        engine::DeedRead cur;
+        if (engine::readDeedByHand(ctx.gw, sentinelHand_, &cur)) {
+            before = cur.owned; saleBefore = cur.forSale;
+            strncpy(ownerBefore, cur.ownerSid, sizeof(ownerBefore) - 1);
+            ownerBefore[sizeof(ownerBefore) - 1] = '\0';
+        }
+        engine::DeedRead post;
+        ok = engine::writeDeedByHand(ctx.gw, sentinelHand_, /*wantOwned=*/1,
+                                     /*ownerSid=*/"", &post) ? 1 : 0;
+        if (ok) {
+            after = post.owned; saleAfter = post.forSale;
+            strncpy(ownerAfter, post.ownerSid, sizeof(ownerAfter) - 1);
+            ownerAfter[sizeof(ownerAfter) - 1] = '\0';
+        }
+        engine::readPlayerWallet(ctx.gw, &w1);
+        writeOk_ = (ok == 1) && (after == 1);
+        if (w0 >= 0 && w1 >= 0 && w0 != w1) walletMoved_ = true;
+        char b[248];
+        _snprintf(b, sizeof(b) - 1,
+                  "SCENARIO DEEDWRITE who=%s hand=%u.%u.%u.%u.%u want=1 ok=%d "
+                  "owned=%d->%d forSale=%d->%d owner='%s'->'%s' "
+                  "wallet=%d->%d t=%lu",
+                  ctx.isHost ? "host" : "join",
+                  sentinelHand_[0], sentinelHand_[1], sentinelHand_[2],
+                  sentinelHand_[3], sentinelHand_[4], ok, before, after,
+                  saleBefore, saleAfter, ownerBefore, ownerAfter, w0, w1,
+                  ctx.elapsedMs);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+
+    static const unsigned long PICK_AT_MS       = 8000;
+    static const unsigned long HOST_WRITE_AT_MS = 12000;
+    static const unsigned long JOIN_WRITE_AT_MS = 24000;
+    static const unsigned long DURATION_MS      = 45000;
+    static const unsigned int  MAX_ROWS         = 64;
+    static const unsigned int  MAX_LOG_ROWS     = 16;
+    static const unsigned int  CENSUS_RADIUS    = 100; // the door-probe radius
+
+    bool          probe_;
+    bool          picked_;
+    bool          pickOk_;
+    bool          wrote_;
+    bool          writeOk_;
+    bool          walletMoved_;
+    unsigned int  censusLogged_;
+    int           lastWallet_;
+    unsigned int  lastOwnedN_;
     unsigned int  sentinelHand_[5];
 };
 
@@ -1261,6 +1504,8 @@ private:
 Scenario* makeBuildingScenario(const std::string& name) {
     if (name == "door_probe")    return new DoorProbeScenario(true);
     if (name == "door_sync")     return new DoorProbeScenario(false);
+    if (name == "deed_probe")    return new DeedProbeScenario(true);
+    if (name == "deed_sync")     return new DeedProbeScenario(false);
     if (name == "build_probe")   return new BuildProbeScenario(true);
     if (name == "build_sync")    return new BuildProbeScenario(false);
     if (name == "bdoor_probe")   return new BdoorProbeScenario(true);

@@ -296,6 +296,7 @@ $diagSpec = @{
     load_probe     = @{ KENSHICOOP_LOAD_SYNC = '0' }
     prod_probe     = @{ KENSHICOOP_PROD_SYNC = '0' }
     research_probe = @{ KENSHICOOP_RESEARCH_SYNC = '0' }
+    deed_probe     = @{ KENSHICOOP_DEED_SYNC = '0' }
     store_probe    = @{ KENSHICOOP_STORE_SYNC = '0' }
     squad_probe    = @{ KENSHICOOP_SQUAD_SYNC = '0' }
     latejoin_probe = @{ KENSHICOOP_LATEJOIN_SYNC = '0' }

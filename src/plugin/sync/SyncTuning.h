@@ -11,9 +11,9 @@
 // behavior change. Pure POD (a default ctor sets today's tuned values); no
 // mutable file-scope state, C++03/v100-safe, header-only.
 //
-// SCOPE: only the ChangeGate-policy channels (money + the six registry channels:
-// faction, doors, placed buildings, placed-building doors, production,
-// research). Medical/stats cadence and the drive/combat/interp tunables in
+// SCOPE: only the ChangeGate-policy channels (money + the seven registry
+// channels: faction, doors, placed buildings, placed-building doors,
+// production, research, deeds). Medical/stats cadence and the drive/combat/interp tunables in
 // ReplicatorUtil.h are a different subsystem (Phase 7's drive state machine
 // owns those) and intentionally stay where they are.
 
@@ -46,6 +46,13 @@ struct SyncTuning {
     unsigned long researchSampleMs;
     unsigned long researchResendMs;
 
+    // Property deeds (protocol 54): purchases are rare; 1 Hz sample. The resend
+    // is the lost-row corrector AND the not-yet-resolvable corrector - the peer
+    // may have the building's zone unloaded when the row first lands - so it
+    // matches the research cadence rather than the shorter door one.
+    unsigned long deedSampleMs;
+    unsigned long deedResendMs;
+
     // Placed buildings - construction progress (protocol 27).
     unsigned long buildSampleMs;
     unsigned long buildResendMs;
@@ -60,6 +67,7 @@ struct SyncTuning {
           doorSampleMs(1000),     doorResendMs(10000),
           prodSampleMs(1000),     prodResendMs(10000),
           researchSampleMs(1000), researchResendMs(15000),
+          deedSampleMs(1000),     deedResendMs(15000),
           buildSampleMs(1000),    buildResendMs(10000),
           bdoorSampleMs(1000),    bdoorResendMs(10000) {}
 };

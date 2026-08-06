@@ -477,6 +477,18 @@ struct Config {
     // escape hatch.
     bool          researchSync;
 
+    // KENSHICOOP_DEED_SYNC (default ON): property-deed sync (protocol 54) -
+    // BOTH clients sample the player faction's owned-building set ~1 Hz and
+    // stream one reliable PKT_DEED row per owned hand (first sight is the
+    // session baseline, then a safety resend that doubles as the retry for a
+    // peer whose copy of the building was not loaded yet); the receiver applies
+    // a pure state write (setFaction + add/removeOwnedObject), never the buy
+    // path. Without it, buying a house or shop is invisible to the partner: the
+    // buyer owns it, the partner still sees it for sale. Forced OFF for
+    // deed_probe (it measures the unsynced baseline). "0" is the A/B escape
+    // hatch.
+    bool          deedSync;
+
     // KENSHICOOP_STORE_SYNC (default ON): storage/machine container sync
     // (protocol 34) - the HOST censuses container-bearing buildings (storage
     // chests + the machine classes) in the interest spheres ~1 Hz and

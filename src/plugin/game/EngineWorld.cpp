@@ -510,6 +510,323 @@ bool writeDoorByHand(const unsigned int dHand[5], int wantOpen, int wantLocked,
     }
 }
 
+// ---- Protocol 54: property-deed (building ownership) sync -----------------
+
+namespace {
+
+// The PLAYER's faction (the owner pointer a bought building is moved to).
+// Caller holds SEH.
+Faction* playerFactionOf(GameWorld* gw) {
+    if (!gw || !gw->player) return 0;
+    return gw->player->getFaction();
+}
+
+// Does the player own this building? Two independent witnesses, either of which
+// is sufficient: the building's owner FACTION pointer, and membership in the
+// player faction's owned-object SET. The engine's buy path writes both, but a
+// half-applied state (our own apply faulting between the two writes, or a mod
+// touching one) must read as owned rather than silently un-owning it back.
+// Caller holds SEH.
+bool deedOwnedFlag(GameWorld* gw, Building* b) {
+    if (!b) return false;
+    Faction* pf = playerFactionOf(gw);
+    if (pf && b->owner == pf) return true;
+    if (g_ownIsOwnedFn) {
+        Ownerships* ow = playerWalletOf(gw);
+        if (ow && g_ownIsOwnedFn(ow, &b->handle)) return true;
+    }
+    return false;
+}
+
+// Fill the detail (non-identity) half of a DeedRead from a live Building.
+// Caller holds SEH.
+void fillDeedDetail(GameWorld* gw, Building* b, DeedRead* r) {
+    RootObject* ro = static_cast<RootObject*>(b);
+    r->resolved = 1;
+    Ogre::Vector3 p = ro->getPosition();
+    r->x = p.x; r->y = p.y; r->z = p.z;
+    r->forSale = b->isForSale() ? 1 : 0;
+    r->shop    = b->isAShop()   ? 1 : 0;
+    if (b->owner) facSidOf(b->owner, r->ownerSid, sizeof(r->ownerSid));
+    GameData* gd = ro->getGameData();
+    if (gd) {
+        strncpy(r->name, gd->name.c_str(), sizeof(r->name) - 1);
+        r->name[sizeof(r->name) - 1] = '\0';
+    }
+}
+
+// Fill a whole DeedRead from a live Building. Caller holds SEH.
+void fillDeedRead(GameWorld* gw, Building* b, DeedRead* r) {
+    memset(r, 0, sizeof(*r));
+    r->forSale = -1; r->shop = -1;
+    readObjectHand(static_cast<RootObject*>(b), r->hand);
+    fillDeedDetail(gw, b, r);
+    r->owned = deedOwnedFlag(gw, b) ? 1 : 0;
+}
+
+} // namespace
+
+unsigned int enumOwnedBuildings(GameWorld* gw, DeedRead* out, unsigned int maxOut) {
+    if (!gw || !out || maxOut == 0) return 0;
+    unsigned int n = 0;
+    __try {
+        Ownerships* ow = playerWalletOf(gw);
+        if (!ow) return 0;
+        // Ownerships::stuff is the owned-object hand list add/removeOwnedObject
+        // maintain and serialise() bakes into the save. It holds every owned
+        // object kind, so filter to BUILDINGs by the hand's own type field - no
+        // resolve needed, which is what lets an unloaded building still publish.
+        unsigned int total = ow->stuff.size();
+        for (unsigned int i = 0; i < total && n < maxOut; ++i) {
+            const hand& h = ow->stuff[i];
+            if (h.type != BUILDING) continue;
+            DeedRead& r = out[n];
+            memset(&r, 0, sizeof(r));
+            r.hand[0] = (unsigned int)h.type;
+            r.hand[1] = h.container;
+            r.hand[2] = h.containerSerial;
+            r.hand[3] = h.index;
+            r.hand[4] = h.serial;
+            // Set membership IS the ownership here; the detail fields are
+            // best-effort and stay at their sentinels for an unloaded building.
+            r.owned = 1; r.forSale = -1; r.shop = -1; r.resolved = 0;
+            RootObject* ro = resolveObjectByHand(r.hand);
+            if (ro) fillDeedDetail(gw, static_cast<Building*>(ro), &r);
+            ++n;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return n; }
+    return n;
+}
+
+unsigned int enumBuildingsNear(GameWorld* gw, float radius, DeedRead* out,
+                               unsigned int maxOut) {
+    if (!gw || !out || maxOut == 0 || !g_getObjsFn) return 0;
+    unsigned int n = 0;
+    __try {
+        Ogre::Vector3 centers[4];
+        unsigned int nc = interestCenters(gw, centers);
+        if (nc == 0) return 0;
+        for (unsigned int ci = 0; ci < nc; ++ci) {
+            g_npcQuery.clear();
+            g_getObjsFn(gw, &g_npcQuery, &centers[ci], radius, BUILDING, 256, 0);
+            unsigned int total = g_npcQuery.size();
+            for (unsigned int i = 0; i < total && n < maxOut; ++i) {
+                RootObject* o = g_npcQuery[i];
+                if (!o) continue;
+                Building* b = static_cast<Building*>(o);
+                // Doors are Buildings too and ride protocol 26; furniture and
+                // interior props are never bought. Only whole structures.
+                if (b->imADoor || b->isAnInteriorObject) continue;
+                unsigned int h[5];
+                if (!readObjectHand(o, h)) continue;
+                bool dup = false; // the two interest spheres can overlap
+                for (unsigned int k = 0; k < n; ++k)
+                    if (out[k].hand[3] == h[3] && out[k].hand[4] == h[4] &&
+                        out[k].hand[1] == h[1]) { dup = true; break; }
+                if (dup) continue;
+                fillDeedRead(gw, b, &out[n]);
+                ++n;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return n; }
+    return n;
+}
+
+bool readDeedByHand(GameWorld* gw, const unsigned int bHand[5], DeedRead* out) {
+    if (!gw || !bHand || !out) return false;
+    RootObject* ro = resolveObjectByHand(bHand);
+    if (!ro) return false;
+    __try {
+        Building* b = static_cast<Building*>(ro);
+        if (b->imADoor) return false;
+        fillDeedRead(gw, b, out);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool writeDeedByHand(GameWorld* gw, const unsigned int bHand[5], int wantOwned,
+                     const char* ownerSid, DeedRead* outAfter) {
+    if (outAfter) memset(outAfter, 0, sizeof(*outAfter));
+    if (!gw || !bHand || !g_ownAddObjFn || !g_ownRemObjFn) return false;
+    RootObject* ro = resolveObjectByHand(bHand);
+    if (!ro) return false;
+    __try {
+        Building* b = static_cast<Building*>(ro);
+        if (b->imADoor) return false;
+        Ownerships* ow = playerWalletOf(gw);
+        if (!ow) return false;
+        Faction* target = 0;
+        if (wantOwned) {
+            target = playerFactionOf(gw);
+            if (!target) return false;
+        } else if (ownerSid && ownerSid[0]) {
+            // Un-own restores the seller named on the wire. An unresolvable sid
+            // leaves the faction alone rather than guessing - dropping the deed
+            // from the owned set is still the half that matters.
+            target = factionBySidC(gw, ownerSid);
+        }
+        if (target && b->owner != target)
+            b->setFaction(target, 0); // virtual; Building overrides it
+        if (wantOwned) g_ownAddObjFn(ow, &b->handle);
+        else           g_ownRemObjFn(ow, &b->handle);
+        // The TOWN half. Owning the building is what the market reads; what makes
+        // it a BASE - the settlement panel with its research level, power grid
+        // and battery - is town state, and the buy path recomputes it for the
+        // buyer only. Without this the peer owns a house that never comes online
+        // (the 2026-08-05 field report). setPlayerBuildingsInThisTown has no
+        // clearing counterpart, so a sale only re-derives the level: leaving the
+        // flag on costs a settlement panel, clearing it wrongly would take the
+        // base away from buildings still owned there.
+        if (g_bldGetRealTownFn) {
+            Town* t = g_bldGetRealTownFn(b);
+            if (t) {
+                if (wantOwned && g_townSetPlayerBldgsFn) g_townSetPlayerBldgsFn(t);
+                if (g_townRecalcLevelFn) g_townRecalcLevelFn(t);
+            }
+        }
+        // A purchase happens inside a UI click, so the datapanel is rebuilt as a
+        // side effect; a deed that arrives on the wire has no click behind it,
+        // and a peer whose ownership state is right while its panel still reads
+        // "for sale" is what the field report describes. This is the engine's
+        // own change signal, not a poke at the GUI.
+        if (g_bldNotifyChangeFn) g_bldNotifyChangeFn(b);
+        if (outAfter) fillDeedRead(gw, b, outAfter);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        coop::logLine("[deed] write SEH-except");
+        return false;
+    }
+}
+
+namespace {
+
+bool handSet(const hand& h) { return h.index != 0 || h.serial != 0; }
+
+bool handEq(const hand& h, const unsigned int w[5]) {
+    return (unsigned int)h.type == w[0] && h.container == w[1] &&
+           h.containerSerial == w[2] && h.index == w[3] && h.serial == w[4];
+}
+
+} // namespace
+
+bool auditDeed(GameWorld* gw, const unsigned int bHand[5], DeedAudit* out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (bHand) for (unsigned int i = 0; i < 5; ++i) out->hand[i] = bHand[i];
+    out->isPlayer = out->ownedSet = out->forSale = out->shop = -1;
+    out->isPublic = out->designation = out->canUse = -1;
+    out->internals = out->wallet = -1;
+    out->curOwn = out->curHome = -1;
+    out->townPlayer = out->townLevel = -1;
+    if (!gw || !bHand) return false;
+    RootObject* ro = resolveObjectByHand(bHand);
+    if (!ro) return false;
+    __try {
+        Building* b = static_cast<Building*>(ro);
+        out->resolved = 1;
+        Faction* pf = playerFactionOf(gw);
+        Ownerships* ow = playerWalletOf(gw);
+        if (b->owner) facSidOf(b->owner, out->ownerSid, sizeof(out->ownerSid));
+        GameData* gd = ro->getGameData();
+        if (gd) {
+            strncpy(out->name, gd->name.c_str(), sizeof(out->name) - 1);
+            out->name[sizeof(out->name) - 1] = '\0';
+        }
+        out->forSale     = b->isForSale() ? 1 : 0;
+        out->shop        = b->isAShop()   ? 1 : 0;
+        out->isPublic    = b->isPublic()  ? 1 : 0;
+        out->designation = (int)b->designation;
+        out->interior    = b->myInterior      ? 1 : 0;
+        out->townMgr     = b->buildingsManager ? 1 : 0;
+        out->townHand    = handSet(b->_town)   ? 1 : 0;
+        out->residentHand = handSet(b->residentSquad) ? 1 : 0;
+        if (g_bldIsThePlayerFn)      out->isPlayer  = g_bldIsThePlayerFn(b) ? 1 : 0;
+        if (g_bldNumInternalFn)      out->internals = g_bldNumInternalFn(b);
+        if (g_bldResidentLeaderFn)
+            out->residentLeader = g_bldResidentLeaderFn(b) ? 1 : 0;
+        if (ow) {
+            if (g_ownIsOwnedFn)   out->ownedSet = g_ownIsOwnedFn(ow, &b->handle) ? 1 : 0;
+            if (g_ownGetMoneyFn)  out->wallet   = g_ownGetMoneyFn(ow);
+            out->stuffSize = (int)ow->stuff.size();
+            out->homeSet    = handSet(ow->_homeBuilding) ? 1 : 0;
+            out->homeIsThis = handEq(ow->_homeBuilding, bHand) ? 1 : 0;
+            out->homeTown   = ow->_homeTown ? 1 : 0;
+            if (g_ownCanUseBldFn && gw->player &&
+                gw->player->playerCharacters.size() > 0) {
+                Character* me = gw->player->playerCharacters[0];
+                if (me) out->canUse = g_ownCanUseBldFn(ow, b, me) ? 1 : 0;
+            }
+        }
+        // The town/base state - the half the field report says never arrives.
+        if (g_bldGetRealTownFn) {
+            Town* t = g_bldGetRealTownFn(b);
+            if (t) {
+                out->townLevel = t->playerTownLevel;
+                if (g_townIsPlayerBldgsFn)
+                    out->townPlayer = g_townIsPlayerBldgsFn(t) ? 1 : 0;
+            }
+        }
+        // The per-squad blocks. Platoons are reached through their members
+        // (Character -> ActivePlatoon -> Platoon::ownerships), deduped by
+        // pointer; the CURRENT platoon is reported separately because it is the
+        // one a UI click would have acted through.
+        if (gw->player && g_ownIsOwnedFn) {
+            Ownerships* seen[8];
+            unsigned int ns = 0;
+            unsigned int pc = gw->player->playerCharacters.size();
+            for (unsigned int i = 0; i < pc && ns < 8; ++i) {
+                Ownerships* so = walletOf(gw->player->playerCharacters[i]);
+                if (!so) continue;
+                bool dup = false;
+                for (unsigned int k = 0; k < ns; ++k)
+                    if (seen[k] == so) { dup = true; break; }
+                if (dup) continue;
+                seen[ns++] = so;
+                ++out->squads;
+                if (g_ownIsOwnedFn(so, &b->handle)) ++out->squadsOwn;
+                if (handEq(so->_homeBuilding, bHand)) ++out->squadsHome;
+            }
+            Platoon* cur = gw->player->currentPlatoon;
+            if (cur) {
+                out->curOwn  = g_ownIsOwnedFn(&cur->ownerships, &b->handle) ? 1 : 0;
+                out->curHome = handEq(cur->ownerships._homeBuilding, bHand) ? 1 : 0;
+            }
+        }
+        // The door group: a door is its own Building with its own owner, so a
+        // purchase that only re-factions the shell would leave the peer locked
+        // out of a building it owns.
+        unsigned int nd = b->doors.size();
+        for (unsigned int i = 0; i < nd; ++i) {
+            Building* d = b->doors[i];
+            if (!d) continue;
+            ++out->doors;
+            if (pf && d->owner == pf) ++out->doorsPlayer;
+            if (ow && g_ownIsOwnedFn && g_ownIsOwnedFn(ow, &d->handle))
+                ++out->doorsSet;
+        }
+        // The furniture/interior group (research bench, storage, counters): the
+        // things the field report says never came online on the peer.
+        if (g_getObjsFn) {
+            Ogre::Vector3 c = ro->getPosition();
+            g_npcQuery.clear();
+            g_getObjsFn(gw, &g_npcQuery, &c, 30.0f, BUILDING, 256, 0);
+            unsigned int total = g_npcQuery.size();
+            for (unsigned int i = 0; i < total; ++i) {
+                RootObject* o = g_npcQuery[i];
+                if (!o || o == ro) continue;
+                Building* f = static_cast<Building*>(o);
+                if (f->imADoor) continue; // counted above
+                if (!f->isAnInteriorObject && !f->isFurnitureOf) continue;
+                ++out->furn;
+                if (pf && f->owner == pf) ++out->furnPlayer;
+                if (ow && g_ownIsOwnedFn && g_ownIsOwnedFn(ow, &f->handle))
+                    ++out->furnSet;
+            }
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 // ---- Protocol 27: placed-building sync -----------------------------------
 
 // Fill a BuildRead from a live Building. Callers hold the SEH frame.

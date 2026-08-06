@@ -25,7 +25,7 @@ typedef double         f64;
 // this header stays a definition file. When you bump PROTOCOL_VERSION, add the
 // matching entry at the bottom of that doc. The version is checked at handshake
 // and a mismatch is rejected (no back-compat).
-const u16 PROTOCOL_VERSION = 53;
+const u16 PROTOCOL_VERSION = 54;
 
 // Packet type tags (first byte of every packet).
 enum PacketType {
@@ -74,7 +74,8 @@ enum PacketType {
     PKT_WORLD_ITEM_CLAIM = 43,// RELIABLE proxy-consumed notice (protocol 47); WorldItemClaimHeader
     PKT_CELL_CLAIM       = 44,// RELIABLE zone-cell presence claim (protocol 49); CellClaimPacket
     PKT_INV_XFER_ACK     = 45,// RELIABLE transfer verdict (protocol 50); InvXferAckPacket
-    PKT_MONEY_DELTA      = 46 // RELIABLE join money-pool delta (join -> host, protocol 52); MoneyDeltaPacket
+    PKT_MONEY_DELTA      = 46,// RELIABLE join money-pool delta (join -> host, protocol 52); MoneyDeltaPacket
+    PKT_DEED             = 47 // RELIABLE property-ownership row (protocol 54); DeedPacket
 };
 
 // One-shot transition events carried on the RELIABLE channel. Continuous state
@@ -1064,6 +1065,48 @@ struct DoorPacket {
     u32 hand[5];
     u8  open;      // 1 = open/opening
     u8  locked;    // 1 = DoorLock engaged (only applied when the door has a lock)
+};
+
+// ---- Protocol 54: property-deed (building ownership) ------------------------
+// One building-ownership row, keyed by the building's save-stable hand - the
+// same identity the door channel above round-trips, and valid here for the same
+// reason: a bought house/shop is a BAKED object both clients loaded from the
+// shared save (unlike a PLACED building, whose runtime hand needs the protocol
+// 27 translation map).
+//
+// This is a LATCHED SET channel on the protocol-38 research shape, NOT the
+// protocol-26 door shape, and the difference is the whole point. A door row is
+// a transient toggle whose next sample self-heals, so the door channel drops a
+// row whose hand does not resolve locally. Ownership is a persistent fact, and
+// the buyer is standing at the building while the partner may be a continent
+// away with that zone unloaded - dropping that row would reproduce the exact
+// bug this channel exists to fix. So deeds send with resendUnsent, and a
+// receiver that cannot resolve the hand yet leaves the row unapplied for the
+// safety resend to retry.
+//
+// SYMMETRIC: either client may buy, per-sender seq drops stale rows. ADDITIVE
+// in practice - an owned=0 row is only ever published from an OBSERVED
+// transition on a building that resolves locally, because a hand merely absent
+// from the local owned set means "unloaded/unknown", never "sold".
+//
+// ownerSid names the NEW owning faction (the player faction for owned=1, the
+// seller for owned=0), so the un-own direction is fully specified by the packet
+// rather than by a baseline the receiver may never have seeded - a building
+// already owned in the save has no recorded town owner to restore.
+//
+// The receiver applies a PURE STATE WRITE (setFaction + add/removeOwnedObject)
+// and NEVER Building::buyMeCallback: that would debit the cats a second time,
+// and publishMoneyPool detects wallet movement by sampling, so the pool would
+// then re-publish the deduction as a fresh local spend. The payer's cats
+// already ride protocol 52.
+struct DeedPacket {
+    u8  type;      // = PKT_DEED
+    u32 ownerId;   // network player id of the sender
+    u32 seq;       // per-sender monotonic (stale-row guard)
+    // building hand [type, container, containerSerial, index, serial]
+    u32 hand[5];
+    u8  owned;     // 1 = the player faction owns it, 0 = un-owned/sold
+    char ownerSid[48]; // new owning faction's GameData stringID ('' = unknown)
 };
 
 // ---- Protocol 27: placed-building sync --------------------------------------

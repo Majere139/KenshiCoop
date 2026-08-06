@@ -3,7 +3,7 @@
 # Get-WalletSeries, Get-PoolSeries, Test-ShopProbe/WalletProbe/MoneySync/
 # Test-VendorTrade, Test-Recruit*,
 # Test-Squad*, Test-Faction*, Test-Time* (+ Get-SlewSummary), Test-Door*,
-# Test-Build*, Test-Bdoor*, Test-Hunger*, Test-Prod*, Test-Research*,
+# Test-Deed*, Test-Build*, Test-Bdoor*, Test-Hunger*, Test-Prod*, Test-Research*,
 # Test-Store*. Dot-sourced by CoopOracles.psm1 (module scope).
 # Must NOT: change gate names or the $script:*Regex marker patterns -
 # they are the C++ log contract (resources/CODE_MAP.md).
@@ -1251,6 +1251,233 @@ function Test-DoorSync {
     Write-Host "  DOOR-SYNC $v - crossed=$crossed diverged=$diverged $detail"
     return (Add-GateResult -Name "door_sync" -Status $v `
                 -Metrics @{ crossed = $crossed; diverged = $diverged } -Detail $detail)
+}
+
+# ---- deed_probe / deed_sync (protocol 54: property ownership) --------------
+
+# Parse a 1 Hz deed census into hand -> ordered samples. $Kind is 'DEED' (the
+# player faction's OWNED set - logged in full, so presence here IS ownership)
+# or 'DEEDNEAR' (nearby buildings, a deterministic sorted slice).
+function Get-DeedSeries {
+    param([string]$File, [string]$Kind = 'DEED')
+    $out = @{}
+    $rx = "SCENARIO $Kind hand=([\d.]+) owned=(-?\d+) forSale=(-?\d+) shop=(-?\d+) res=(-?\d+) owner='([^']*)' name='([^']*)' pos=\(([^)]*)\) t=(\d+)"
+    foreach ($m in @(Select-String -Path $File -Pattern $rx -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups
+        $hand = $g[1].Value
+        if (-not $out.ContainsKey($hand)) { $out[$hand] = @() }
+        $out[$hand] += @{ owned = [int]$g[2].Value; forSale = [int]$g[3].Value
+                          shop = [int]$g[4].Value; res = [int]$g[5].Value
+                          owner = $g[6].Value; name = $g[7].Value
+                          t = [long]$g[9].Value }
+    }
+    return $out
+}
+
+# The per-tick wallet + set-size series (the double-charge witness).
+function Get-DeedCounts {
+    param([string]$File)
+    $out = @()
+    $rx = "SCENARIO DEEDCOUNT who=(host|join) owned=(\d+) near=(\d+) forSale=(\d+) wallet=(-?\d+) t=(\d+)"
+    foreach ($m in @(Select-String -Path $File -Pattern $rx -ErrorAction SilentlyContinue)) {
+        $g = $m.Matches[0].Groups
+        $out += @{ owned = [int]$g[2].Value; near = [int]$g[3].Value
+                   forSale = [int]$g[4].Value; wallet = [int]$g[5].Value
+                   t = [long]$g[6].Value }
+    }
+    return $out
+}
+
+# The wallet reading closest to (but not after) $T, and the first at or after
+# $T + $AfterMs. Returns @{before; after} with -1 for a missing sample.
+function Get-DeedWalletAround {
+    param($Counts, [long]$T, [long]$AfterMs = 4000)
+    $before = -1; $after = -1
+    foreach ($c in $Counts) {
+        if ($c.t -le $T) { $before = $c.wallet }
+        if ($after -eq -1 -and $c.t -ge ($T + $AfterMs)) { $after = $c.wallet }
+    }
+    return @{ before = $before; after = $after }
+}
+
+$script:DeedPickRegex  = "SCENARIO DEEDPICK who=(host|join) ok=(\d) cand=(\d+) of=(\d+) hand=([\d.]+) forSale=(-?\d+) shop=(-?\d+) name='([^']*)' t=(\d+)"
+$script:DeedWriteRegex = "SCENARIO DEEDWRITE who=(host|join) hand=([\d.]+) want=(\d) ok=(\d) owned=(-?\d+)->(-?\d+) forSale=(-?\d+)->(-?\d+) owner='([^']*)'->'([^']*)' wallet=(-?\d+)->(-?\d+) t=(\d+)"
+$script:DeedRecvRegex  = "\[deed\] RECV hand=([\d.]+) owned=(-?\d+)->(-?\d+) ok=(\d)"
+
+# Pull the one DEEDWRITE line per side into a plain record (or $null).
+function Get-DeedWrite {
+    param([string]$File)
+    $m = Select-String -Path $File -Pattern $script:DeedWriteRegex -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if ($null -eq $m) { return $null }
+    $g = $m.Matches[0].Groups
+    return @{ hand = $g[2].Value; want = [int]$g[3].Value; ok = [int]$g[4].Value
+              ownedBefore = [int]$g[5].Value; ownedAfter = [int]$g[6].Value
+              saleBefore = [int]$g[7].Value;  saleAfter = [int]$g[8].Value
+              ownerBefore = $g[9].Value; ownerAfter = $g[10].Value
+              wallet0 = [int]$g[11].Value; wallet1 = [int]$g[12].Value
+              t = [long]$g[13].Value }
+}
+
+# deed_probe (protocol 54 phase 0): the unsynced baseline. Gates the LOCAL
+# legs - both sides picked a subject, the pure state write (setFaction +
+# addOwnedObject, never buyMeCallback) flipped owned 0->1 and stuck to run end,
+# and the WALLET did not move across it (the double-charge guard the apply path
+# inherits) - plus the negative control that nothing crossed with the hatch
+# off. Everything else is a FINDING: cross-client hand intersection (the wire
+# identity question) and whether isForSale is settable or derived.
+function Test-DeedProbe {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $hW = Get-DeedWrite -File $HostFile
+    $jW = Get-DeedWrite -File $JoinFile
+    if ($null -eq $hW) { $why += "host never logged its DEEDWRITE (no un-owned building in census range?)" }
+    if ($null -eq $jW) { $why += "join never logged its DEEDWRITE" }
+
+    $hOwn  = Get-DeedSeries -File $HostFile -Kind 'DEED'
+    $jOwn  = Get-DeedSeries -File $JoinFile -Kind 'DEED'
+    $hNear = Get-DeedSeries -File $HostFile -Kind 'DEEDNEAR'
+    $jNear = Get-DeedSeries -File $JoinFile -Kind 'DEEDNEAR'
+    if ($hNear.Keys.Count -eq 0) { $why += "host census saw no buildings (move the scenario to a save with buildings in range)" }
+    if ($jNear.Keys.Count -eq 0) { $why += "join census saw no buildings" }
+
+    $hCounts = Get-DeedCounts -File $HostFile
+    $jCounts = Get-DeedCounts -File $JoinFile
+
+    foreach ($leg in @(@($hW, $hOwn, $hCounts, 'host'), @($jW, $jOwn, $jCounts, 'join'))) {
+        $w = $leg[0]; $own = $leg[1]; $counts = $leg[2]; $side = $leg[3]
+        if ($null -eq $w) { continue }
+        if ($w.ok -ne 1 -or $w.ownedAfter -ne 1) {
+            $why += "$side state write did not take (ok=$($w.ok) owned=$($w.ownedBefore)->$($w.ownedAfter)) - setFaction+addOwnedObject is not the ownership lever"
+        }
+        if ($w.wallet0 -ge 0 -and $w.wallet1 -ge 0 -and $w.wallet0 -ne $w.wallet1) {
+            $why += "$side wallet MOVED across the state write ($($w.wallet0) -> $($w.wallet1)) - the apply path would double-charge"
+        }
+        if (-not $own.ContainsKey($w.hand)) {
+            $why += "$side claimed hand=$($w.hand) never appeared in its own owned set"
+        } else {
+            $end = $own[$w.hand][$own[$w.hand].Count - 1]
+            if ($end.owned -ne 1) { $why += "$side claim did not stick to run end (owned=$($end.owned))" }
+        }
+    }
+
+    # Negative control: with the hatch off nothing may cross, in either
+    # direction - no applied row and no ownership appearing on the peer.
+    $recvH = @(Select-String -Path $HostFile -Pattern $script:DeedRecvRegex -ErrorAction SilentlyContinue)
+    $recvJ = @(Select-String -Path $JoinFile -Pattern $script:DeedRecvRegex -ErrorAction SilentlyContinue)
+    if ($recvH.Count -gt 0 -or $recvJ.Count -gt 0) {
+        $why += "[deed] RECV seen with KENSHICOOP_DEED_SYNC=0 (host=$($recvH.Count) join=$($recvJ.Count)) - the hatch does not gate the channel"
+    }
+    foreach ($leg in @(@($hW, $jOwn, 'host', 'join'), @($jW, $hOwn, 'join', 'host'))) {
+        $w = $leg[0]; $peerOwn = $leg[1]
+        if ($null -eq $w) { continue }
+        if ($peerOwn.ContainsKey($w.hand)) {
+            $s = @($peerOwn[$w.hand] | Where-Object { $_.owned -eq 1 -and $_.t -ge $w.t })
+            if ($s.Count -gt 0) { $why += "$($leg[2]) claim hand=$($w.hand) CROSSED to $($leg[3]) with the hatch off" }
+        }
+    }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  DEED-PROBE $v - $detail"
+
+    $common = @($hNear.Keys | Where-Object { $jNear.ContainsKey($_) })
+    Write-Host "    FINDING: building hands host=$($hNear.Keys.Count) join=$($jNear.Keys.Count) common=$($common.Count)"
+    $distinct = ($null -ne $hW) -and ($null -ne $jW) -and ($hW.hand -ne $jW.hand)
+    Write-Host "    FINDING: picks host=$(if ($hW) { $hW.hand } else { 'none' }) join=$(if ($jW) { $jW.hand } else { 'none' }) distinct=$distinct"
+    foreach ($pair in @(@('host', $hW), @('join', $jW))) {
+        $w = $pair[1]
+        if ($null -eq $w) { continue }
+        Write-Host "    FINDING: $($pair[0]) forSale $($w.saleBefore)->$($w.saleAfter) owner '$($w.ownerBefore)'->'$($w.ownerAfter)' (forSale moving with no explicit write = derived from the owner, so it never goes on the wire)"
+    }
+    $hEnd = if ($hCounts.Count) { $hCounts[$hCounts.Count - 1] } else { $null }
+    $jEnd = if ($jCounts.Count) { $jCounts[$jCounts.Count - 1] } else { $null }
+    Write-Host "    FINDING: final owned-set size host=$(if ($hEnd) { $hEnd.owned } else { -1 }) join=$(if ($jEnd) { $jEnd.owned } else { -1 }) (unsynced: each side sees only its own claim)"
+
+    return (Add-GateResult -Name "deed_probe" -Status $v `
+                -Metrics @{ commonHands = $common.Count } -Detail $detail)
+}
+
+# deed_sync (protocol 54): the gated ownership-convergence oracle. Each side
+# claimed a distinct building; the gate is that each claim CROSSED - the peer
+# logged an APPLIED [deed] RECV for that hand and its own owned set then
+# reported it - and stayed owned to run end, that the two owned sets agree at
+# the final sample, and that the peer's WALLET DID NOT MOVE across the apply.
+# That last one is the point of the whole channel design: applying a deed must
+# be a pure state write, and a convergence-only gate cannot tell a correct
+# apply from one that re-ran the buy path and charged the party twice.
+function Test-DeedSync {
+    param([string]$HostFile, [string]$JoinFile)
+    $why = @()
+    $hW = Get-DeedWrite -File $HostFile
+    $jW = Get-DeedWrite -File $JoinFile
+    if ($null -eq $hW) { $why += "host never logged its DEEDWRITE" }
+    if ($null -eq $jW) { $why += "join never logged its DEEDWRITE" }
+    if ($null -ne $hW -and $hW.ok -ne 1) { $why += "host state write failed locally" }
+    if ($null -ne $jW -and $jW.ok -ne 1) { $why += "join state write failed locally" }
+    if ($null -ne $hW -and $null -ne $jW -and $hW.hand -eq $jW.hand) {
+        $why += "both sides claimed the SAME building (hand=$($hW.hand)) - the two crossing legs are not independent"
+    }
+
+    $hOwn = Get-DeedSeries -File $HostFile -Kind 'DEED'
+    $jOwn = Get-DeedSeries -File $JoinFile -Kind 'DEED'
+    $hCounts = Get-DeedCounts -File $HostFile
+    $jCounts = Get-DeedCounts -File $JoinFile
+
+    $crossed = 0
+    $walletMoved = 0
+    foreach ($leg in @(@($hW, $jOwn, $jCounts, $JoinFile, 'host', 'join'),
+                       @($jW, $hOwn, $hCounts, $HostFile, 'join', 'host'))) {
+        $w = $leg[0]; $peerOwn = $leg[1]; $peerCounts = $leg[2]
+        $peerFile = $leg[3]; $side = $leg[4]; $peer = $leg[5]
+        if ($null -eq $w -or $w.ok -ne 1) { continue }
+
+        # The applied row on the peer: the channel's own witness. A row that
+        # arrived but could not resolve logs ok=0 and is retried, so ok=1 is
+        # what distinguishes "delivered" from "landed".
+        $applied = @(Select-String -Path $peerFile -Pattern $script:DeedRecvRegex -ErrorAction SilentlyContinue |
+                     Where-Object { $_.Matches[0].Groups[1].Value -eq $w.hand -and
+                                    $_.Matches[0].Groups[4].Value -eq '1' })
+        if ($applied.Count -eq 0) {
+            $why += "$peer never applied $side's claim (no '[deed] RECV hand=$($w.hand) ... ok=1')"
+        }
+        # ...and the peer's own census agreeing, which is the independent read.
+        if (-not $peerOwn.ContainsKey($w.hand)) {
+            $why += "$side claim hand=$($w.hand) never entered $peer's owned set"
+        } else {
+            $after = @($peerOwn[$w.hand] | Where-Object { $_.t -ge ($w.t - 500) -and $_.owned -eq 1 })
+            if ($after.Count -eq 0) {
+                $why += "$side claim hand=$($w.hand) never observed owned on $peer after t=$($w.t)"
+            } else {
+                $crossed++
+                $end = $peerOwn[$w.hand][$peerOwn[$w.hand].Count - 1]
+                if ($end.owned -ne 1) { $why += "$side claim did not STAY owned on $peer (final owned=$($end.owned))" }
+            }
+        }
+        # The double-charge witness: applying a deed is a pure state write, so
+        # the receiver's pool must read the same before and after.
+        $ww = Get-DeedWalletAround -Counts $peerCounts -T $w.t
+        if ($ww.before -ge 0 -and $ww.after -ge 0 -and $ww.before -ne $ww.after) {
+            $walletMoved++
+            $why += "$peer's wallet MOVED across $side's apply ($($ww.before) -> $($ww.after)) - the apply re-ran the buy path and the party paid twice"
+        }
+    }
+
+    # No owned-set divergence at the final sample (symmetric difference).
+    $hFinal = @($hOwn.Keys | Where-Object { $hOwn[$_][$hOwn[$_].Count - 1].owned -eq 1 })
+    $jFinal = @($jOwn.Keys | Where-Object { $jOwn[$_][$jOwn[$_].Count - 1].owned -eq 1 })
+    $onlyH = @($hFinal | Where-Object { $jFinal -notcontains $_ })
+    $onlyJ = @($jFinal | Where-Object { $hFinal -notcontains $_ })
+    if ($onlyH.Count -gt 0 -or $onlyJ.Count -gt 0) {
+        $why += "owned sets diverged at run end (host-only=$($onlyH.Count) join-only=$($onlyJ.Count))"
+    }
+
+    $v = if ($why.Count -eq 0) { "PASS" } else { "FAIL" }
+    $detail = $why -join "; "
+    Write-Host "  DEED-SYNC $v - crossed=$crossed walletMoved=$walletMoved hostOwned=$($hFinal.Count) joinOwned=$($jFinal.Count) $detail"
+    return (Add-GateResult -Name "deed_sync" -Status $v `
+                -Metrics @{ crossed = $crossed; walletMoved = $walletMoved
+                            ownedHost = $hFinal.Count; ownedJoin = $jFinal.Count } `
+                -Detail $detail)
 }
 
 # Parse the 1 Hz SCENARIO BUILDSITE census into hand -> ordered samples

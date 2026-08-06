@@ -505,6 +505,30 @@ public:
     // Research tech-tree sync master enable (KENSHICOOP_RESEARCH_SYNC).
     void setResearchSync(bool v) { researchSync_ = v; }
 
+    // BEFORE engine (protocol 54, BOTH clients - either may buy): sample the
+    // player faction's owned-BUILDING set ~1 Hz and stream one PKT_DEED row per
+    // owned hand - first sight sends (the loaded save's owned set IS the shared
+    // baseline, so this is near-free), then a safety resend that doubles as the
+    // retry for a peer whose copy of the building was not loaded when the row
+    // first landed. An un-own row is published ONLY from an observed transition
+    // on a building that still resolves locally and reads not-owned: a hand that
+    // merely stopped resolving means "unloaded", never "sold", so it stays
+    // latched and silent (the protocol 46/47 additive-only rule).
+    void publishDeeds(const SyncContext& ctx);
+
+    // BEFORE engine (protocol 54): drain received deed rows and apply each as a
+    // PURE STATE WRITE (setFaction + add/removeOwnedObject) - never
+    // Building::buyMeCallback, which would debit the cats a second time and be
+    // re-published by publishMoneyPool's wallet sampler as a fresh local spend.
+    // Per-hand seq guard drops stale rows; the baseline is updated BEFORE the
+    // engine write (the echo guard). A hand that does not resolve yet leaves the
+    // row unapplied so the safety resend retries it - the one place this channel
+    // must NOT behave like the door channel, which drops such a row for good.
+    void applyDeeds(const SyncContext& ctx);
+
+    // Property-deed sync master enable (KENSHICOOP_DEED_SYNC).
+    void setDeedSync(bool v) { deedSync_ = v; }
+
     // Phase 6c: drive the change-gated SAMPLED channels (faction, doors, placed
     // buildings, placed-building doors, production, research) from one
     // channel-descriptor registry. Replaces the per-channel if-blocks the tick
@@ -1804,6 +1828,31 @@ private:
     u32           researchSeqOut_;
     unsigned long researchSampleMs_;
     bool          researchSync_;
+    // Protocol 54 property-deed rows, keyed by the building's save-stable hand
+    // (both clients loaded the same save, so the key resolves on both - the
+    // door/furniture precedent, not the protocol-27 runtime-mint one).
+    // knownOwned is the last value we SENT or APPLIED: the change gate for the
+    // publisher AND the echo guard for the receiver (-1 = no baseline yet).
+    // sent = the row went out at least once; applied = the state write landed,
+    // so a resend is a no-op. The row shape is the protocol-38 latched-set one:
+    // an unresolvable hand leaves applied false and the resend retries it.
+    // EXPLICIT ctor, not value-init: the protocol-47 narrative records that
+    // under this toolchain a struct reached through std::map is not reliably
+    // zero-initialized, and a garbage latch flag cost a debugging session.
+    struct DeedRow {
+        unsigned long lastSendMs;
+        u32  seqSeen;
+        bool sent;
+        bool applied;
+        int  knownOwned;
+        DeedRow() : lastSendMs(0), seqSeen(0), sent(false), applied(false),
+                    knownOwned(-1) {}
+    };
+    std::map<Key, DeedRow> deedRows_;
+    u32           deedSeqOut_;
+    unsigned long deedSampleMs_;
+    unsigned long deedAuditMs_; // last wide-state dump (owner-vs-peer diff)
+    bool          deedSync_;
     // Protocol 23 recruitment sync state.
     bool recruitSync_;
     // Ownership PINS (protocols 23 + 35): per-hand overrides layered on the

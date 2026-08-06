@@ -1271,6 +1271,47 @@
             Tier = 'full'; WanVariant = $false
         }
 
+        # deed_probe: property-ownership phase-0 diagnostic (protocol 54 -
+        # deedSync forced OFF). Buying a house/shop is purely local today, so
+        # the buyer owns it and the partner still sees it for sale. Both sides
+        # snapshot the nearby-building census at t=8s (before anything can
+        # cross), pick the first NOT-owned building in (serial, index) order -
+        # host candidate 0, join candidate 1 - and claim it with the pure state
+        # write (setFaction + addOwnedObject, never buyMeCallback): host t=12s,
+        # join t=24s. 1 Hz census of the owned SET + nearby buildings + the
+        # wallet on both sides. Gates: both picks landed on DISTINCT hands that
+        # intersect cross-client, both local writes flipped owned 0->1 and stuck
+        # to run end, the wallet did not move across the state write (the
+        # double-charge guard), and NOTHING crossed (the negative control).
+        deed_probe = @{
+            DiagEnv = @{ KENSHICOOP_DEED_SYNC = '0' }
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'deed_probe'
+            Gating   = @('deed_probe', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'probe'; WanVariant = $false
+        }
+
+        # deed_sync: protocol-54 property-deed sync (deedSync ON - the same
+        # script as deed_probe, so the probe's measured gap must now be
+        # CLOSED). Both sides sample the player faction's owned-building set
+        # ~1 Hz and stream reliable PKT_DEED rows (first sight is the session
+        # baseline, 15 s safety resend that doubles as the retry for a peer
+        # whose copy of the building was not loaded yet); the receiver applies
+        # a pure state write. Gates: the probe's local legs PLUS each side's
+        # claim CROSSED (the peer logged an applied [deed] RECV and its owned
+        # set shows the hand) and stayed owned to run end, the owned sets agree
+        # at the final sample, and the PEER'S WALLET DID NOT MOVE across the
+        # apply - the double-charge witness a convergence-only gate cannot see,
+        # since two clients agreeing on the wrong balance is still agreement.
+        deed_sync = @{
+            Save = 'sync'; Setup = ''; Tolerance = 6.0
+            PrimaryGate = 'deed_sync'
+            Gating   = @('deed_sync', 'clock_sync')
+            Advisory = @('smoothness', 'anim_truth', 'march')
+            Tier = 'full'; WanVariant = $false
+        }
+
         # store_probe: storage/machine container phase-0 diagnostic (protocol
         # 34 - storeSync forced OFF, the protocol-27 mint channel ON). The
         # HOST places a crafting bench + a general-storage chest leader-

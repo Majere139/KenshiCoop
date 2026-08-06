@@ -126,6 +126,8 @@ function Invoke-OneOracle {
         "time_sync"     { return (Test-TimeSync        -HostFile $HostLog -JoinFile $JoinLog) }
         "door_probe"    { return (Test-DoorProbe       -HostFile $HostLog -JoinFile $JoinLog) }
         "door_sync"     { return (Test-DoorSync        -HostFile $HostLog -JoinFile $JoinLog) }
+        "deed_probe"    { return (Test-DeedProbe       -HostFile $HostLog -JoinFile $JoinLog) }
+        "deed_sync"     { return (Test-DeedSync        -HostFile $HostLog -JoinFile $JoinLog) }
         "build_probe"   { return (Test-BuildProbe      -HostFile $HostLog -JoinFile $JoinLog) }
         "build_sync"    { return (Test-BuildSync       -HostFile $HostLog -JoinFile $JoinLog) }
         "bdoor_probe"   { return (Test-BdoorProbe      -HostFile $HostLog -JoinFile $JoinLog) }

@@ -222,6 +222,8 @@ void NetLink::queueProd(const ProdPacket& pkt) { pushLocked(outCs_, outProd_, pk
 
 void NetLink::queueResearch(const ResearchPacket& pkt) { pushLocked(outCs_, outResearch_, pkt); }
 
+void NetLink::queueDeed(const DeedPacket& pkt) { pushLocked(outCs_, outDeed_, pkt); }
+
 void NetLink::queueBuildPlace(const BuildPlacePacket& pkt) { pushLocked(outCs_, outBuildPlace_, pkt); }
 
 void NetLink::queueBuildState(const BuildStatePacket& pkt) { pushLocked(outCs_, outBuildState_, pkt); }
@@ -767,6 +769,14 @@ void NetLink::threadLoop() {
                         if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &rp)
                             && inbound_) {
                             inbound_->pushResearch(rp.ownerId, rp);
+                        }
+                    } else if (type == PKT_DEED) {
+                        // Reliable property-deed ownership row (protocol 54):
+                        // symmetric, applied as a pure state write.
+                        DeedPacket dep;
+                        if (readPacket(ev.packet->data, (unsigned)ev.packet->dataLength, &dep)
+                            && inbound_) {
+                            inbound_->pushDeed(dep.ownerId, dep);
                         }
                     } else if (type == PKT_BUILD_PLACE) {
                         // Reliable placed-building announcement (protocol 27):
@@ -1464,6 +1474,26 @@ void NetLink::threadLoop() {
         LeaveCriticalSection(&outCs_);
         for (size_t i = 0; i < researchPkts.size(); ++i) {
             ENetPacket* out = enet_packet_create(&researchPkts[i], sizeof(ResearchPacket),
+                                                 ENET_PACKET_FLAG_RELIABLE);
+            if (isHost_) {
+                enet_host_broadcast(enetHost_, CH_RELIABLE, out);
+            } else if (serverPeer_ && serverPeer_->state == ENET_PEER_STATE_CONNECTED) {
+                enet_peer_send(serverPeer_, CH_RELIABLE, out);
+            } else {
+                enet_packet_destroy(out);
+            }
+        }
+
+        // Drain + send any queued property-deed rows on CH_RELIABLE (protocol
+        // 54). SYMMETRIC - either client may buy - so this drains on both
+        // sides. First-sight + safety-resent by the caller; a party that owns a
+        // stable set of buildings is silent between resends.
+        std::vector<DeedPacket> deedPkts;
+        EnterCriticalSection(&outCs_);
+        deedPkts.swap(outDeed_);
+        LeaveCriticalSection(&outCs_);
+        for (size_t i = 0; i < deedPkts.size(); ++i) {
+            ENetPacket* out = enet_packet_create(&deedPkts[i], sizeof(DeedPacket),
                                                  ENET_PACKET_FLAG_RELIABLE);
             if (isHost_) {
                 enet_host_broadcast(enetHost_, CH_RELIABLE, out);

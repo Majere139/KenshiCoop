@@ -73,6 +73,7 @@
 #include <kenshi/Building/CraftingBuilding.h>  // CraftingBuilding::operate override (protocol 33)
 #include <kenshi/Building/GeneratorBuilding.h> // GeneratorBuilding::getPowerOutput override (protocol 33)
 #include <kenshi/Building/ResearchBuilding.h>  // ResearchBuilding tech-level evidence (protocol 33)
+#include <kenshi/Town.h>            // Town player-base state (protocol 54 deeds)
 #include <kenshi/ShopTrader.h>      // ShopTrader (vendor stock, protocol 22)
 #include <kenshi/Globals.h>         // gui (ForgottenGUI*, KenshiLib data export)
 #include <kenshi/gui/ForgottenGUI.h> // ForgottenGUI::mainbar
@@ -230,6 +231,36 @@ typedef void  (__fastcall* OwnSetMoneyFn)(Ownerships* self, int amount);
 typedef Item* (__fastcall* BuyItemFn)(Inventory* self, Item* itemToBuy,
                                       RootObject* sendingTo);
 typedef void  (__fastcall* PlatoonRefreshInvFn)(ActivePlatoon* self, bool firstTime);
+
+// property deeds (protocol 54): the owned-object SET on the player faction's
+// Ownerships. Reference params cross as pointers (the __fastcall thunk ABI the
+// rest of this table uses).
+typedef void (__fastcall* OwnAddObjFn)(Ownerships* self, const hand* what);
+typedef void (__fastcall* OwnRemObjFn)(Ownerships* self, const hand* what);
+typedef bool (__fastcall* OwnIsOwnedFn)(Ownerships* self, const hand* what);
+// Audit-only levers (optional rows: an unresolved one costs a diagnostic field,
+// never the channel). canIUseThisBuilding is the engine's own access predicate
+// and isThePlayer the one the datapanel keys on - the two questions the field
+// report ("owned but no panel, no access") actually asks.
+typedef bool (__fastcall* OwnCanUseBldFn)(Ownerships* self, Building* b,
+                                          Character* me);
+typedef bool (__fastcall* BldIsThePlayerFn)(const Building* self);
+// Building::notifyChange - the engine's own "this building changed, rebuild the
+// GUI for it" signal. The buy path runs inside a UI click so the datapanel is
+// rebuilt for free; a deed applied from the wire is not, and the field report is
+// a peer whose ownership state is correct while its panel still says nothing.
+typedef void (__fastcall* BldNotifyChangeFn)(Building* self);
+// The TOWN half of owning a building. The field report's missing piece is the
+// base panel (research level / power / battery), which is TOWN state, not
+// building state: Town::playerHasBuildingsInThisTown is the switch that makes a
+// settlement read as one of the player's, and playerTownLevel the level that
+// panel prints. Both are recomputed by the buy path on the buyer only.
+typedef Town* (__fastcall* BldGetRealTownFn)(const Building* self);
+typedef void  (__fastcall* TownSetPlayerBldgsFn)(Town* self);
+typedef void  (__fastcall* TownRecalcLevelFn)(Town* self);
+typedef bool  (__fastcall* TownIsPlayerBldgsFn)(const Town* self);
+typedef Character* (__fastcall* BldResidentLeaderFn)(const Building* self);
+typedef int  (__fastcall* BldNumInternalFn)(const Building* self);
 typedef Character* (__fastcall* ShopGetTraderFn)(const ShopTrader* self);
 
 // recruitment (protocol 23) + squad moves (protocol 35)
@@ -452,6 +483,20 @@ extern OwnSetMoneyFn g_ownSetMoneyFn;
 extern BuyItemFn     g_buyItemFn;
 extern PlatoonRefreshInvFn g_platoonRefreshInvFn;
 extern ShopGetTraderFn     g_shopGetTraderFn;
+
+// property deeds (protocol 54)
+extern OwnAddObjFn   g_ownAddObjFn;
+extern OwnRemObjFn   g_ownRemObjFn;
+extern OwnIsOwnedFn  g_ownIsOwnedFn;
+extern OwnCanUseBldFn      g_ownCanUseBldFn;
+extern BldIsThePlayerFn    g_bldIsThePlayerFn;
+extern BldResidentLeaderFn g_bldResidentLeaderFn;
+extern BldNumInternalFn    g_bldNumInternalFn;
+extern BldNotifyChangeFn   g_bldNotifyChangeFn;
+extern BldGetRealTownFn     g_bldGetRealTownFn;
+extern TownSetPlayerBldgsFn g_townSetPlayerBldgsFn;
+extern TownRecalcLevelFn    g_townRecalcLevelFn;
+extern TownIsPlayerBldgsFn  g_townIsPlayerBldgsFn;
 extern BuyItemFn g_buyItemOrig;
 
 // Cross-owner trade veto (see Engine.h installXferBlockHook). g_invVetoSuspend
