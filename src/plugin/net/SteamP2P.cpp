@@ -389,6 +389,31 @@ void shutdown() {
     if (!g_ready) return;
     if (g_peer != 0)     g_close(g_iface, g_peer);
     if (g_pingPeer != 0 && g_pingPeer != g_peer) g_close(g_iface, g_pingPeer);
+
+    // Drop every handle resolved through the Steam client pipe. A disconnect is
+    // often triggered BY a Steam-level session drop, and the client can recycle
+    // the pipe while we are down - which invalidates g_iface/g_user without any
+    // notification to us. init() early-returns on g_ready, so leaving these set
+    // means a reconnect silently reuses a pointer resolved at plugin load and
+    // keeps handing it to ReadP2PPacket/IsP2PPacketAvailable from the ENet
+    // socket hooks. Clearing g_ready forces the next init() to re-resolve.
+    g_ready    = false;
+    g_iface    = 0;
+    g_user     = 0;
+    g_peer     = 0;
+    g_pingPeer = 0;
+
+    // Per-session latches, so the next session's diagnostics describe itself
+    // rather than staying silent because the first session already fired them.
+    g_loggedFirstRecv   = false;
+    g_loggedStraySender = false;
+    g_haveLastState     = false;
+    g_lastStateTick     = 0;
+    g_lastPingTick      = 0;
+
+    // g_selfId is deliberately kept: it is a plain uint64, not a pipe handle,
+    // and the F2 panel reads it via selfId() to offer "Copy my Steam ID" while
+    // disconnected. init() refreshes it anyway on the next successful connect.
 }
 
 } // namespace steamp2p

@@ -1818,7 +1818,15 @@ void startNetworking() {
 // path (NetLink cleanly supports stop() then start again; Steam is re-armed and
 // the Replicator/Inbound session state is reset for a clean handshake).
 void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
-    if (g_net.isRunning()) g_net.stop();
+    // stop() unconditionally: it already no-ops when no worker exists, and it is
+    // the ONLY thing that joins the thread. isRunning() reads running_, which the
+    // worker sets from inside threadLoop - so between CreateThread returning and
+    // that first instruction, the thread is alive while isRunning() is still
+    // false. Gating on it there skipped the join, leaving the old worker running
+    // while a new one was created, and let the steamp2p::shutdown() below close
+    // the P2P session out from under a live IsP2PPacketAvailable call in
+    // hookWait. Rapid reconnects made that window easy to hit.
+    g_net.stop();
     coop::steamp2p::shutdown();
     // World is live here (reconnect from within a running game): despawn minted
     // proxies before clearing maps so a re-connect leaves no orphaned duplicates.
@@ -1865,7 +1873,7 @@ void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
 
 void coopUiDisconnect() {
     coopLog("[coop-ui] disconnect");
-    if (g_net.isRunning()) g_net.stop();
+    g_net.stop(); // unconditional - see the note in coopUiConnect
     coop::steaminvite::reset(); // leave any Steam lobby
     coop::steamp2p::shutdown();
     // World stays live on a manual disconnect: despawn minted proxies before

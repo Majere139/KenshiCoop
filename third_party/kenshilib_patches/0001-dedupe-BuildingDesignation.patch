@@ -1,0 +1,42 @@
+diff --git a/KenshiLib/Include/kenshi/Building/Building.h b/KenshiLib/Include/kenshi/Building/Building.h
+index fd1087f..226e706 100644
+--- a/KenshiLib/Include/kenshi/Building/Building.h
++++ b/KenshiLib/Include/kenshi/Building/Building.h
+@@ -11,6 +11,8 @@
+ #include <kenshi/PhysicsCollection.h>
+ #include <kenshi/PhysicsActual.h>
+ 
++#ifndef KENSHILIB_BUILDINGDESIGNATION_DEFINED
++#define KENSHILIB_BUILDINGDESIGNATION_DEFINED
+ enum BuildingDesignation
+ {
+     BD_NONE,
+@@ -26,6 +28,7 @@ enum BuildingDesignation
+     BD_SLAVE_STORAGE,
+     BD_RESIDENTIAL_SMALL
+ };
++#endif // KENSHILIB_BUILDINGDESIGNATION_DEFINED
+ 
+ enum BuildingClassType
+ {
+diff --git a/KenshiLib/Include/kenshi/Platoon.h b/KenshiLib/Include/kenshi/Platoon.h
+index 75eaa5f..61aaf98 100644
+--- a/KenshiLib/Include/kenshi/Platoon.h
++++ b/KenshiLib/Include/kenshi/Platoon.h
+@@ -28,6 +28,8 @@ class AreaBiomeGroup;
+ class AreaSector;
+ 
+ // TODO move?
++#ifndef KENSHILIB_BUILDINGDESIGNATION_DEFINED
++#define KENSHILIB_BUILDINGDESIGNATION_DEFINED
+ enum BuildingDesignation
+ {
+     BD_NONE,
+@@ -43,6 +45,7 @@ enum BuildingDesignation
+     BD_SLAVE_STORAGE,
+     BD_RESIDENTIAL_SMALL
+ };
++#endif // KENSHILIB_BUILDINGDESIGNATION_DEFINED
+ 
+ enum BuildingFunction;
+ 

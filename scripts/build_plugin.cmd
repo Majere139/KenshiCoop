@@ -32,10 +32,26 @@ set "SDK=C:\Program Files\Microsoft SDKs\Windows\v7.1"
 set "KL=%REPO%\third_party\KenshiLib_deps"
 set "ENET=%REPO%\third_party\enet\enet\include"
 
-REM Locate MSBuild via vswhere (falls back to a common path).
-set "MSBUILD="
-for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" 2^>nul`) do set "MSBUILD=%%i"
+REM Locate MSBuild. A pre-set %MSBUILD% wins, then vswhere, then a known path.
+REM "-products *" matters: the default product filter skips Community/2026-era
+REM installs, and "-requires Microsoft.Component.MSBuild" matches nothing on
+REM them either, so the narrower query returned empty and fell through to a
+REM VS2022 BuildTools path that need not exist on this machine.
+REM The ^"...^" wrapping is required, not decoration: for /f "usebackq" strips the
+REM quotes around an exe path that itself contains spaces as soon as the command
+REM line carries further quoted arguments, so the unwrapped form ran
+REM 'C:\Program' and silently yielded nothing.
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+if not defined MSBUILD (
+  for /f "usebackq delims=" %%i in (`^""%VSWHERE%" -latest -products * -find "MSBuild\**\Bin\MSBuild.exe"^"`) do set "MSBUILD=%%i"
+)
 if not defined MSBUILD set "MSBUILD=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\MSBuild.exe"
+if not exist "%MSBUILD%" (
+  echo ERROR: MSBuild.exe not found.
+  echo        Set MSBUILD to its full path and re-run, e.g.
+  echo          set "MSBUILD=C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\MSBuild.exe"
+  exit /b 1
+)
 
 REM x64 native toolchain on PATH so cl.exe finds its sibling DLLs (mspdb100, etc).
 set "PATH=%VC%\bin\amd64;%VC%\bin;%VS10%\Common7\IDE;%SDK%\Bin\x64;%SDK%\Bin;%PATH%"
@@ -50,6 +66,30 @@ REM Libs: VC10 x64 CRT + Win SDK 7.1 x64 + KenshiLib (kenshilib.lib, OgreMain_x6
 set "LIB=%VC%\lib\amd64;%SDK%\Lib\x64;%KL%\KenshiLib\Libraries"
 
 echo === Building KenshiCoop.dll (%CONFIG%^|x64, v100) ===
+
+REM Fail early and legibly when the toolchain is absent: without this the build
+REM dies much later inside MSBuild with an opaque toolset error. These use goto
+REM rather than if(...) blocks because %VC%/%SDK% expand to paths containing
+REM "(x86)", whose ")" would close a parenthesised block early.
+if not exist "%VC%\bin\amd64\cl.exe" goto :no_v100
+if not exist "%SDK%\Include"         goto :no_sdk71
+goto :toolchain_ok
+
+:no_v100
+echo ERROR: the VC++ 2010 ^(v100^) x64 compiler was not found at
+echo          %VC%\bin\amd64\cl.exe
+echo        KenshiLib requires this exact toolset. Install Windows SDK 7.1 plus
+echo        the "VC++ 2010 SP1 Compiler Update for the Windows SDK 7.1"
+echo        ^(KB2519277^). See resources/BUILD_SETUP.md Part A.
+exit /b 1
+
+:no_sdk71
+echo ERROR: Windows SDK 7.1 headers not found at
+echo          %SDK%\Include
+echo        See resources/BUILD_SETUP.md Part A.
+exit /b 1
+
+:toolchain_ok
 where cl.exe
 
 REM UseEnv=true: use the INCLUDE/LIB/PATH above instead of registry-derived paths.
