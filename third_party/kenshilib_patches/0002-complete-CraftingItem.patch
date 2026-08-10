@@ -1,0 +1,20 @@
+diff --git a/KenshiLib/Include/kenshi/Building/CraftingBuilding.h b/KenshiLib/Include/kenshi/Building/CraftingBuilding.h
+index 59c8737..3c7759a 100644
+--- a/KenshiLib/Include/kenshi/Building/CraftingBuilding.h
++++ b/KenshiLib/Include/kenshi/Building/CraftingBuilding.h
+@@ -7,7 +7,14 @@
+ class InventoryLayout;
+ class Faction;
+ class DatapanelGUI;
+-class CraftingItem;
++// KenshiLib ships only a forward declaration, but the 'crafting' member below is
++// a std::deque<CraftingItem> BY VALUE, and the VC10 STL instantiates deque on the
++// member declaration - which needs a complete type. Give it an opaque definition.
++// This cannot move any member offset: MSVC's deque stores a map pointer plus three
++// size_t and never embeds T, so sizeof(deque<T>) is identical for every T (the
++// mirrored layout here has it spanning 0x498..0x4C8 either way). Nothing reads the
++// deque's elements; it exists so the offsets of the members after it stay right.
++class CraftingItem {};
+ 
+ // TODO move?
+ class GameDataGroup
