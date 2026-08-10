@@ -102,13 +102,17 @@ void Replicator::applyNpcCensus(Inbound& in) {
             censusPos_[k] = cp;
         }
     }
+    censusRows_ = n;
     censusRecvMs_ = nowMs();
     static unsigned long logTick = 0;
     if ((censusRecvMs_ - logTick) > 10000) {
         logTick = censusRecvMs_;
-        char b[96];
-        _snprintf(b, sizeof(b) - 1, "[census] recv n=%u culls=%lu",
-                  n, censusCulls_);
+        char b[160];
+        _snprintf(b, sizeof(b) - 1,
+                  "[census] recv n=%u culls=%lu silentSkips=%lu%s",
+                  n, censusCulls_, censusSilentSkips_,
+                  n == 0 ? "  <- EMPTY: peer claimed nothing, not culling on it"
+                         : "");
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }
@@ -1049,6 +1053,26 @@ u32 Replicator::authorityFor(GameWorld* gw, float x, float z) const {
 
 bool Replicator::authorHoldsBody(GameWorld* gw, u32 localId, const Key& k,
                                  Character* c, float x, float z) {
+    // SILENCE IS NOT ABSENCE. An empty census is not a claim that the peer's
+    // region is empty - it is the peer making no claim at all, and the two mean
+    // opposite things here. Measured 2026-08-09, the two players separated:
+    //
+    //   join  [census] sent n=0 ... enum=62 notmine=62   <- claimed nothing
+    //   host  [census] recv n=0 culls=156                <- hid 156 real bodies
+    //
+    // The join's own presence filter had rejected all 62 because the two sides'
+    // cell maps disagreed (host saw "cells=2 18,35=1 20,32=0", join saw
+    // "cells=1 19,35=0"), so each side believed the OTHER owned the region and
+    // neither vouched for anything in it. Cell authority is derived
+    // independently on each machine and is not a shared fact, so this
+    // disagreement is reachable whenever the players separate.
+    //
+    // Until ownership IS shared, refuse to act on silence. Erring this way
+    // leaves a body visible that maybe should have been hidden; erring the
+    // other way hides bodies that genuinely exist, which is the desync players
+    // actually report. Restores are unaffected, so a session already in the bad
+    // state heals instead of staying broken.
+    if (censusRows_ == 0) { ++censusSilentSkips_; return true; }
     if (!cellAuth_) return false;
     u32 owner = authorityFor(gw, x, z);
     // Ours to author, or nobody's we have heard from: either way this body is

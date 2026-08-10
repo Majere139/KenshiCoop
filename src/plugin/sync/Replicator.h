@@ -1020,6 +1020,11 @@ private:
     // speaks for the cells its sender owns, so enforcement has to know who
     // sent it. Defaults to the host, which is who it always was.
     u32                       censusOwner_;
+    // Rows in the peer's most recent census. Zero is NOT "the world is empty
+    // there" - it is "I made no claim", and the two mean opposite things to the
+    // cull. See the guard at the top of authorHoldsBody.
+    unsigned int              censusRows_;
+    unsigned long             censusSilentSkips_; // bodies spared by that guard
     unsigned long             censusCulls_;   // join: wide-radius suppress count
     // Phase 0.5 census diagnostics (2026-08-02 field report: "join sees local
     // NPCs the host does not, worsening over long travel"). Four mechanisms in

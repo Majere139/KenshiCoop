@@ -15,7 +15,11 @@
 namespace coop {
 
 Replicator::Replicator()
-    : catchupK_(CATCHUP_K), snapDist_(SNAP_DIST), snapSeconds_(SNAP_SECONDS),
+    // censusRows_ starts at 0 deliberately: before any census has arrived the
+    // peer has made no claim, and the cull must not run on that. Same reasoning
+    // as the guard in authorHoldsBody.
+    : censusRows_(0), censusSilentSkips_(0),
+      catchupK_(CATCHUP_K), snapDist_(SNAP_DIST), snapSeconds_(SNAP_SECONDS),
       combatSoftDist_(COMBAT_SOFT_DIST), combatSnapDist_(COMBAT_SNAP_DIST),
       combatBigSnapDist_(COMBAT_BIG_SNAP_DIST), combatSlideMax_(COMBAT_SLIDE_MAX),
       combatConvergeMs_(COMBAT_CONVERGE_MS),
@@ -199,6 +203,7 @@ void Replicator::resetSession() {
     parkMs_.clear();
     censusRecvMs_ = 0;
     censusSendMs_ = 0;
+    censusRows_   = 0; // no claim carries across a session reset
     // Protocol 43: the camera hint describes the OLD world's coordinates.
     camHintSendMs_ = 0;
     peerCamMs_ = 0;
