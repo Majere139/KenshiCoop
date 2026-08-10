@@ -84,6 +84,14 @@
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <ProgramDatabaseFile>$(OutDir)KenshiCoop.pdb</ProgramDatabaseFile>
+      <!-- Record only the PDB FILENAME in the DLL, not its absolute build path.
+           The default writes something like
+             C:\Users\<name>\...\x64\Release\KenshiCoop.pdb
+           into every binary, so a shipped release leaks the building machine's
+           user name and directory layout (found 2026-08-10 in a published
+           asset). A debugger still resolves the PDB when it sits next to the
+           DLL, which is how it is used here anyway. -->
+      <AdditionalOptions>/PDBALTPATH:%_PDB% %(AdditionalOptions)</AdditionalOptions>
       <!-- Linker MAP alongside the PDB: no debugger is installed on the dev box, so
            a crash address can only be turned into a function name by looking up its
            RVA in a text map. The PDB is useless without a tool that reads it. -->
@@ -107,6 +115,14 @@
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <ProgramDatabaseFile>$(OutDir)KenshiCoop.pdb</ProgramDatabaseFile>
+      <!-- Record only the PDB FILENAME in the DLL, not its absolute build path.
+           The default writes something like
+             C:\Users\<name>\...\x64\Release\KenshiCoop.pdb
+           into every binary, so a shipped release leaks the building machine's
+           user name and directory layout (found 2026-08-10 in a published
+           asset). A debugger still resolves the PDB when it sits next to the
+           DLL, which is how it is used here anyway. -->
+      <AdditionalOptions>/PDBALTPATH:%_PDB% %(AdditionalOptions)</AdditionalOptions>
       <GenerateMapFile>true</GenerateMapFile>
       <MapFileName>$(OutDir)KenshiCoop.map</MapFileName>
       <AdditionalDependencies>kenshilib.lib;OgreMain_x64.lib;MyGUIEngine_x64.lib;ws2_32.lib;winmm.lib;%(AdditionalDependencies)</AdditionalDependencies>
