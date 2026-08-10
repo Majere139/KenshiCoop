@@ -726,7 +726,7 @@ bool peerCamAnchor(float out[3]) {
 // Camera anchors within ~100u of an existing anchor are dropped (the common
 // camera-follows-leader case adds no reach, only query cost). Writes up to
 // four centers; returns the count. Caller holds the SEH frame.
-unsigned int interestCenters(GameWorld* gw, Ogre::Vector3 outC[4]) {
+unsigned int interestCenters(GameWorld* gw, Ogre::Vector3 outC[4], AnchorInfo* info) {
     PlayerInterface* pl = gw->player;
     if (!pl || pl->playerCharacters.size() == 0) return 0;
     unsigned int pairs[2][2];
@@ -743,6 +743,11 @@ unsigned int interestCenters(GameWorld* gw, Ogre::Vector3 outC[4]) {
         if (seen) continue;
         pairs[nc][0] = h[1]; pairs[nc][1] = h[2];
         outC[nc] = m->getPosition();
+        if (info) {
+            info[nc].kind = ANCHOR_TAB;
+            info[nc].ctnr = h[1];
+            info[nc].ctnrSerial = h[2];
+        }
         ++nc;
     }
     if (nc == 0 || !s_camInterest) return nc;
@@ -763,6 +768,11 @@ unsigned int interestCenters(GameWorld* gw, Ogre::Vector3 outC[4]) {
         }
         if (dup) continue;
         outC[nc] = Ogre::Vector3(cams[ci][0], cams[ci][1], cams[ci][2]);
+        if (info) {
+            info[nc].kind = (ci == 0) ? ANCHOR_LOCAL_CAM : ANCHOR_PEER_CAM;
+            info[nc].ctnr = 0;
+            info[nc].ctnrSerial = 0;
+        }
         ++nc;
     }
     return nc;
@@ -770,12 +780,12 @@ unsigned int interestCenters(GameWorld* gw, Ogre::Vector3 outC[4]) {
 
 // SEH wrapper over interestCenters for callers outside the engine layer
 // (interestCenters itself relies on the caller's SEH frame).
-unsigned int interestAnchors(GameWorld* gw, float out[12]) {
+unsigned int interestAnchorsEx(GameWorld* gw, float out[12], AnchorInfo info[4]) {
     if (!gw || !out) return 0;
     unsigned int nc = 0;
     __try {
         Ogre::Vector3 centers[4];
-        nc = interestCenters(gw, centers);
+        nc = interestCenters(gw, centers, info);
         for (unsigned int i = 0; i < nc; ++i) {
             out[i * 3 + 0] = centers[i].x;
             out[i * 3 + 1] = centers[i].y;
@@ -785,6 +795,10 @@ unsigned int interestAnchors(GameWorld* gw, float out[12]) {
         return 0;
     }
     return nc;
+}
+
+unsigned int interestAnchors(GameWorld* gw, float out[12]) {
+    return interestAnchorsEx(gw, out, 0);
 }
 
 unsigned int captureNpcs(GameWorld* gw, EntityState* out, unsigned int maxOut) {

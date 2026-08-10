@@ -786,7 +786,8 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
     // of trying to put it here is in the loop comment, along with the measurement
     // that settled it.
     float rawAnch[12];
-    unsigned int nRawAnch = engine::interestAnchors(gw, rawAnch);
+    engine::AnchorInfo rawAnchInfo[4];
+    unsigned int nRawAnch = engine::interestAnchorsEx(gw, rawAnch, rawAnchInfo);
     // A proxy's own hand is one WE minted and no other client has ever heard of,
     // so censusing it under that hand vouches for nothing: the peer looks for the
     // body it knows, does not find it, and hides its own real copy. That is how a
@@ -934,7 +935,7 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
         // capability veto) - it is no longer evidence of the ghost mechanism.
         const float* anch = rawAnch;    // pre-veto: the veto reads off a?=
         unsigned int na = nRawAnch;
-        char det[192]; det[0] = '\0';
+        char det[288]; det[0] = '\0'; // 4 anchors x up to ~47 chars each
         for (unsigned int a = 0; a < na; ++a) {
             unsigned int share = 0;
             for (unsigned int i = 0; i < n; ++i) {
@@ -949,9 +950,31 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
             }
             bool ld = engine::isZoneLoadedAt(gw, anch[a * 3 + 0],
                                              anch[a * 3 + 1], anch[a * 3 + 2]);
-            char one[40];
-            _snprintf(one, sizeof(one) - 1, " a%u=%s:%u",
-                      a, ld ? "loaded" : "UNLOADED", share);
+            // Provenance. The count alone cannot tell "one anchor each" from
+            // "one player holds both tab slots" - and the second case is what
+            // stops a fleeing player's surroundings streaming. Name the source:
+            // tab anchors report their latched rank and whether WE own that tab,
+            // cameras report which side they came from.
+            char who[24];
+            const engine::AnchorInfo& ai = rawAnchInfo[a];
+            if (ai.kind == engine::ANCHOR_TAB) {
+                std::pair<u32, u32> key(ai.ctnr, ai.ctnrSerial);
+                std::map<std::pair<u32, u32>, unsigned int>::const_iterator it =
+                    tabRank_.find(key);
+                if (it != tabRank_.end()) {
+                    _snprintf(who, sizeof(who) - 1, "tab%u%s", it->second,
+                              ownsTab(key, it->second) ? "/mine" : "/peer");
+                } else {
+                    _snprintf(who, sizeof(who) - 1, "tab?");
+                }
+            } else {
+                _snprintf(who, sizeof(who) - 1,
+                          ai.kind == engine::ANCHOR_LOCAL_CAM ? "camL" : "camP");
+            }
+            who[sizeof(who) - 1] = '\0';
+            char one[72];
+            _snprintf(one, sizeof(one) - 1, " a%u=%s:%s:%u",
+                      a, who, ld ? "loaded" : "UNLOADED", share);
             one[sizeof(one) - 1] = '\0';
             unsigned int used = (unsigned int)strlen(det);
             if (used + strlen(one) + 1 < sizeof(det)) strcat(det, one);
@@ -964,7 +987,7 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
         // why anything was left out - it read as "the peer is not watching these"
         // when it mostly meant "another client authors these". Now there is only
         // one reason a row is dropped here, and this names it.
-        char b[320];
+        char b[448];
         _snprintf(b, sizeof(b) - 1,
                   "[census] sent n=%u radius=%.0f mid=%u anchors=%u%s"
                   " enum=%u notmine=%u proxyrow=%u attnR=%.0f",

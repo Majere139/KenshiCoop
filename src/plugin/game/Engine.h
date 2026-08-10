@@ -215,6 +215,25 @@ void setCamInterest(bool on);
 // camera-watched NPCs get mid-band drive slots too. Returns the anchor count.
 unsigned int interestAnchors(GameWorld* gw, float out[12]);
 
+// Where each anchor came from, parallel to interestAnchors' position array.
+// The engine layer knows WHERE an anchor is but not WHOSE it is - ownership
+// lives in the sync layer's squad-tab rank partition - so the tab container is
+// reported raw and the caller maps it to a rank.
+const unsigned char ANCHOR_TAB       = 0; // a squad-tab leader
+const unsigned char ANCHOR_LOCAL_CAM = 1; // this client's camera centre
+const unsigned char ANCHOR_PEER_CAM  = 2; // the peer's camera hint
+struct AnchorInfo {
+    unsigned char kind;
+    unsigned int  ctnr;       // squad-tab container       (ANCHOR_TAB only)
+    unsigned int  ctnrSerial; // squad-tab container serial (ANCHOR_TAB only)
+};
+
+// As interestAnchors, but also reports each anchor's provenance. Exists because
+// the anchor COUNT alone cannot distinguish "both players covered" from "one
+// player holds both tab slots and the other has no anchor at all" - which is
+// the failure that makes a fleeing player's surroundings stop streaming.
+unsigned int interestAnchorsEx(GameWorld* gw, float out[12], AnchorInfo info[4]);
+
 // ---- Stage 4 NPC replication primitives ------------------------------------
 
 // SEH-guarded: enumerate characters near the local player and capture every one

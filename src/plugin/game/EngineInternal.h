@@ -621,7 +621,9 @@ bool isPlayerSquad(GameWorld* gw, RootObject* obj);
 // Live NON-player Faction* read off a nearby world NPC. Caller holds SEH.
 Faction* findNearbyNonPlayerFaction(GameWorld* gw);
 // Dual-interest centers (one per squad tab leader, up to two). Caller holds SEH.
-unsigned int interestCenters(GameWorld* gw, Ogre::Vector3 outC[4]);
+// info, when non-null, receives one AnchorInfo per returned centre (see Engine.h).
+unsigned int interestCenters(GameWorld* gw, Ogre::Vector3 outC[4],
+                             AnchorInfo* info = 0);
 // Case-insensitive substring test on raw C strings (SEH legal).
 bool ciContains(const char* hay, const char* needle);
 // Template scans (reused g_dataScratch; main thread only).
