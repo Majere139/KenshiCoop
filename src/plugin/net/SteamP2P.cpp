@@ -93,6 +93,58 @@ void steamLog(const char* msg) {
 
 const ENetSocket FAKE_SOCKET = (ENetSocket)0x51EAD;
 
+// ---- Fault containment around the flat Steam calls ---------------------------
+// The peer leaving tears down Steam's own record of the P2P session, and it can
+// do so while the net thread is mid-call: hookWait polls IsP2PPacketAvailable
+// every 5 ms, so the window is hit often. Observed 2026-08-09 on the JOIN, about
+// half a second after the host left - steam_api64+0x48e3 reading unmapped memory
+// with hookWait on the stack, taking the process down while ENet was already
+// retrying the connection.
+//
+// We cannot make Steam's teardown atomic from out here, so contain it instead: a
+// faulting call reports "nothing available" rather than killing the game, and
+// latches so we stop hammering a record that has already gone. ENet then times
+// the peer out through its normal path. init() clears the latch, so a later
+// reconnect (which re-resolves the interface anyway) starts clean.
+//
+// Each wrapper is its own leaf function: __try/__except cannot live in a frame
+// that needs C++ unwinding, and keeping them tiny keeps the guarded region to
+// exactly the call we do not trust.
+bool g_steamFaulted = false;
+bool g_faultLogged  = false;
+
+bool safeIsAvail(unsigned int* avail, int ch) {
+    __try { return g_isAvail(g_iface, avail, ch) ? true : false; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { g_steamFaulted = true; return false; }
+}
+
+bool safeRead(void* dest, unsigned int destSize, unsigned int* msgSize,
+              unsigned long long* sender, int ch) {
+    __try { return g_read(g_iface, dest, destSize, msgSize, sender, ch) ? true : false; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { g_steamFaulted = true; return false; }
+}
+
+bool safeSend(SteamId to, const void* data, unsigned int len, int ch) {
+    __try { return g_send(g_iface, to, data, len, SEND_UNRELIABLE, ch) ? true : false; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { g_steamFaulted = true; return false; }
+}
+
+// Also net-thread-reached (tick -> logSessionState / spikeTick), so it needs the
+// same containment as the packet calls.
+bool safeSessionState(SteamId id, SessionState* st) {
+    __try { return g_sessionState(g_iface, id, st) ? true : false; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { g_steamFaulted = true; return false; }
+}
+
+// Logged from outside the SEH frames (steamLog builds strings; keep that out of
+// a guarded region). Cheap enough to call from the hook paths.
+void noteFaultOnce() {
+    if (!g_steamFaulted || g_faultLogged) return;
+    g_faultLogged = true;
+    steamLog("P2P call faulted (session torn down under us?) - tunnel disabled "
+             "until the next connect; ENet will time the peer out");
+}
+
 ENetSocket ENET_CALLBACK hookCreate(ENetSocketType type) {
     (void)type;
     return FAKE_SOCKET;
@@ -109,13 +161,13 @@ int ENET_CALLBACK hookSend(ENetSocket s, const ENetAddress* address,
     unsigned int  len = 0;
     size_t i;
     (void)s; (void)address; // single peer: the fake address is ignored
-    if (!g_ready || g_peer == 0) return -1;
+    if (!g_ready || g_peer == 0 || g_steamFaulted) return -1;
     for (i = 0; i < bufferCount; ++i) {
         if (len + buffers[i].dataLength > sizeof(buf)) return -1;
         std::memcpy(buf + len, buffers[i].data, buffers[i].dataLength);
         len += (unsigned int)buffers[i].dataLength;
     }
-    if (!g_send(g_iface, g_peer, buf, len, SEND_UNRELIABLE, CH_TUNNEL)) return -1;
+    if (!safeSend(g_peer, buf, len, CH_TUNNEL)) { noteFaultOnce(); return -1; }
     return (int)len;
 }
 
@@ -125,9 +177,9 @@ int ENET_CALLBACK hookReceive(ENetSocket s, ENetAddress* address,
     unsigned long long sender = 0;
     unsigned char buf[4096];
     (void)s;
-    if (!g_ready || bufferCount < 1) return 0;
-    if (!g_isAvail(g_iface, &avail, CH_TUNNEL)) return 0;
-    if (!g_read(g_iface, buf, sizeof(buf), &got, &sender, CH_TUNNEL)) return 0;
+    if (!g_ready || bufferCount < 1 || g_steamFaulted) return 0;
+    if (!safeIsAvail(&avail, CH_TUNNEL)) { noteFaultOnce(); return 0; }
+    if (!safeRead(buf, sizeof(buf), &got, &sender, CH_TUNNEL)) { noteFaultOnce(); return 0; }
     if (sender != g_peer) {
         // Someone else sent to us (not our configured co-op partner): drop.
         if (!g_loggedStraySender) {
@@ -168,7 +220,10 @@ int ENET_CALLBACK hookWait(ENetSocket s, enet_uint32* condition, enet_uint32 tim
     }
     for (;;) {
         unsigned int avail = 0;
-        if (g_ready && g_isAvail(g_iface, &avail, CH_TUNNEL)) {
+        // This spin is where the teardown race was observed: 5 ms polling gives
+        // the peer's departure plenty of chances to free the session mid-call.
+        if (g_steamFaulted) { noteFaultOnce(); Sleep(5); }
+        else if (g_ready && safeIsAvail(&avail, CH_TUNNEL)) {
             *condition |= ENET_SOCKET_WAIT_RECEIVE;
             return 0;
         }
@@ -188,7 +243,7 @@ ENetSocketHooks g_hooks; // filled in installEnetHooks
 void logSessionState(SteamId peer) {
     SessionState st;
     std::memset(&st, 0, sizeof(st));
-    if (!g_sessionState(g_iface, peer, &st)) return;
+    if (g_steamFaulted || !safeSessionState(peer, &st)) return;
     if (g_haveLastState &&
         st.connectionActive == g_lastState.connectionActive &&
         st.connecting       == g_lastState.connecting &&
@@ -219,17 +274,17 @@ void spikeTick() {
         unsigned int avail = 0, got = 0;
         unsigned long long sender = 0;
         SpikeMsg m;
-        if (!g_isAvail(g_iface, &avail, CH_SPIKE)) break;
-        if (!g_read(g_iface, &m, sizeof(m), &got, &sender, CH_SPIKE)) break;
+        if (g_steamFaulted || !safeIsAvail(&avail, CH_SPIKE)) break;
+        if (!safeRead(&m, sizeof(m), &got, &sender, CH_SPIKE)) break;
         if (got != sizeof(m)) continue;
         if (std::memcmp(m.tag, "KCSP", 4) == 0) {
             // Ping: echo it back with the sender's own timestamp intact.
             std::memcpy(m.tag, "KCSQ", 4);
-            g_send(g_iface, sender, &m, sizeof(m), SEND_UNRELIABLE, CH_SPIKE);
+            safeSend(sender, &m, sizeof(m), CH_SPIKE);
         } else if (std::memcmp(m.tag, "KCSQ", 4) == 0) {
             SessionState st;
             std::memset(&st, 0, sizeof(st));
-            g_sessionState(g_iface, sender, &st);
+            safeSessionState(sender, &st);
             char b[128];
             _snprintf(b, sizeof(b) - 1, "ping seq=%u rtt=%lu ms relay=%u",
                       m.seq, (unsigned long)(now - m.tick), (unsigned)st.usingRelay);
@@ -245,7 +300,7 @@ void spikeTick() {
         std::memcpy(m.tag, "KCSP", 4);
         m.seq  = ++g_pingSeq;
         m.tick = now;
-        g_send(g_iface, g_pingPeer, &m, sizeof(m), SEND_UNRELIABLE, CH_SPIKE);
+        safeSend(g_pingPeer, &m, sizeof(m), CH_SPIKE);
     }
 }
 
@@ -255,6 +310,10 @@ void spikeTick() {
 
 bool init() {
     if (g_ready) return true;
+    // A previous session may have latched a fault. The interface is about to be
+    // re-resolved from a live pipe, so the old verdict does not carry over.
+    g_steamFaulted = false;
+    g_faultLogged  = false;
 
     HMODULE mod = GetModuleHandleA("steam_api64.dll");
     if (mod == 0) mod = LoadLibraryA("steam_api64.dll");
