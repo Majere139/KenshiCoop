@@ -2274,6 +2274,16 @@ private:
     std::map<Key, Character*>    aliasByKey_;
     std::map<Character*, Key>    aliasKeyOfChar_; // reverse view, in lockstep
     std::map<Key, unsigned long> aliasVouchMs_;   // last census that carried the key
+    // v2 (2026-08-12): local (i,s) -> body, rebuilt from every census walk
+    // (the walk already passes each body through our hands at 1 Hz). Feeds
+    // the (i,s)-exact bind: 39% of the peer keys this side could not resolve
+    // in the 2026-08-11 captures named an (i,s) held here as a live body -
+    // containers are per-client/per-epoch, the (i,s) pair persists. A NULL
+    // value marks an (i,s) that appeared TWICE in one walk (engine collision;
+    // never observed, but a collision must refuse to bind, not pick a side).
+    // Entries are up to one walk stale: every consumer must round-trip the
+    // pointer (readHand + resolve back) before touching the body.
+    std::map<std::pair<u32, u32>, Character*> localByIS_;
     // JOIN: per-hand request state - debounce, retry cap, negative-reply
     // backoff (deniedMs = when the host said "can't resolve either" or the
     // local proxy spawn failed; retried only after a long cooldown).

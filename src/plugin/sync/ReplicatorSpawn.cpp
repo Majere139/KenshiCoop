@@ -132,11 +132,24 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
                 if (live != body) { dropAlias(k, "despawned"); continue; }
                 Character* orig = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
                 if (orig && orig != body) { dropAlias(k, "original-resolved"); continue; }
-                std::map<Key, unsigned long>::iterator vm = aliasVouchMs_.find(k);
-                if (vm == aliasVouchMs_.end() ||
-                    (now - vm->second) >= ALIAS_STALE_MS) {
-                    dropAlias(k, "stale");
-                    continue;
+                // v2 (2026-08-12): silence-aware staleness. v1 aged the vouch
+                // against wall time unconditionally, so every ownership flip
+                // (peer census empties) dropped ALL aliases within 30 s -
+                // measured 2026-08-11: 13 of 13 host aliases gone at the
+                // flips, then re-bound from scratch. An empty census is the
+                // peer making NO claim, and no censuses arriving at all
+                // (peer left) is the same silence - the exact principle the
+                // cull guard shipped on. Age only while the peer is actively
+                // publishing a non-empty census that omits the key.
+                bool peerSpeaking = censusRows_ > 0 && censusRecvMs_ != 0 &&
+                                    (now - censusRecvMs_) <= 15000;
+                if (peerSpeaking) {
+                    std::map<Key, unsigned long>::iterator vm = aliasVouchMs_.find(k);
+                    if (vm == aliasVouchMs_.end() ||
+                        (now - vm->second) >= ALIAS_STALE_MS) {
+                        dropAlias(k, "stale");
+                        continue;
+                    }
                 }
             }
         }
@@ -164,30 +177,38 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             pkt.hContainerSerial = rq.hContainerSerial;
             pkt.hIndex = rq.hIndex; pkt.hSerial = rq.hSerial;
             Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
-            // Identity map (2026-08-11): a hand that fails engine resolve may
-            // still be one WE bound - a minted proxy or an aliased local body
-            // IS the body the peer knows by this hand, so describe it rather
-            // than dead-ending. Measured 2026-08-10: all 13 distinct found=0
-            // hands (322 answers) were hands this side itself had bound and
-            // was censusing; the peer burned its retry budget asking about
-            // bodies we were standing next to. The pointer gets the same
-            // round-trip proof as the liveness sweep before we touch it -
-            // between sweeps it can be a stale despawn.
-            const char* via = "";
+            // v2 (2026-08-12): a REQ for a key WE bound is proof the key is
+            // DEAD on its origin side. Every bound key originated from the
+            // peer (census or stream), and a peer that still knew the key
+            // would have resolved it locally instead of asking. v1 answered
+            // these found=1 from the binding table, which RESURRECTED dead
+            // keys: at the 2026-08-11 reunion the peer re-learned its own
+            // pre-reload container keys from our bindings and minted puppets
+            // of our puppets (the 1,131 squad - eight bodies of inflation).
+            // Now the binding is retired instead: an aliased key drops the
+            // alias (the local body is real and stays; its census row simply
+            // returns to its local hand), a proxied key ORPHANS the puppet
+            // (despawn + unbind - its premise died with the key), and the
+            // answer comes from the engine alone. A dead key gets found=0,
+            // the peer's backoff stops the retries, and the stale-key
+            // circulation measured on 2026-08-11 (18 full keys unresolvable
+            // on BOTH sides) loses its supply.
             if (!c) {
+                if (aliasByKey_.find(k) != aliasByKey_.end())
+                    dropAlias(k, "peer-lost-key");
                 std::map<Key, Character*>::iterator bp = proxyByKey_.find(k);
-                if (bp != proxyByKey_.end()) { c = bp->second; via = " via=proxy"; }
-            }
-            if (!c) {
-                std::map<Key, Character*>::iterator ba = aliasByKey_.find(k);
-                if (ba != aliasByKey_.end()) { c = ba->second; via = " via=alias"; }
-            }
-            if (via[0]) {
-                unsigned int ph[5];
-                Character* live = 0;
-                if (engine::readHand(c, ph))
-                    live = engine::resolveCharByHand(ph[0], ph[1], ph[2], ph[3], ph[4]);
-                if (live != c) { c = 0; via = ""; } // sweep will unbind it
+                if (bp != proxyByKey_.end()) {
+                    if (gw && bp->second) engine::despawnProxyNpc(gw, bp->second);
+                    spawnReq_.erase(k);
+                    lifeSet(k, LIFE_UNKNOWN, "proxy-orphaned");
+                    char ob[176]; _snprintf(ob, sizeof(ob) - 1,
+                        "[spawn] proxy ORPHANED hand=%u,%u,%u,%u,%u "
+                        "(peer lost the key; proxies=%u)",
+                        k.t, k.c, k.cs, k.i, k.s,
+                        (unsigned)proxyByKey_.size() - 1);
+                    ob[sizeof(ob) - 1] = '\0'; coop::logLine(ob);
+                    proxyByKey_.erase(bp);
+                }
             }
             bool dead = false;
             float age = 0.0f;
@@ -199,9 +220,9 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             pkt.age   = age; // animals scale body size by age (protocol 39)
             net.queueSpawnInfo(pkt);
             char b[240]; _snprintf(b, sizeof(b) - 1,
-                "[spawn] INFO send hand=%u,%u,%u,%u,%u found=%d dead=%d age=%.2f sid='%s' fac='%s'%s",
+                "[spawn] INFO send hand=%u,%u,%u,%u,%u found=%d dead=%d age=%.2f sid='%s' fac='%s'",
                 k.t, k.c, k.cs, k.i, k.s, pkt.found, pkt.dead, pkt.age,
-                pkt.charSid, pkt.facSid, via);
+                pkt.charSid, pkt.facSid);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
     }
@@ -344,6 +365,71 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
         std::map<Key, unsigned long>::iterator rko = rekeyedOld_.find(k);
         if (rko != rekeyedOld_.end() && (now - rko->second) < REKEYED_GRACE_MS)
             continue;
+        // v2 centerpiece (2026-08-12): (i,s)-exact identity bind. Counted
+        // from the 2026-08-11 captures: 39% of the peer keys this side could
+        // not resolve named an (i,s) it held as a live local body - whole
+        // same-template packs, member by member. Containers are per-client
+        // and per-epoch; the (i,s) pair persists. No position or sole-twin
+        // requirement: identical-looking pack members carry DISTINCT (i,s),
+        // so the ambiguity that forced v1's conservatism dissolves. The sid
+        // check is mandatory - of the 4 cross-client (i,s) collisions in 93
+        // shared serials (2026-08-10), all four named different templates,
+        // so charSid filters every observed collision. Runs BEFORE the
+        // distance gates: a far body binds where it could never mint (the
+        // 2026-08-11 shopkeeper sat in a far-defer loop at 2,900 u while the
+        // peer's copy stayed culled). Applies to census AND stream replies -
+        // stream-minting on top of an (i,s)-matched local body is the
+        // doubling class measured at the bandit fight. Drive semantics
+        // unchanged: an aliased body defers, nobody drives it (v1 rule).
+        {
+            std::map<std::pair<u32, u32>, Character*>::iterator li =
+                localByIS_.find(std::make_pair(k.i, k.s));
+            Character* cand = (li != localByIS_.end()) ? li->second : 0;
+            if (cand && aliasKeyOfChar_.find(cand) == aliasKeyOfChar_.end()) {
+                bool isProxy = false;
+                for (std::map<Key, Character*>::iterator pi = proxyByKey_.begin();
+                     pi != proxyByKey_.end(); ++pi)
+                    if (pi->second == cand) { isProxy = true; break; }
+                bool ok = !isProxy;
+                unsigned int th[5];
+                if (ok) {
+                    // the index is up to one walk stale: prove liveness the
+                    // same way the sweep does before touching the body
+                    Character* live = 0;
+                    if (engine::readHand(cand, th))
+                        live = engine::resolveCharByHand(th[0], th[1], th[2], th[3], th[4]);
+                    ok = (live == cand);
+                }
+                if (ok) {
+                    Key tk; tk.t = th[0]; tk.c = th[1]; tk.cs = th[2];
+                    tk.i = th[3]; tk.s = th[4];
+                    if (ownHands_.find(tk) != ownHands_.end()) ok = false;
+                }
+                if (ok) {
+                    char csid[48], cfac[48];
+                    float cx2, cy2, cz2, chd; bool cdead = false; float cage = 0.0f;
+                    ok = engine::describeCharacter(cand, csid, sizeof(csid),
+                                                   cfac, sizeof(cfac),
+                                                   &cx2, &cy2, &cz2, &chd,
+                                                   &cdead, &cage) &&
+                         strcmp(csid, p.charSid) == 0;
+                }
+                if (ok) {
+                    aliasByKey_[k] = cand;
+                    aliasKeyOfChar_[cand] = k;
+                    aliasVouchMs_[k] = now;
+                    spawnReq_.erase(k);
+                    lifeSet(k, LIFE_RESOLVED, "alias-bind-is");
+                    char b[200]; _snprintf(b, sizeof(b) - 1,
+                        "[spawn] ALIAS bound hand=%u,%u,%u,%u,%u sid='%s' "
+                        "((i,s) exact; aliases=%u)",
+                        k.t, k.c, k.cs, k.i, k.s, p.charSid,
+                        (unsigned)aliasByKey_.size());
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    continue;
+                }
+            }
+        }
         // Mint gate (census-mint fix + Phase 1 spawn parity): the reply
         // position is the host's authority. Inside spawnMintRadius_ of our
         // own squad, always mint (a baked NPC this close sits in a loaded

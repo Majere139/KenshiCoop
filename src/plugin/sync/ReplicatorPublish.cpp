@@ -796,6 +796,17 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
     // a driven proxy while the join had the original culled, and it is why the pair
     // saw different populations after travelling together. The body a proxy STANDS
     // FOR is the hand it was bound to, so that is the hand it is vouched for under.
+    // v2: refresh the (i,s) -> body index from this walk. The enumeration is
+    // the freshest complete view of local bodies we ever hold; the bind path
+    // (syncSpawns) reads it within the next second and liveness-proves the
+    // pointer before use. Duplicate (i,s) in one walk -> NULL (refuse to bind).
+    localByIS_.clear();
+    for (unsigned int i = 0; i < n; ++i) {
+        std::pair<u32, u32> is(states[i].hIndex, states[i].hSerial);
+        std::map<std::pair<u32, u32>, Character*>::iterator ex = localByIS_.find(is);
+        if (ex == localByIS_.end()) localByIS_[is] = chars[i];
+        else ex->second = 0;
+    }
     std::map<Character*, Key> proxyKeyOf;
     for (std::map<Key, Character*>::const_iterator pi = proxyByKey_.begin();
          pi != proxyByKey_.end(); ++pi)

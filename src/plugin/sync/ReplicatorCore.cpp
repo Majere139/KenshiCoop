@@ -203,9 +203,13 @@ void Replicator::resetSession() {
     // Identity aliases (2026-08-11) pair OLD-world pointers with OLD-world
     // peer hands - both sides of each entry are dead after a reload. Cleared
     // like proxies, but nothing is despawned: aliased bodies are real.
+    // (Peer LEAVE preserves them across this call - see
+    // clearPeerReplicationState, which snapshots and restores: the world
+    // survives a leave, so the pointers do too.)
     aliasByKey_.clear();
     aliasKeyOfChar_.clear();
     aliasVouchMs_.clear();
+    localByIS_.clear(); // same reason: enumeration pointers die with the world
     parkMs_.clear();
     censusRecvMs_ = 0;
     censusSendMs_ = 0;
@@ -363,7 +367,31 @@ void Replicator::clearPeerReplicationState(GameWorld* gw) {
     b[sizeof(b) - 1] = '\0';
     coop::logLine(b);
     // Now drop every map (proxyByKey_ included) back to freshly-launched state.
+    //
+    // v2 (2026-08-12): identity aliases SURVIVE the peer leave. This path
+    // runs with the LOCAL world still live - every aliased body is a real
+    // local Character whose pointer stays valid - and the returning join
+    // reloads the connect-push save, after which save-stable keys
+    // re-validate instantly. Keys the join re-keyed away die through the
+    // normal hygiene (original-resolved / peer-lost-key / silence-aware
+    // staleness). Wiping aliases here is what turned the 2026-08-11
+    // reconnect into a 52-mint re-inflation surge: the fresh resolution
+    // sweep re-minted bodies the alias table already knew. resetSession()
+    // stays authoritative for WORLD RELOADS, where the pointers really die.
+    std::map<Key, Character*>    keepAlias   = aliasByKey_;
+    std::map<Character*, Key>    keepAliasRC = aliasKeyOfChar_;
+    std::map<Key, unsigned long> keepVouch   = aliasVouchMs_;
     resetSession();
+    aliasByKey_     = keepAlias;
+    aliasKeyOfChar_ = keepAliasRC;
+    aliasVouchMs_   = keepVouch;
+    if (!aliasByKey_.empty()) {
+        char ab[96];
+        _snprintf(ab, sizeof(ab) - 1,
+                  "[leave] aliases preserved=%u", (unsigned)aliasByKey_.size());
+        ab[sizeof(ab) - 1] = '\0';
+        coop::logLine(ab);
+    }
 }
 
 void Replicator::ingest(Inbound& in) {
