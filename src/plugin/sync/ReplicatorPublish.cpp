@@ -800,14 +800,29 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
     for (std::map<Key, Character*>::const_iterator pi = proxyByKey_.begin();
          pi != proxyByKey_.end(); ++pi)
         if (pi->second) proxyKeyOf[pi->second] = pi->first;
+    // Identity aliases (2026-08-11) ride the same bound-key publish path as
+    // proxies, for the same reason stated above: the hand a body is vouched
+    // under must be a hand the PEER knows. An aliased local body is the
+    // peer's body under the peer's hand, so its row goes out under that hand
+    // - which is what stops the peer culling its own real copy (the 67.8%
+    // divergent-key population measured 2026-08-10). Alias entries overwrite
+    // nothing: a body is never both minted-proxy and alias (the bind path
+    // excludes proxies via the sameTemplateNear exclusion list).
+    for (std::map<Character*, Key>::const_iterator ai = aliasKeyOfChar_.begin();
+         ai != aliasKeyOfChar_.end(); ++ai)
+        proxyKeyOf[ai->first] = ai->second;
     std::set<Key> censusKeys;
     unsigned int m = 0;          // rows that survived the gate
     unsigned int nNotMine = 0;   // omitted because another client authors them
     unsigned int nProxyRow = 0;  // rows published under a bound key, not a local one
+    unsigned int nAliasRow = 0;  // of those, rows whose bound key is an identity alias
     for (unsigned int i = 0; i < n; ++i) {
         Key k = keyOf(states[i]);
         std::map<Character*, Key>::const_iterator px = proxyKeyOf.find(chars[i]);
-        if (px != proxyKeyOf.end()) { k = px->second; ++nProxyRow; }
+        if (px != proxyKeyOf.end()) {
+            k = px->second;
+            if (aliasKeyOfChar_.count(chars[i])) ++nAliasRow; else ++nProxyRow;
+        }
         censusKeys.insert(k);
         // The attention gate USED to sit here, and it was the wrong channel for
         // it. A census row is a statement that a body EXISTS, and existence
@@ -990,9 +1005,9 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
         char b[448];
         _snprintf(b, sizeof(b) - 1,
                   "[census] sent n=%u radius=%.0f mid=%u anchors=%u%s"
-                  " enum=%u notmine=%u proxyrow=%u attnR=%.0f",
+                  " enum=%u notmine=%u proxyrow=%u aliasrow=%u attnR=%.0f",
                   m, censusRadius_, (unsigned)midBand_.size(), na, det,
-                  n, nNotMine, nProxyRow, attentionRadius_);
+                  n, nNotMine, nProxyRow, nAliasRow, attentionRadius_);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         // KENSHICOOP_DEBUG_CENSUS=1: dump every census row (hand + name) at the
         // same 10 s cadence, so a join-side cull can be classified against the
@@ -1012,6 +1027,22 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
                           i, states[i].hIndex, states[i].hSerial,
                           states[i].x, states[i].y, states[i].z, nm);
                 r[sizeof(r) - 1] = '\0'; coop::logLine(r);
+                // Companion line for remapped rows only (2026-08-11): the row
+                // above prints the LOCAL hand (dump-diff.ps1 parses that format
+                // - do not touch it); this one records the key the row was
+                // actually PUBLISHED under, so the wire-view convergence the
+                // identity map buys is measurable from the same capture.
+                std::map<Character*, Key>::const_iterator pk = proxyKeyOf.find(chars[i]);
+                if (pk != proxyKeyOf.end()) {
+                    char r2[176];
+                    _snprintf(r2, sizeof(r2) - 1,
+                              "[census] rowpub %u hand=%u,%u pub=%u,%u,%u,%u,%u%s",
+                              i, states[i].hIndex, states[i].hSerial,
+                              pk->second.t, pk->second.c, pk->second.cs,
+                              pk->second.i, pk->second.s,
+                              aliasKeyOfChar_.count(chars[i]) ? " via=alias" : " via=proxy");
+                    r2[sizeof(r2) - 1] = '\0'; coop::logLine(r2);
+                }
             }
         }
     }

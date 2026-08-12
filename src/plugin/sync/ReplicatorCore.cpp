@@ -200,6 +200,12 @@ void Replicator::resetSession() {
     // host re-publishes within a second of the new world going live.
     censusHands_.clear();
     censusPos_.clear();
+    // Identity aliases (2026-08-11) pair OLD-world pointers with OLD-world
+    // peer hands - both sides of each entry are dead after a reload. Cleared
+    // like proxies, but nothing is despawned: aliased bodies are real.
+    aliasByKey_.clear();
+    aliasKeyOfChar_.clear();
+    aliasVouchMs_.clear();
     parkMs_.clear();
     censusRecvMs_ = 0;
     censusSendMs_ = 0;

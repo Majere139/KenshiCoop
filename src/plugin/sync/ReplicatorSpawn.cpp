@@ -13,6 +13,18 @@
 
 namespace coop {
 
+void Replicator::dropAlias(const Key& k, const char* why) {
+    std::map<Key, Character*>::iterator it = aliasByKey_.find(k);
+    if (it == aliasByKey_.end()) return;
+    aliasKeyOfChar_.erase(it->second);
+    aliasByKey_.erase(it);
+    aliasVouchMs_.erase(k);
+    char b[176]; _snprintf(b, sizeof(b) - 1,
+        "[spawn] ALIAS dropped hand=%u,%u,%u,%u,%u (%s; aliases=%u)",
+        k.t, k.c, k.cs, k.i, k.s, why, (unsigned)aliasByKey_.size());
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+}
+
 void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerId,
                             bool isHost) {
     // Request pacing: per-hand debounce (the reliable channel guarantees
@@ -92,6 +104,44 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
         }
     }
 
+    // Alias hygiene (2026-08-11), same cadence as the proxy sweep above. An
+    // alias is dropped when any leg of it stops being true:
+    //   - the local body despawned (same round-trip proof as proxies);
+    //   - the peer's hand now resolves in OUR engine to a DIFFERENT body: the
+    //     true original materialized (its block loaded) and the alias was a
+    //     lookalike stand-in - mirror of the proxy DUPE-HEAL, minus the
+    //     destroy (an aliased body is real and stays);
+    //   - the peer's census stopped vouching the hand for ALIAS_STALE_MS: the
+    //     peer re-keyed/despawned its side, or the pair separated and the
+    //     peer no longer claims that ground. Either way the alias serves
+    //     nothing until a fresh census-missing cycle rebinds it.
+    {
+        const unsigned long ALIAS_STALE_MS = 30000;
+        static unsigned long aliasSweepMs = 0; // main-thread only
+        if (!aliasByKey_.empty() && (now - aliasSweepMs) >= 1000) {
+            aliasSweepMs = now;
+            for (std::map<Key, Character*>::iterator it = aliasByKey_.begin();
+                 it != aliasByKey_.end(); ) {
+                const Key k = it->first;   // copy: dropAlias erases the node
+                Character* body = it->second;
+                ++it; // advance before any possible erase
+                unsigned int h[5];
+                Character* live = 0;
+                if (engine::readHand(body, h))
+                    live = engine::resolveCharByHand(h[0], h[1], h[2], h[3], h[4]);
+                if (live != body) { dropAlias(k, "despawned"); continue; }
+                Character* orig = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+                if (orig && orig != body) { dropAlias(k, "original-resolved"); continue; }
+                std::map<Key, unsigned long>::iterator vm = aliasVouchMs_.find(k);
+                if (vm == aliasVouchMs_.end() ||
+                    (now - vm->second) >= ALIAS_STALE_MS) {
+                    dropAlias(k, "stale");
+                    continue;
+                }
+            }
+        }
+    }
+
     // ---- Answering side (both clients) ---------------------------------------
     {
         std::deque<InboundSpawnReq> got;
@@ -114,6 +164,31 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             pkt.hContainerSerial = rq.hContainerSerial;
             pkt.hIndex = rq.hIndex; pkt.hSerial = rq.hSerial;
             Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+            // Identity map (2026-08-11): a hand that fails engine resolve may
+            // still be one WE bound - a minted proxy or an aliased local body
+            // IS the body the peer knows by this hand, so describe it rather
+            // than dead-ending. Measured 2026-08-10: all 13 distinct found=0
+            // hands (322 answers) were hands this side itself had bound and
+            // was censusing; the peer burned its retry budget asking about
+            // bodies we were standing next to. The pointer gets the same
+            // round-trip proof as the liveness sweep before we touch it -
+            // between sweeps it can be a stale despawn.
+            const char* via = "";
+            if (!c) {
+                std::map<Key, Character*>::iterator bp = proxyByKey_.find(k);
+                if (bp != proxyByKey_.end()) { c = bp->second; via = " via=proxy"; }
+            }
+            if (!c) {
+                std::map<Key, Character*>::iterator ba = aliasByKey_.find(k);
+                if (ba != aliasByKey_.end()) { c = ba->second; via = " via=alias"; }
+            }
+            if (via[0]) {
+                unsigned int ph[5];
+                Character* live = 0;
+                if (engine::readHand(c, ph))
+                    live = engine::resolveCharByHand(ph[0], ph[1], ph[2], ph[3], ph[4]);
+                if (live != c) { c = 0; via = ""; } // sweep will unbind it
+            }
             bool dead = false;
             float age = 0.0f;
             bool found = c && engine::describeCharacter(
@@ -123,10 +198,10 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             pkt.dead  = dead ? 1 : 0;
             pkt.age   = age; // animals scale body size by age (protocol 39)
             net.queueSpawnInfo(pkt);
-            char b[224]; _snprintf(b, sizeof(b) - 1,
-                "[spawn] INFO send hand=%u,%u,%u,%u,%u found=%d dead=%d age=%.2f sid='%s' fac='%s'",
+            char b[240]; _snprintf(b, sizeof(b) - 1,
+                "[spawn] INFO send hand=%u,%u,%u,%u,%u found=%d dead=%d age=%.2f sid='%s' fac='%s'%s",
                 k.t, k.c, k.cs, k.i, k.s, pkt.found, pkt.dead, pkt.age,
-                pkt.charSid, pkt.facSid);
+                pkt.charSid, pkt.facSid, via);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
     }
@@ -158,6 +233,9 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
              it != censusHands_.end(); ++it) {
             const Key& k = *it;
             if (proxyByKey_.find(k) != proxyByKey_.end()) continue;
+            // Identity-aliased: the hand already names a local body; there is
+            // nothing to ask about and nothing to mint.
+            if (aliasByKey_.find(k) != aliasByKey_.end()) continue;
             if (ownHands_.find(k) != ownHands_.end()) continue;
             // Phase 1b (phantom fix): a hand we PIN owned is ours - a census
             // vouch for it is our own echo or a stale tail after a control-flip
@@ -243,6 +321,20 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             continue;
         }
         if (proxyByKey_.find(k) != proxyByKey_.end()) continue; // duplicate reply
+        // Identity-aliased hand (2026-08-11): the body already EXISTS locally
+        // under another engine key. Minting would stand a puppet on top of it
+        // (the exact double the dupe guard exists to prevent), and driving the
+        // real body from the peer's stream would put two writers on one
+        // Character. v1 scope is identity + census vouching only, so ANY reply
+        // for an aliased hand - census or stream - defers on the far cadence.
+        // The cost is that near-field position authority does not apply to
+        // aliased bodies yet; each side renders its own sim of them, which is
+        // exactly what the wide band already does.
+        if (aliasByKey_.find(k) != aliasByKey_.end()) {
+            rq.farMs = now;
+            rq.sends = 0;
+            continue;
+        }
         // Phase 1b (phantom fix): a hand we PIN owned must never be minted - it
         // is ours (a control-flip claim), and a reply for it is a stale tail.
         if (pinOwned_.find(k) != pinOwned_.end()) continue;
@@ -360,6 +452,58 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
                                                        MINT_DUPE_RADIUS,
                                                        excl, ne);
             if (twin) {
+                // Identity bind (2026-08-11), the dump-diff fix: this guard
+                // used to detect the correlation - "the census-missing hand is
+                // probably THAT body under a hand we cannot correlate" - and
+                // then throw it away, deferring forever while the twin stood
+                // there. Now, when the identity is UNAMBIGUOUS, record it:
+                // exactly one same-template body in the radius, not already
+                // aliased, and not one of our own squad (a recruit twin is
+                // owner-synced, never census-bound). Ambiguity (the
+                // six-identical-Thieves case) keeps the old defer - a wrong
+                // bind would vouch the wrong body and swap two identities.
+                bool bindable = aliasKeyOfChar_.find(twin) == aliasKeyOfChar_.end();
+                if (bindable) {
+                    // Own-squad exclusion: read the twin's CURRENT hand and
+                    // test it against ownHands_. A recruit standing at the
+                    // reply position is owner-synced under protocol 35 re-key,
+                    // never census-bound.
+                    unsigned int th[5];
+                    if (engine::readHand(twin, th)) {
+                        Key tk; tk.t = th[0]; tk.c = th[1]; tk.cs = th[2];
+                        tk.i = th[3]; tk.s = th[4];
+                        if (ownHands_.find(tk) != ownHands_.end()) bindable = false;
+                    } else {
+                        bindable = false; // unreadable pointer: do not bind it
+                    }
+                }
+                if (bindable) {
+                    // second probe with the twin excluded: a SECOND
+                    // same-template body inside the radius = ambiguous.
+                    if (ne < NPC_CENSUS_MAX) {
+                        excl[ne] = twin;
+                        Character* second = engine::sameTemplateNear(
+                            gw, p.charSid, p.x, p.y, p.z, MINT_DUPE_RADIUS,
+                            excl, ne + 1);
+                        if (second) bindable = false;
+                    } else {
+                        bindable = false; // cannot prove uniqueness: defer
+                    }
+                }
+                if (bindable) {
+                    aliasByKey_[k] = twin;
+                    aliasKeyOfChar_[twin] = k;
+                    aliasVouchMs_[k] = now;
+                    spawnReq_.erase(k); // identity resolved: no REQ/mint cycle
+                    lifeSet(k, LIFE_RESOLVED, "alias-bind");
+                    char b[200]; _snprintf(b, sizeof(b) - 1,
+                        "[spawn] ALIAS bound hand=%u,%u,%u,%u,%u sid='%s' "
+                        "(sole twin within %.0fu; aliases=%u)",
+                        k.t, k.c, k.cs, k.i, k.s, p.charSid, MINT_DUPE_RADIUS,
+                        (unsigned)aliasByKey_.size());
+                    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+                    continue;
+                }
                 rq.farMs = now;
                 rq.sends = 0;
                 char b[200]; _snprintf(b, sizeof(b) - 1,

@@ -104,6 +104,15 @@ void Replicator::applyNpcCensus(Inbound& in) {
     }
     censusRows_ = n;
     censusRecvMs_ = nowMs();
+    // Identity aliases (2026-08-11): refresh the vouch stamp for every alias
+    // key this census carries. The hygiene sweep drops an alias the peer has
+    // stopped vouching for ~30 s - peer re-key, peer despawn, or separation
+    // (the peer no longer claims that ground); a fresh census-missing cycle
+    // rebinds when the pair converges again.
+    for (std::map<Key, Character*>::const_iterator ai = aliasByKey_.begin();
+         ai != aliasByKey_.end(); ++ai)
+        if (censusHands_.find(ai->first) != censusHands_.end())
+            aliasVouchMs_[ai->first] = censusRecvMs_;
     static unsigned long logTick = 0;
     if ((censusRecvMs_ - logTick) > 10000) {
         logTick = censusRecvMs_;
@@ -475,6 +484,19 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
             if (driven && suppressed_.find(k) == suppressed_.end()) continue;
             bool exists = censusHands_.find(k) != censusHands_.end() ||
                           keep.find(k) != keep.end() || driven;
+            // Identity alias (2026-08-11): the peer censuses this body under
+            // ITS hand, not our local one - that mismatch is the whole
+            // divergent-key population (67.8% of position-matched bodies,
+            // measured 2026-08-10), and culling on it is how the join hid
+            // 1,771 bodies in one session. A body whose alias key the census
+            // carries is vouched for, whatever its local hand says.
+            if (!exists) {
+                std::map<Character*, Key>::const_iterator ak =
+                    aliasKeyOfChar_.find(wChars[i]);
+                if (ak != aliasKeyOfChar_.end() &&
+                    censusHands_.find(ak->second) != censusHands_.end())
+                    exists = true;
+            }
             std::map<Key, Character*>::iterator s = suppressed_.find(k);
             AuthCount& ac = authCount_[k];
             // Dormancy, same as the near pass - and this is where it matters

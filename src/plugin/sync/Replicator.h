@@ -2178,6 +2178,9 @@ private:
     // Drop attnObs_ latches for hands this tick's enumeration no longer sees,
     // so a long session's map cannot grow without bound.
     void pruneAttention(const std::set<Key>& seen);
+    // Remove one identity alias (both directions + vouch stamp), with a log
+    // line naming why. Safe on a key that has no alias.
+    void dropAlias(const Key& k, const char* why);
     // Phase B: close the attach window if it is due and log what the burst
     // cost. Called once per authority tick.
     void measureAttach(unsigned long now);
@@ -2248,6 +2251,29 @@ private:
     // syncSpawns runs a ~1 s liveness sweep: SEH-read each pointer's current
     // hand and resolve it back; anything but the same pointer unbinds the
     // entry untouched.
+    //
+    // Identity aliases (2026-08-11): peer-hand -> EXISTING local body. The
+    // 2026-08-10 dump diff measured why these exist: runtime-spawned NPCs are
+    // keyed independently per client (67.8% of position-matched bodies carried
+    // different hands; only save-loaded bodies shared keys), so each side
+    // culled its own real copies while minting proxies for the peer's. An
+    // alias records "the peer's hand K IS this local body" when the mint dupe
+    // guard finds an unambiguous same-template twin at the reply position.
+    //
+    // DELIBERATELY NOT proxyByKey_: a bound proxy inherits the entire
+    // world-NPC drive path (see above), and an aliased body is a REAL local
+    // sim - driving it from the peer's stream would put two writers on one
+    // Character. Aliases are consulted by exactly three readers: the census
+    // publisher (row goes out under the PEER's hand, so the peer's original
+    // is vouched for and stops being culled), the wide-pass cull judge (a
+    // local body whose alias key is census-vouched is not a ghost), and the
+    // spawn-REQ answerer (describe the aliased body instead of found=0 -
+    // measured 2026-08-10: all 13 distinct found=0 hands, 322 answers, were
+    // hands the answering side itself had bound). Stream replies for an
+    // aliased hand DEFER (no puppet mint on top of the twin, no drive).
+    std::map<Key, Character*>    aliasByKey_;
+    std::map<Character*, Key>    aliasKeyOfChar_; // reverse view, in lockstep
+    std::map<Key, unsigned long> aliasVouchMs_;   // last census that carried the key
     // JOIN: per-hand request state - debounce, retry cap, negative-reply
     // backoff (deniedMs = when the host said "can't resolve either" or the
     // local proxy spawn failed; retried only after a long cooldown).
