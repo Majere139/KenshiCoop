@@ -91,6 +91,21 @@ struct Config {
     // the ~200 u stream bubble. 0 disables (legacy stream-bubble minting).
     float        spawnMintRadius;   // KENSHICOOP_SPAWN_MINT_RADIUS    (600 u)
 
+    // v2.1 cluster correlation (2026-08-13, cluster-correlation-design.md):
+    // fresh-spawn same-template GROUPS pair whole-cluster (signature +
+    // count + centroid) into ordinary alias binds instead of minting
+    // doubles; suppressed originals restore on bind. clusterEnabled is the
+    // field-triage kill switch; the rest tune the matcher (settle/max-wait
+    // in ms, fraction in percent, radii in world units).
+    bool         clusterEnabled;         // KENSHICOOP_CLUSTER               (1)
+    unsigned int clusterSettleMs;        // KENSHICOOP_CLUSTER_SETTLE_MS     (1500)
+    unsigned int clusterMaxWaitMs;       // KENSHICOOP_CLUSTER_MAX_WAIT_MS   (4000)
+    float        clusterMergeRadius;     // KENSHICOOP_CLUSTER_MERGE_RADIUS  (300 u)
+    float        clusterMatchRadius;     // KENSHICOOP_CLUSTER_MATCH_RADIUS  (600 u)
+    float        clusterPairDist;        // KENSHICOOP_CLUSTER_PAIR_DIST     (150 u)
+    unsigned int clusterMatchFraction;   // KENSHICOOP_CLUSTER_MATCH_FRACTION (60 %)
+    float        clusterAmbiguityRadius; // KENSHICOOP_CLUSTER_AMBIGUITY_RADIUS (1200 u)
+
     // v38 census position parking (pack-hidden fix, 2026-07-11): how far a
     // census-PRESENT local NPC copy may drift from the host's census position
     // before the join parks it back onto the host's spot (wide pass only,

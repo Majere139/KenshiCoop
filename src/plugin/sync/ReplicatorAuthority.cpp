@@ -351,6 +351,20 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
         // behavior stands.
         bool exists = streamed ||
                       (censusFresh && censusHands_.find(k) != censusHands_.end());
+        // v2.1 (2026-08-13): mirror the wide pass's alias consult (2026-08-11)
+        // here in the near pass - the gap was measured 2026-08-12 as 13 quiet
+        // reason=suppress suppressions during an approach, and it became a
+        // functional dependency once cluster binds RESTORE suppressed
+        // originals: without this, a cluster-restored body inside the stream
+        // bubble re-suppresses on the next judgment (its local hand is never
+        // in the peer's census; its ALIAS key is).
+        if (!exists && censusFresh) {
+            std::map<Character*, Key>::const_iterator akN =
+                aliasKeyOfChar_.find(chars[i]);
+            if (akN != aliasKeyOfChar_.end() &&
+                censusHands_.find(akN->second) != censusHands_.end())
+                exists = true;
+        }
         std::map<Key, Character*>::iterator s = suppressed_.find(k);
         AuthCount& ac = authCount_[k];
         // Dormant and census-absent: neither client is speaking for this

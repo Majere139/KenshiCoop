@@ -127,6 +127,39 @@ Character* sameTemplateNear(GameWorld* gw, const char* charSid,
     }
 }
 
+// SEH-guarded (join, cluster correlation 2026-08-13): the whole-set variant of
+// sameTemplateNear. Cluster matching judges a GROUP of same-template bodies at
+// once, so it needs every candidate in the radius, not the first.
+unsigned int sameTemplateNearAll(GameWorld* gw, const char* charSid,
+                                 float x, float y, float z, float radius,
+                                 Character* const* excl, unsigned int exclCount,
+                                 Character** out, unsigned int outMax) {
+    if (!gw || !g_getCharsFn || !charSid || !charSid[0] || !out || !outMax) return 0;
+    __try {
+        Ogre::Vector3 center(x, y, z);
+        g_npcQuery.clear();
+        g_getCharsFn(gw, &g_npcQuery, &center, radius, radius, radius, 96, 96, 0);
+        unsigned int total = g_npcQuery.size();
+        unsigned int n = 0;
+        for (unsigned int i = 0; i < total && n < outMax; ++i) {
+            RootObject* obj = g_npcQuery[i];
+            if (!obj || isPlayerSquad(gw, obj)) continue;
+            Character* ch = static_cast<Character*>(obj);
+            bool skip = false;
+            for (unsigned int e = 0; e < exclCount && !skip; ++e)
+                if (excl[e] == ch) skip = true;
+            if (skip) continue;
+            GameData* gd = ch->getGameData();
+            if (!gd) continue;
+            const char* sid = gd->stringID.c_str();
+            if (sid && strcmp(sid, charSid) == 0) out[n++] = ch;
+        }
+        return n;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
 Character* spawnProxyNpc(GameWorld* gw, const char* charSid, const char* facSid,
                          float x, float y, float z, float heading, float age) {
     if (!gw || !gw->theFactory || !g_createCharFn || !charSid || !charSid[0]) return 0;

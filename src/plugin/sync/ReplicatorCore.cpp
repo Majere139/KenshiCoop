@@ -69,6 +69,11 @@ Replicator::Replicator()
       speedLastSendMs_(0), speedCombatSampleMs_(0), speedCombatHoldMs_(0),
       spawnSync_(false), spawnPosLogMs_(0),
       spawnMintRadius_(0.0f), censusScanMs_(0),
+      nextClusterId_(0), clusterBinds_(0), clusterEnabled_(true),
+      clusterSettleMs_(1500), clusterMaxWaitMs_(4000),
+      clusterMergeRadius_(300.0f), clusterMatchRadius_(600.0f),
+      clusterPairDist_(150.0f), clusterAmbiguityRadius_(1200.0f),
+      clusterMatchFraction_(60),
       poolSeen_(-1), poolSent_(-1), poolSentMs_(0), poolTotal_(-1),
       poolSeq_(0), poolAcked_(0),
       moneySync_(true), recruitSync_(true),
@@ -210,6 +215,9 @@ void Replicator::resetSession() {
     aliasKeyOfChar_.clear();
     aliasVouchMs_.clear();
     localByIS_.clear(); // same reason: enumeration pointers die with the world
+    // v2.1 cluster registry: peer keys AND local positions are old-world.
+    clusters_.clear();
+    containerCluster_.clear();
     parkMs_.clear();
     censusRecvMs_ = 0;
     censusSendMs_ = 0;

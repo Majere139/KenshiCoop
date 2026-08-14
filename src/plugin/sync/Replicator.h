@@ -692,6 +692,19 @@ public:
     // stream-bubble-only minting.
     void setSpawnMintRadius(float r) { spawnMintRadius_ = r; }
 
+    // KENSHICOOP_CLUSTER* (v2.1 cluster correlation, 2026-08-13): see
+    // cluster-correlation-design.md and the state block by clusters_. All
+    // values env-tunable; 'on=false' is the field-triage kill switch.
+    void setClusterTuning(bool on, unsigned int settleMs, unsigned int maxWaitMs,
+                          float mergeR, float matchR, float pairD,
+                          unsigned int fracPct, float ambigR) {
+        clusterEnabled_ = on;
+        clusterSettleMs_ = settleMs; clusterMaxWaitMs_ = maxWaitMs;
+        clusterMergeRadius_ = mergeR; clusterMatchRadius_ = matchR;
+        clusterPairDist_ = pairD; clusterAmbiguityRadius_ = ambigR;
+        clusterMatchFraction_ = fracPct;
+    }
+
     // KENSHICOOP_CENSUS_PARK (v38 pack-hidden fix): how far a census-PRESENT
     // local copy may drift from the host's census position before the join
     // parks it back onto the host's spot. <= 0 disables parking (existence-
@@ -2284,6 +2297,54 @@ private:
     // Entries are up to one walk stale: every consumer must round-trip the
     // pointer (readHand + resolve back) before touching the body.
     std::map<std::pair<u32, u32>, Character*> localByIS_;
+    // v2.1 (2026-08-13, user-approved design: cluster-correlation-design.md):
+    // cluster correlation for fresh-spawn same-template GROUPS - the class
+    // neither prior binder reaches ((i,s) needs shared history; sole-twin
+    // refuses N-way ambiguity). Census-sourced unresolvable keys accumulate
+    // into clusters (by peer container for squad-shaped packs, by
+    // template+proximity for singleton-shaped - both shapes field-documented
+    // Obs B3); a settled cluster is judged ONCE against the local same-
+    // template population and, on an unambiguous match, members pair by
+    // nearest position into ORDINARY alias binds (same maps, hygiene, census
+    // vouching, dead-key retirement). Suppressed originals are eligible
+    // targets and are RESTORED on bind - the merc-robbery / dead-shops fix.
+    struct ClusterMember {
+        Key key; char sid[48]; float x, y, z; bool dead;
+        int outcome; // 0=pending 1=bound 2=pass-to-mint
+        ClusterMember() : x(0), y(0), z(0), dead(false), outcome(0) { sid[0] = '\0'; }
+    };
+    struct PendingCluster {
+        std::vector<ClusterMember> members;
+        unsigned long firstMs, lastAddMs, judgedMs;
+        bool judged, matched;
+        u32 c0, cs0;        // first member's container
+        bool sameContainer; // true while every member shares (c0,cs0): squad-shaped
+        char sid0[48];      // first member's template
+        bool sameSid;       // true while every member shares sid0
+        PendingCluster() : firstMs(0), lastAddMs(0), judgedMs(0), judged(false),
+                           matched(false), c0(0), cs0(0), sameContainer(true),
+                           sameSid(true) { sid0[0] = '\0'; }
+    };
+    std::map<unsigned int, PendingCluster>      clusters_;
+    std::map<std::pair<u32, u32>, unsigned int> containerCluster_; // (c,cs) -> id
+    unsigned int  nextClusterId_;
+    unsigned long clusterBinds_;    // cumulative; 'clbind=' on the census line
+    bool          clusterEnabled_;
+    unsigned long clusterSettleMs_, clusterMaxWaitMs_;
+    float         clusterMergeRadius_, clusterMatchRadius_, clusterPairDist_,
+                  clusterAmbiguityRadius_;
+    unsigned int  clusterMatchFraction_; // percent of members that must pair
+    // returns: 1 = this key alias-bound; 0 = hold (cluster still settling);
+    //          -1 = pass to the normal mint gates
+    int  clusterConsider(GameWorld* gw, const Key& k, const char* sid,
+                         float x, float y, float z, bool dead,
+                         unsigned long now);
+    void clusterJudge(GameWorld* gw, unsigned int cid, PendingCluster& cl,
+                      unsigned long now);
+    bool clusterSiblingBind(GameWorld* gw, unsigned int cid, const Key& k,
+                            const char* sid, float x, float y, float z,
+                            bool dead, unsigned long now);
+    void clusterSweep(unsigned long now);
     // JOIN: per-hand request state - debounce, retry cap, negative-reply
     // backoff (deniedMs = when the host said "can't resolve either" or the
     // local proxy spawn failed; retried only after a long cooldown).

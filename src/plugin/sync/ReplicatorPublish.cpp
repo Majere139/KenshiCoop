@@ -1016,9 +1016,11 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
         char b[448];
         _snprintf(b, sizeof(b) - 1,
                   "[census] sent n=%u radius=%.0f mid=%u anchors=%u%s"
-                  " enum=%u notmine=%u proxyrow=%u aliasrow=%u attnR=%.0f",
+                  " enum=%u notmine=%u proxyrow=%u aliasrow=%u clbind=%lu"
+                  " attnR=%.0f",
                   m, censusRadius_, (unsigned)midBand_.size(), na, det,
-                  n, nNotMine, nProxyRow, nAliasRow, attentionRadius_);
+                  n, nNotMine, nProxyRow, nAliasRow, clusterBinds_,
+                  attentionRadius_);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         // KENSHICOOP_DEBUG_CENSUS=1: dump every census row (hand + name) at the
         // same 10 s cadence, so a join-side cull can be classified against the

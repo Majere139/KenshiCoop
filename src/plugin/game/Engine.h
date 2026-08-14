@@ -440,6 +440,17 @@ Character* sameTemplateNear(GameWorld* gw, const char* charSid,
                             float x, float y, float z, float radius,
                             Character* const* excl, unsigned int exclCount);
 
+// SEH-guarded (join, cluster correlation 2026-08-13): ALL world NPCs with the
+// SAME template stringID within 'radius' of (x,y,z), skipping 'excl' pointers,
+// written to 'out' (capped at outMax). Returns the count. Same query machinery
+// as sameTemplateNear; exists because cluster matching needs the whole local
+// candidate set (a pack is N same-template twins - the single-twin probe's
+// ambiguity), not just the first hit.
+unsigned int sameTemplateNearAll(GameWorld* gw, const char* charSid,
+                                 float x, float y, float z, float radius,
+                                 Character* const* excl, unsigned int exclCount,
+                                 Character** out, unsigned int outMax);
+
 // spawn_probe / spawn_sync scenario scaffold (SEH-guarded): reproduce a runtime
 // squad spawn locally - 'count' world characters in a nearby NON-PLAYER faction
 // (findNearbyNonPlayerFaction; leader-faction fallback on a blank save), spread

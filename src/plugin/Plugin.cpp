@@ -1985,6 +1985,11 @@ void configureReplicator() {
         g_repl.setSendStamp(g_cfg.sendStamp);
         g_repl.setCensusRadius(g_cfg.censusRadius);
         g_repl.setSpawnMintRadius(g_cfg.spawnMintRadius);
+        g_repl.setClusterTuning(g_cfg.clusterEnabled, g_cfg.clusterSettleMs,
+                                g_cfg.clusterMaxWaitMs, g_cfg.clusterMergeRadius,
+                                g_cfg.clusterMatchRadius, g_cfg.clusterPairDist,
+                                g_cfg.clusterMatchFraction,
+                                g_cfg.clusterAmbiguityRadius);
         g_repl.setCensusParkDist(g_cfg.censusParkDist);
         g_repl.setCensusFreezeAi(g_cfg.censusFreezeAi);
         g_repl.setAttentionRadius(g_cfg.attentionRadius);

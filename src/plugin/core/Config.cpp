@@ -306,6 +306,33 @@ void loadConfig(Config& c) {
         std::string mr = envOr("KENSHICOOP_SPAWN_MINT_RADIUS", "");
         c.spawnMintRadius = mr.empty() ? 600.0f : (float)std::atof(mr.c_str());
         if (c.spawnMintRadius < 0.0f) c.spawnMintRadius = 0.0f;
+        // v2.1 cluster correlation (2026-08-13): DEFAULT ON - it is the
+        // release's point; "0" is the field-triage kill switch. The rest
+        // tune the matcher; defaults come from measured pack spreads
+        // (raptors ~50 u, empire squad ~150 u, slaver arrivals ~100 u).
+        c.clusterEnabled = envOr("KENSHICOOP_CLUSTER", "1") != "0";
+        c.clusterSettleMs =
+            (unsigned int)std::atoi(envOr("KENSHICOOP_CLUSTER_SETTLE_MS", "1500").c_str());
+        c.clusterMaxWaitMs =
+            (unsigned int)std::atoi(envOr("KENSHICOOP_CLUSTER_MAX_WAIT_MS", "4000").c_str());
+        c.clusterMergeRadius =
+            (float)std::atof(envOr("KENSHICOOP_CLUSTER_MERGE_RADIUS", "300").c_str());
+        c.clusterMatchRadius =
+            (float)std::atof(envOr("KENSHICOOP_CLUSTER_MATCH_RADIUS", "600").c_str());
+        c.clusterPairDist =
+            (float)std::atof(envOr("KENSHICOOP_CLUSTER_PAIR_DIST", "150").c_str());
+        c.clusterMatchFraction =
+            (unsigned int)std::atoi(envOr("KENSHICOOP_CLUSTER_MATCH_FRACTION", "60").c_str());
+        c.clusterAmbiguityRadius =
+            (float)std::atof(envOr("KENSHICOOP_CLUSTER_AMBIGUITY_RADIUS", "1200").c_str());
+        if (c.clusterSettleMs < 250)  c.clusterSettleMs = 250;
+        if (c.clusterMaxWaitMs < c.clusterSettleMs) c.clusterMaxWaitMs = c.clusterSettleMs;
+        if (c.clusterMergeRadius < 0.0f)     c.clusterMergeRadius = 0.0f;
+        if (c.clusterMatchRadius < 0.0f)     c.clusterMatchRadius = 0.0f;
+        if (c.clusterPairDist < 0.0f)        c.clusterPairDist = 0.0f;
+        if (c.clusterMatchFraction > 100)    c.clusterMatchFraction = 100;
+        if (c.clusterAmbiguityRadius < c.clusterMatchRadius)
+            c.clusterAmbiguityRadius = c.clusterMatchRadius;
         // Census park distance: "0" (explicit) disables; absent = 120 u
         // default. Deliberately ABOVE town-schedule divergence (~50 u for a
         // bar NPC seated at a different stool per sim - run 185524 showed

@@ -104,6 +104,11 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
         }
     }
 
+    // Cluster registry hygiene (v2.1): expire judged clusters after their
+    // straggler window and abandoned unjudged ones. Cheap; piggybacks the
+    // same tick as the alias sweep below.
+    clusterSweep(now);
+
     // Alias hygiene (2026-08-11), same cadence as the proxy sweep above. An
     // alias is dropped when any leg of it stops being true:
     //   - the local body despawned (same round-trip proof as proxies);
@@ -401,8 +406,13 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
                     ok = (live == cand);
                 }
                 if (ok) {
-                    Key tk; tk.t = th[0]; tk.c = th[1]; tk.cs = th[2];
-                    tk.i = th[3]; tk.s = th[4];
+                    // readHand's array order is {index, serial, type,
+                    // container, containerSerial} (EngineEntity.cpp) - the
+                    // mapping here was scrambled until 2026-08-13, making
+                    // this own-squad test a silent no-op (latent: zero (i,s)
+                    // binds had fired in the field).
+                    Key tk; tk.i = th[0]; tk.s = th[1]; tk.t = th[2];
+                    tk.c = th[3]; tk.cs = th[4];
                     if (ownHands_.find(tk) != ownHands_.end()) ok = false;
                 }
                 if (ok) {
@@ -428,6 +438,26 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
                     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
                     continue;
                 }
+            }
+        }
+        // v2.1 cluster correlation (2026-08-13, user-approved design:
+        // cluster-correlation-design.md): census-sourced keys that neither
+        // (i,s) history nor an existing alias/proxy explains enter the
+        // cluster registry BEFORE the distance gates - like the (i,s) bind,
+        // a cluster bind is legal where a mint is not (the peer's copy of a
+        // pack member is identity, not spawn authority). Outcomes: bound
+        // (done), hold (cluster still settling - re-judge on the ~1 s
+        // budget-defer cadence), pass (judged unmatched - fall through to
+        // the normal mint path). Stream REQs and force-REQs skip: both are
+        // already explicitly correlated.
+        if (clusterEnabled_ && rq.fromCensus && !rq.forceReq) {
+            int cv = clusterConsider(gw, k, p.charSid, p.x, p.y, p.z,
+                                     p.dead != 0, now);
+            if (cv == 1) continue;          // alias-bound by the cluster judge
+            if (cv == 0) {                  // settling: hold, revisit in ~1 s
+                rq.farMs = (now > FAR_RETRY_MS) ? (now - FAR_RETRY_MS + 1000) : now;
+                rq.sends = 0;
+                continue;
             }
         }
         // Mint gate (census-mint fix + Phase 1 spawn parity): the reply
@@ -556,8 +586,10 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
                     // never census-bound.
                     unsigned int th[5];
                     if (engine::readHand(twin, th)) {
-                        Key tk; tk.t = th[0]; tk.c = th[1]; tk.cs = th[2];
-                        tk.i = th[3]; tk.s = th[4];
+                        // readHand order is {i, s, t, c, cs} - scrambled here
+                        // until 2026-08-13 (silent no-op own-squad test).
+                        Key tk; tk.i = th[0]; tk.s = th[1]; tk.t = th[2];
+                        tk.c = th[3]; tk.cs = th[4];
                         if (ownHands_.find(tk) != ownHands_.end()) bindable = false;
                     } else {
                         bindable = false; // unreadable pointer: do not bind it
@@ -1266,6 +1298,353 @@ void Replicator::insertPeerMember(GameWorld* gw, Character* c, const Key& newK,
         ok ? 1 : 0, inSquad, lk.t, lk.c, lk.cs, lk.i, lk.s,
         pinnedLocal ? 1 : 0, ownIt ? 1 : 0);
     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+}
+
+// ---- v2.1 cluster correlation (2026-08-13) ---------------------------------
+// Design: cluster-correlation-design.md (user-approved). The INFO loop routes
+// census-sourced unresolvable keys here; a cluster settles, is judged ONCE
+// against the local same-template population, and matched members become
+// ORDINARY alias binds - same maps, hygiene, census vouching, and dead-key
+// retirement as the sole-twin and (i,s) binders. Two field-documented pack
+// shapes (Obs B3): squad-shaped (one container, members i=1..N, possibly
+// MIXED sids - the empire squad carried four) and singleton-shaped (one
+// container per body - wildlife, mercs, town residents). Container identity
+// trumps template for membership; singleton containers merge by template +
+// proximity.
+
+int Replicator::clusterConsider(GameWorld* gw, const Key& k, const char* sid,
+                                float x, float y, float z, bool dead,
+                                unsigned long now) {
+    if (!sid || !sid[0]) return -1;
+    const unsigned int CLUSTER_MEMBER_MAX = 40;
+    // Find this key's cluster: container mapping first (the squad rule).
+    std::pair<u32, u32> ck(k.c, k.cs);
+    unsigned int cid = 0;
+    PendingCluster* cl = 0;
+    std::map<std::pair<u32, u32>, unsigned int>::iterator ci =
+        containerCluster_.find(ck);
+    if (ci != containerCluster_.end()) {
+        std::map<unsigned int, PendingCluster>::iterator cf =
+            clusters_.find(ci->second);
+        if (cf != clusters_.end()) { cid = cf->first; cl = &cf->second; }
+        else containerCluster_.erase(ci); // stale mapping from a swept cluster
+    }
+    if (!cl) {
+        // Singleton merge: an UNJUDGED all-singleton same-template cluster
+        // whose centroid sits within the merge radius adopts this key.
+        for (std::map<unsigned int, PendingCluster>::iterator it =
+                 clusters_.begin(); it != clusters_.end(); ++it) {
+            PendingCluster& c2 = it->second;
+            if (c2.judged || !c2.sameSid) continue;
+            if (c2.sameContainer && c2.members.size() > 1) continue; // squad-shaped
+            if (strcmp(c2.sid0, sid) != 0) continue;
+            if (c2.members.empty()) continue;
+            float cx = 0, cy = 0, cz = 0;
+            for (size_t m = 0; m < c2.members.size(); ++m) {
+                cx += c2.members[m].x; cy += c2.members[m].y; cz += c2.members[m].z;
+            }
+            float inv = 1.0f / (float)c2.members.size();
+            if (dist3(x, y, z, cx * inv, cy * inv, cz * inv) <= clusterMergeRadius_) {
+                cid = it->first; cl = &c2; break;
+            }
+        }
+    }
+    if (!cl) {
+        cid = ++nextClusterId_;
+        PendingCluster& nc = clusters_[cid];
+        nc.firstMs = nc.lastAddMs = now;
+        nc.c0 = k.c; nc.cs0 = k.cs;
+        _snprintf(nc.sid0, sizeof(nc.sid0) - 1, "%s", sid);
+        nc.sid0[sizeof(nc.sid0) - 1] = '\0';
+        cl = &nc;
+        char b[176]; _snprintf(b, sizeof(b) - 1,
+            "[cluster] formed id=%u seed=%u,%u,%u,%u,%u sid='%s'",
+            cid, k.t, k.c, k.cs, k.i, k.s, sid);
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    // Add or refresh the member. (Key equality via the map ordering - Key is
+    // a nested type whose operator< already exists for the alias maps.)
+    ClusterMember* me = 0;
+    for (size_t m = 0; m < cl->members.size(); ++m) {
+        const Key& mk = cl->members[m].key;
+        if (!(mk < k) && !(k < mk)) { me = &cl->members[m]; break; }
+    }
+    if (me) {
+        if (me->outcome == 1) return 1;
+        if (me->outcome == 2) return -1;
+        me->x = x; me->y = y; me->z = z; me->dead = dead; // refresh; no settle bump
+    } else if (cl->judged) {
+        // Straggler into a judged cluster: only a MATCHED squad-shaped
+        // cluster earns the direct sibling bind - its container identity was
+        // proven by the members that already bound. Anything else passes to
+        // the normal mint path.
+        if (!(cl->matched && cl->sameContainer && k.c == cl->c0 && k.cs == cl->cs0))
+            return -1;
+        return clusterSiblingBind(gw, cid, k, sid, x, y, z, dead, now) ? 1 : -1;
+    } else {
+        if (cl->members.size() >= CLUSTER_MEMBER_MAX) return -1; // full: mint
+        ClusterMember nm;
+        nm.key = k;
+        _snprintf(nm.sid, sizeof(nm.sid) - 1, "%s", sid);
+        nm.sid[sizeof(nm.sid) - 1] = '\0';
+        nm.x = x; nm.y = y; nm.z = z; nm.dead = dead;
+        cl->members.push_back(nm);
+        cl->lastAddMs = now;
+        if (k.c != cl->c0 || k.cs != cl->cs0) cl->sameContainer = false;
+        if (strcmp(sid, cl->sid0) != 0)       cl->sameSid = false;
+        containerCluster_[ck] = cid;
+    }
+    // Judge once settled (no new member for settleMs, or maxWait elapsed).
+    if (!cl->judged &&
+        ((now - cl->lastAddMs) >= clusterSettleMs_ ||
+         (now - cl->firstMs) >= clusterMaxWaitMs_)) {
+        clusterJudge(gw, cid, *cl, now);
+        for (size_t m = 0; m < cl->members.size(); ++m) {
+            const Key& mk = cl->members[m].key;
+            if (!(mk < k) && !(k < mk))
+                return cl->members[m].outcome == 1 ? 1 : -1;
+        }
+        return -1;
+    }
+    return 0; // settling
+}
+
+void Replicator::clusterJudge(GameWorld* gw, unsigned int cid,
+                              PendingCluster& cl, unsigned long now) {
+    cl.judged = true; cl.judgedMs = now; cl.matched = false;
+    const unsigned int n = (unsigned int)cl.members.size();
+    for (unsigned int i = 0; i < n; ++i) cl.members[i].outcome = 2; // default: mint
+    if (n == 0) return;
+    float cx = 0, cy = 0, cz = 0;
+    for (unsigned int i = 0; i < n; ++i) {
+        cx += cl.members[i].x; cy += cl.members[i].y; cz += cl.members[i].z;
+    }
+    cx /= n; cy /= n; cz /= n;
+    // Exclusions: bound proxies (answer to their own keys) and already-
+    // aliased bodies. Suppressed originals stay IN - restoring a culled
+    // original is the point (decision 2, approved).
+    const unsigned int EXCL_MAX = 256;
+    static Character* excl[EXCL_MAX]; // main-thread only
+    unsigned int ne = 0;
+    for (std::map<Key, Character*>::iterator pi = proxyByKey_.begin();
+         pi != proxyByKey_.end() && ne < EXCL_MAX; ++pi) excl[ne++] = pi->second;
+    for (std::map<Character*, Key>::iterator ai = aliasKeyOfChar_.begin();
+         ai != aliasKeyOfChar_.end() && ne < EXCL_MAX; ++ai) excl[ne++] = ai->first;
+    // Candidates: one wide probe per DISTINCT member sid at the ambiguity
+    // radius, so a single pool answers both pairing (<= match radius) and
+    // the uniqueness test (leftovers inside the ambiguity radius).
+    const unsigned int CAND_MAX = 96;
+    static Character* cand[CAND_MAX];  // main-thread only
+    struct CandInfo {
+        Character* ch; float x, y, z, dc; bool dead, used; char sid[48];
+    };
+    static CandInfo pool[CAND_MAX];    // main-thread only
+    unsigned int np = 0;
+    for (unsigned int i = 0; i < n && np < CAND_MAX; ++i) {
+        bool seen = false;
+        for (unsigned int j = 0; j < i && !seen; ++j)
+            if (strcmp(cl.members[j].sid, cl.members[i].sid) == 0) seen = true;
+        if (seen) continue;
+        unsigned int got = engine::sameTemplateNearAll(
+            gw, cl.members[i].sid, cx, cy, cz, clusterAmbiguityRadius_,
+            excl, ne, cand, CAND_MAX);
+        for (unsigned int c = 0; c < got && np < CAND_MAX; ++c) {
+            char csid[48], cfac[48];
+            float px, py, pz, phd; bool pdead = false; float page = 0.0f;
+            if (!engine::describeCharacter(cand[c], csid, sizeof(csid),
+                                           cfac, sizeof(cfac),
+                                           &px, &py, &pz, &phd, &pdead, &page))
+                continue;
+            if (strcmp(csid, cl.members[i].sid) != 0) continue;
+            CandInfo& q = pool[np++];
+            q.ch = cand[c]; q.x = px; q.y = py; q.z = pz; q.dead = pdead;
+            q.used = false;
+            q.dc = dist3(px, py, pz, cx, cy, cz);
+            _snprintf(q.sid, sizeof(q.sid) - 1, "%s", csid);
+            q.sid[sizeof(q.sid) - 1] = '\0';
+        }
+    }
+    // Greedy nearest pairing. Dead pools stay apart (decision 3); the pair
+    // cap is the tight inter-sim drift bound for real clusters, relaxed to
+    // the match radius for the n==1 unique-single rule (town residents walk
+    // schedules that separate the two sims' copies far beyond 150 u - the
+    // 2026-08-12 shopkeeper class; uniqueness carries the proof instead).
+    const unsigned int PAIR_MAX = 40; // == CLUSTER_MEMBER_MAX
+    int pairOf[PAIR_MAX];
+    for (unsigned int i = 0; i < n && i < PAIR_MAX; ++i) pairOf[i] = -1;
+    float pairCap = (n >= 2) ? clusterPairDist_ : clusterMatchRadius_;
+    unsigned int paired = 0;
+    for (;;) {
+        float best = 1.0e30f; int bi = -1, bj = -1;
+        for (unsigned int i = 0; i < n && i < PAIR_MAX; ++i) {
+            if (pairOf[i] >= 0) continue;
+            for (unsigned int j = 0; j < np; ++j) {
+                if (pool[j].used) continue;
+                if (pool[j].dead != cl.members[i].dead) continue;
+                if (pool[j].dc > clusterMatchRadius_) continue;
+                if (strcmp(pool[j].sid, cl.members[i].sid) != 0) continue;
+                float d = dist3(cl.members[i].x, cl.members[i].y, cl.members[i].z,
+                                pool[j].x, pool[j].y, pool[j].z);
+                if (d <= pairCap && d < best) { best = d; bi = (int)i; bj = (int)j; }
+            }
+        }
+        if (bi < 0) break;
+        pairOf[bi] = bj; pool[bj].used = true; ++paired;
+    }
+    // Coverage (>=2 pairs at >=fraction) or the n==1 unique-single rule.
+    bool cover;
+    if (n >= 2) cover = (paired >= 2) && (paired * 100u >= clusterMatchFraction_ * n);
+    else        cover = (paired == 1);
+    // Ambiguity: enough unpaired same-template candidates inside the
+    // ambiguity radius to re-cover the match means a SECOND local group
+    // could claim these binds (the 9-dust-boss battlefield). Defer: honest
+    // doubles beat wrong binds. For a unique single, ANY leftover kills it.
+    unsigned int leftovers = 0;
+    for (unsigned int j = 0; j < np; ++j) if (!pool[j].used) ++leftovers;
+    bool ambiguous;
+    if (n >= 2) ambiguous = cover && leftovers >= ((paired > 4) ? paired - 2 : 2);
+    else        ambiguous = cover && leftovers >= 1;
+    if (!cover || ambiguous) {
+        char b[220]; _snprintf(b, sizeof(b) - 1,
+            "[cluster] judged id=%u n=%u paired=%u cand=%u leftover=%u sid0='%s' "
+            "verdict=%s (mint path)",
+            cid, n, paired, np, leftovers, cl.sid0,
+            ambiguous ? "ambiguous" : "coverage");
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        return;
+    }
+    // Bind the pairs - per-member paranoia inherited from the (i,s) binder.
+    unsigned int bound = 0, restored = 0;
+    for (unsigned int i = 0; i < n && i < PAIR_MAX; ++i) {
+        if (pairOf[i] < 0) continue;
+        const Key& mk = cl.members[i].key;
+        if (aliasByKey_.find(mk) != aliasByKey_.end()) {
+            cl.members[i].outcome = 1; // raced: another binder got it first
+            continue;
+        }
+        Character* body = pool[pairOf[i]].ch;
+        unsigned int th[5];
+        Character* live = 0;
+        if (engine::readHand(body, th))
+            live = engine::resolveCharByHand(th[0], th[1], th[2], th[3], th[4]);
+        if (live != body) continue;
+        Key tk; tk.i = th[0]; tk.s = th[1]; tk.t = th[2]; // readHand order
+        tk.c = th[3]; tk.cs = th[4];
+        if (ownHands_.find(tk) != ownHands_.end()) continue;
+        if (aliasKeyOfChar_.find(body) != aliasKeyOfChar_.end()) continue;
+        aliasByKey_[mk] = body;
+        aliasKeyOfChar_[body] = mk;
+        aliasVouchMs_[mk] = now;
+        spawnReq_.erase(mk);
+        lifeSet(mk, LIFE_RESOLVED, "alias-bind-cluster");
+        cl.members[i].outcome = 1;
+        ++bound; ++clusterBinds_;
+        // Restore a suppressed original (decision 2): it answers under the
+        // peer's key now, and the alias consults in BOTH authority passes
+        // keep the vouch, so the cull that hid it cannot legitimately
+        // re-fire.
+        bool didRestore = false;
+        for (std::map<Key, Character*>::iterator si = suppressed_.begin();
+             si != suppressed_.end(); ++si) {
+            if (si->second != body) continue;
+            engine::restoreNpc(gw, body);
+            suppressed_.erase(si);
+            ++restored; didRestore = true;
+            break;
+        }
+        char b[240]; _snprintf(b, sizeof(b) - 1,
+            "[spawn] ALIAS bound hand=%u,%u,%u,%u,%u sid='%s' "
+            "(cluster %u/%u id=%u restored=%d; aliases=%u)",
+            mk.t, mk.c, mk.cs, mk.i, mk.s, cl.members[i].sid,
+            bound, n, cid, didRestore ? 1 : 0, (unsigned)aliasByKey_.size());
+        b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    }
+    cl.matched = bound > 0;
+    char b[200]; _snprintf(b, sizeof(b) - 1,
+        "[cluster] judged id=%u n=%u paired=%u bound=%u restored=%u sid0='%s' "
+        "verdict=matched",
+        cid, n, paired, bound, restored, cl.sid0);
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+}
+
+bool Replicator::clusterSiblingBind(GameWorld* gw, unsigned int cid,
+                                    const Key& k, const char* sid,
+                                    float x, float y, float z, bool dead,
+                                    unsigned long now) {
+    const unsigned int EXCL_MAX = 256;
+    static Character* excl[EXCL_MAX]; // main-thread only
+    unsigned int ne = 0;
+    for (std::map<Key, Character*>::iterator pi = proxyByKey_.begin();
+         pi != proxyByKey_.end() && ne < EXCL_MAX; ++pi) excl[ne++] = pi->second;
+    for (std::map<Character*, Key>::iterator ai = aliasKeyOfChar_.begin();
+         ai != aliasKeyOfChar_.end() && ne < EXCL_MAX; ++ai) excl[ne++] = ai->first;
+    static Character* cand[16]; // main-thread only
+    unsigned int got = engine::sameTemplateNearAll(gw, sid, x, y, z,
+                                                   clusterPairDist_,
+                                                   excl, ne, cand, 16);
+    Character* pick = 0; float best = 1.0e30f;
+    for (unsigned int c = 0; c < got; ++c) {
+        char csid[48], cfac[48];
+        float px, py, pz, phd; bool pdead = false; float page = 0.0f;
+        if (!engine::describeCharacter(cand[c], csid, sizeof(csid),
+                                       cfac, sizeof(cfac),
+                                       &px, &py, &pz, &phd, &pdead, &page))
+            continue;
+        if (strcmp(csid, sid) != 0 || pdead != dead) continue;
+        float d = dist3(x, y, z, px, py, pz);
+        if (d < best) { best = d; pick = cand[c]; }
+    }
+    if (!pick) return false;
+    unsigned int th[5];
+    Character* live = 0;
+    if (engine::readHand(pick, th))
+        live = engine::resolveCharByHand(th[0], th[1], th[2], th[3], th[4]);
+    if (live != pick) return false;
+    Key tk; tk.i = th[0]; tk.s = th[1]; tk.t = th[2]; tk.c = th[3]; tk.cs = th[4];
+    if (ownHands_.find(tk) != ownHands_.end()) return false;
+    if (aliasKeyOfChar_.find(pick) != aliasKeyOfChar_.end()) return false;
+    aliasByKey_[k] = pick;
+    aliasKeyOfChar_[pick] = k;
+    aliasVouchMs_[k] = now;
+    spawnReq_.erase(k);
+    lifeSet(k, LIFE_RESOLVED, "alias-bind-cluster");
+    ++clusterBinds_;
+    bool didRestore = false;
+    for (std::map<Key, Character*>::iterator si = suppressed_.begin();
+         si != suppressed_.end(); ++si) {
+        if (si->second != pick) continue;
+        engine::restoreNpc(gw, pick);
+        suppressed_.erase(si);
+        didRestore = true;
+        break;
+    }
+    char b[240]; _snprintf(b, sizeof(b) - 1,
+        "[spawn] ALIAS bound hand=%u,%u,%u,%u,%u sid='%s' "
+        "(cluster-sibling id=%u restored=%d; aliases=%u)",
+        k.t, k.c, k.cs, k.i, k.s, sid, cid, didRestore ? 1 : 0,
+        (unsigned)aliasByKey_.size());
+    b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+    return true;
+}
+
+void Replicator::clusterSweep(unsigned long now) {
+    if (clusters_.empty()) return;
+    for (std::map<unsigned int, PendingCluster>::iterator it = clusters_.begin();
+         it != clusters_.end(); ) {
+        PendingCluster& cl = it->second;
+        bool expired = cl.judged
+            ? (now - cl.judgedMs) > clusterMaxWaitMs_ * 4   // straggler window
+            : (now - cl.lastAddMs) > clusterMaxWaitMs_ * 2; // abandoned
+        if (!expired) { ++it; continue; }
+        for (size_t m = 0; m < cl.members.size(); ++m) {
+            const Key& mk = cl.members[m].key;
+            std::map<std::pair<u32, u32>, unsigned int>::iterator cc =
+                containerCluster_.find(std::make_pair(mk.c, mk.cs));
+            if (cc != containerCluster_.end() && cc->second == it->first)
+                containerCluster_.erase(cc);
+        }
+        clusters_.erase(it++);
+    }
 }
 
 
