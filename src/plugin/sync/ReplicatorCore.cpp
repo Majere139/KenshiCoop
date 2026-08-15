@@ -72,7 +72,7 @@ Replicator::Replicator()
       nextClusterId_(0), clusterBinds_(0), clusterEnabled_(true),
       clusterSettleMs_(1500), clusterMaxWaitMs_(4000),
       clusterMergeRadius_(300.0f), clusterMatchRadius_(600.0f),
-      clusterPairDist_(150.0f), clusterAmbiguityRadius_(1200.0f),
+      clusterPairDist_(400.0f), clusterAmbiguityRadius_(800.0f),
       clusterMatchFraction_(60),
       poolSeen_(-1), poolSent_(-1), poolSentMs_(0), poolTotal_(-1),
       poolSeq_(0), poolAcked_(0),

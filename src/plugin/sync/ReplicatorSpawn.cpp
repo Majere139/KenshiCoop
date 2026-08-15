@@ -1495,20 +1495,53 @@ void Replicator::clusterJudge(GameWorld* gw, unsigned int cid,
     bool cover;
     if (n >= 2) cover = (paired >= 2) && (paired * 100u >= clusterMatchFraction_ * n);
     else        cover = (paired == 1);
-    // Ambiguity: enough unpaired same-template candidates inside the
-    // ambiguity radius to re-cover the match means a SECOND local group
-    // could claim these binds (the 9-dust-boss battlefield). Defer: honest
-    // doubles beat wrong binds. For a unique single, ANY leftover kills it.
-    unsigned int leftovers = 0;
-    for (unsigned int j = 0; j < np; ++j) if (!pool[j].used) ++leftovers;
+    // Ambiguity (retuned 2026-08-15 after Session C): a SECOND local group
+    // that could claim these binds means the pairing is a guess (the
+    // 9-dust-boss battlefield). Defer: honest doubles beat wrong binds.
+    //
+    // v2.1 counted EVERY unpaired candidate in the pool as a claimant - any
+    // member template, anywhere inside the ambiguity radius. In dense
+    // homogeneous towns that vetoed correct pairings wholesale (Session C:
+    // `paired==n ... verdict=ambiguous` on nearly every cluster; Blake's log
+    // `n=1 paired=1 cand=19 leftover=18` - 18 unrelated Shop Guards vetoing
+    // one Boot trader). A leftover now counts ONLY if it is a PLAUSIBLE
+    // ALTERNATIVE for some pair: same template as that pair's member, and
+    // within pair-scale distance of the member's peer position - i.e. it
+    // could actually have been chosen instead. Pair-scale = max(pair cap,
+    // the cluster's own spread), so a spread-out squad tolerates its own
+    // drift while a tight vendor keeps a tight veto zone. Other templates
+    // and far same-template bodies are not alternatives.
+    float spread = 0.0f;
+    for (unsigned int i = 0; i < n; ++i) {
+        float d = dist3(cl.members[i].x, cl.members[i].y, cl.members[i].z, cx, cy, cz);
+        if (d > spread) spread = d;
+    }
+    float altScale = pairCap;
+    if (spread > altScale) altScale = spread;
+    unsigned int leftovers = 0;   // plausible alternatives only
+    unsigned int leftoverAny = 0; // raw unpaired count, for the log
+    for (unsigned int j = 0; j < np; ++j) {
+        if (pool[j].used) continue;
+        ++leftoverAny;
+        bool plausible = false;
+        for (unsigned int i = 0; i < n && i < PAIR_MAX && !plausible; ++i) {
+            if (pairOf[i] < 0) continue;
+            if (pool[j].dead != cl.members[i].dead) continue;
+            if (strcmp(pool[j].sid, cl.members[i].sid) != 0) continue;
+            float d = dist3(cl.members[i].x, cl.members[i].y, cl.members[i].z,
+                            pool[j].x, pool[j].y, pool[j].z);
+            if (d <= altScale) plausible = true;
+        }
+        if (plausible) ++leftovers;
+    }
     bool ambiguous;
     if (n >= 2) ambiguous = cover && leftovers >= ((paired > 4) ? paired - 2 : 2);
     else        ambiguous = cover && leftovers >= 1;
     if (!cover || ambiguous) {
-        char b[220]; _snprintf(b, sizeof(b) - 1,
-            "[cluster] judged id=%u n=%u paired=%u cand=%u leftover=%u sid0='%s' "
-            "verdict=%s (mint path)",
-            cid, n, paired, np, leftovers, cl.sid0,
+        char b[240]; _snprintf(b, sizeof(b) - 1,
+            "[cluster] judged id=%u n=%u paired=%u cand=%u leftover=%u/%u "
+            "spread=%.0f sid0='%s' verdict=%s (mint path)",
+            cid, n, paired, np, leftovers, leftoverAny, spread, cl.sid0,
             ambiguous ? "ambiguous" : "coverage");
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         return;

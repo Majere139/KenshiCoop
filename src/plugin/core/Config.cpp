@@ -319,12 +319,16 @@ void loadConfig(Config& c) {
             (float)std::atof(envOr("KENSHICOOP_CLUSTER_MERGE_RADIUS", "300").c_str());
         c.clusterMatchRadius =
             (float)std::atof(envOr("KENSHICOOP_CLUSTER_MATCH_RADIUS", "600").c_str());
+        // Retuned 2026-08-15 (Session C): PAIR_DIST 150 -> 400 (moving packs
+        // after a split paired nothing at 150 u with candidates present) and
+        // AMBIGUITY_RADIUS 1200 -> 800 (it now bounds candidate collection
+        // only; the veto itself is plausibility-scoped in the judge).
         c.clusterPairDist =
-            (float)std::atof(envOr("KENSHICOOP_CLUSTER_PAIR_DIST", "150").c_str());
+            (float)std::atof(envOr("KENSHICOOP_CLUSTER_PAIR_DIST", "400").c_str());
         c.clusterMatchFraction =
             (unsigned int)std::atoi(envOr("KENSHICOOP_CLUSTER_MATCH_FRACTION", "60").c_str());
         c.clusterAmbiguityRadius =
-            (float)std::atof(envOr("KENSHICOOP_CLUSTER_AMBIGUITY_RADIUS", "1200").c_str());
+            (float)std::atof(envOr("KENSHICOOP_CLUSTER_AMBIGUITY_RADIUS", "800").c_str());
         if (c.clusterSettleMs < 250)  c.clusterSettleMs = 250;
         if (c.clusterMaxWaitMs < c.clusterSettleMs) c.clusterMaxWaitMs = c.clusterSettleMs;
         if (c.clusterMergeRadius < 0.0f)     c.clusterMergeRadius = 0.0f;

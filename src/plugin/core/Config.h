@@ -102,9 +102,9 @@ struct Config {
     unsigned int clusterMaxWaitMs;       // KENSHICOOP_CLUSTER_MAX_WAIT_MS   (4000)
     float        clusterMergeRadius;     // KENSHICOOP_CLUSTER_MERGE_RADIUS  (300 u)
     float        clusterMatchRadius;     // KENSHICOOP_CLUSTER_MATCH_RADIUS  (600 u)
-    float        clusterPairDist;        // KENSHICOOP_CLUSTER_PAIR_DIST     (150 u)
+    float        clusterPairDist;        // KENSHICOOP_CLUSTER_PAIR_DIST     (400 u)
     unsigned int clusterMatchFraction;   // KENSHICOOP_CLUSTER_MATCH_FRACTION (60 %)
-    float        clusterAmbiguityRadius; // KENSHICOOP_CLUSTER_AMBIGUITY_RADIUS (1200 u)
+    float        clusterAmbiguityRadius; // KENSHICOOP_CLUSTER_AMBIGUITY_RADIUS (800 u)
 
     // v38 census position parking (pack-hidden fix, 2026-07-11): how far a
     // census-PRESENT local NPC copy may drift from the host's census position
