@@ -1232,15 +1232,27 @@ static bool injectTransientDead() {
 RootObject* resolveGroundGear(const unsigned int hand[5], void* cached) {
     bool pickedUp = false;
     RootObject* ro = reinterpret_cast<RootObject*>(cached);
-    if (ro && engine::groundObjectLiveness(ro, 0, &pickedUp)) return ro;
-    if (pickedUp) return 0; // it really has entered a bag - not ours to re-home any more
-    // The cached pointer is dead or unreadable (the engine streamed the object out and back,
-    // say). The hand is the only other handle we have, so try it - but only now.
     bool haveHand = false;
     for (int k = 0; k < 5; ++k) if (hand[k] != 0) { haveHand = true; break; }
-    if (!haveHand) return 0;
-    RootObject* byHand = engine::resolveObjectByHand(hand);
-    if (!byHand || byHand == ro) return 0;
+    // 2026-08-15: the SEH guard on the liveness probe is NOT sufficient proof for the
+    // cached pointer. Three distinct fault shapes in one session came through this call
+    // on a freed object - a poison READ, then an EXECUTE into kenshi_x64, then a NULL
+    // deref inside Ogre - because getPosition() is a VIRTUAL call: a dangling vtable
+    // pointer can jump into arbitrary live code, and an EXECUTE that lands somewhere
+    // valid does not fault at all. Contained so far only by where the jumps happened
+    // to land. So the cached pointer is now trusted ONLY when the engine's own
+    // hand->object lookup hands back that same pointer (the same round-trip proof
+    // every identity binder uses); a track with no usable hand does not get to
+    // dereference a bare cached pointer at all - it re-resolves or reads as dead.
+    RootObject* byHand = haveHand ? engine::resolveObjectByHand(hand) : 0;
+    if (ro && byHand == ro) {
+        if (engine::groundObjectLiveness(ro, 0, &pickedUp)) return ro;
+        return 0; // proven-live pointer, but the item is bagged or unreadable
+    }
+    // Cached pointer unproven (stale, or a runtime-minted item whose hand is not
+    // resolvable here): never dereference it. If the hand resolves to a DIFFERENT
+    // object, judge that one; otherwise the track is dead for now.
+    if (!byHand) return 0;
     if (!engine::groundObjectLiveness(byHand, 0, &pickedUp)) return 0;
     return byHand;
 }
