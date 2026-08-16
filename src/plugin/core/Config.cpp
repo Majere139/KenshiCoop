@@ -340,6 +340,10 @@ void loadConfig(Config& c) {
         // Stream proxy guard (2026-08-15, obs D8): DEFAULT ON; "0" is the
         // field-triage kill switch (restores the mirror ping-pong).
         c.streamProxyGuard = envOr("KENSHICOOP_STREAM_PROXY_GUARD", "1") != "0";
+        // Door authority + receive-side med translation (Session E): both
+        // DEFAULT ON; "0" restores the prior behavior for field triage.
+        c.doorAuthority = envOr("KENSHICOOP_DOOR_AUTHORITY", "1") != "0";
+        c.medXlate      = envOr("KENSHICOOP_MED_XLATE", "1") != "0";
         // Census park distance: "0" (explicit) disables; absent = 120 u
         // default. Deliberately ABOVE town-schedule divergence (~50 u for a
         // bar NPC seated at a different stool per sim - run 185524 showed

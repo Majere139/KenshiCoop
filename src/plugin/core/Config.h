@@ -115,7 +115,26 @@ struct Config {
     // ownership flip (42 of 44 stream mints in that session, both sides).
     // On: proxies never enter the NPC stream and a REQ for one of our proxy
     // hands answers found=0. Kill switch for field triage only.
+    // As of 2026-08-15 late (Session E) the guard also covers ALIASED bodies
+    // (14 mirror-of-alias stream mints measured in E) - same switch.
     bool         streamProxyGuard;       // KENSHICOOP_STREAM_PROXY_GUARD    (1)
+
+    // Door authority (2026-08-15 Session E, obs E8/E9): only the CELL OWNER
+    // streams a door's state, and the owner also periodically resends the
+    // baseline (doorResendMs) so silent lock-seed divergence heals. The
+    // non-owner applies and never sends. Closes both observed failure modes:
+    // the 1 Hz open/close tug-of-war (Squin) and the locked-on-one-screen
+    // divergence that got a player beaten by town guards (Clownsteady).
+    bool         doorAuthority;          // KENSHICOOP_DOOR_AUTHORITY        (1)
+
+    // Receive-side puppet translation for vitals / hits / limb events
+    // (Session E obs E4/E5 "authorship rule"): an incoming medical or hit key
+    // that resolves nowhere raw is applied to the minted puppet bound to that
+    // key, so the NON-author of a fight sees damage numbers and moving health
+    // bars. Puppets only (damage-guarded: this stream is their sanctioned
+    // writer); aliased natives deliberately excluded (second-writer design
+    // call, not a fallback).
+    bool         medXlate;               // KENSHICOOP_MED_XLATE             (1)
 
     // v38 census position parking (pack-hidden fix, 2026-07-11): how far a
     // census-PRESENT local NPC copy may drift from the host's census position

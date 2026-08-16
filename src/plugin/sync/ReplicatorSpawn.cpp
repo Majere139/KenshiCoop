@@ -225,11 +225,24 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             // honest answer is "no such body": the body it stands for is the
             // peer's own, under the peer's key. found=0 -> the peer's
             // denied-backoff stops the retries; nothing is destroyed.
-            bool ownProxy = false;
-            if (c && streamProxyGuard_ && isOwnProxyBody(c)) {
-                ownProxy = true;
-                c = 0;
-                ++proxyAnswerDenied_;
+            const char* denyTag = "";
+            if (c && streamProxyGuard_) {
+                if (isOwnProxyBody(c)) {
+                    denyTag = " (own proxy: denied)";
+                    c = 0;
+                    ++proxyAnswerDenied_;
+                } else if (aliasKeyOfChar_.find(c) != aliasKeyOfChar_.end() &&
+                           aliasByKey_.find(k) == aliasByKey_.end()) {
+                    // Session E extension: the asked hand is the LOCAL hand of
+                    // a body the peer already holds under its own key (our
+                    // alias binds it). found=1 here mints a mirror-of-alias on
+                    // the peer - 14 measured in Session E. The second clause
+                    // is belt-and-braces: a REQ for the ALIAS key itself never
+                    // resolves raw, so it takes the dead-key path above.
+                    denyTag = " (own alias: denied)";
+                    c = 0;
+                    ++proxyAnswerDenied_;
+                }
             }
             bool dead = false;
             float age = 0.0f;
@@ -243,8 +256,7 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             char b[240]; _snprintf(b, sizeof(b) - 1,
                 "[spawn] INFO send hand=%u,%u,%u,%u,%u found=%d dead=%d age=%.2f sid='%s' fac='%s'%s",
                 k.t, k.c, k.cs, k.i, k.s, pkt.found, pkt.dead, pkt.age,
-                pkt.charSid, pkt.facSid,
-                ownProxy ? " (own proxy: denied)" : "");
+                pkt.charSid, pkt.facSid, denyTag);
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
     }
@@ -871,6 +883,21 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 int limb = (int)ev.arg;
                 if (limb < 0 || limb > 3) break;
                 Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+                // Puppet translation (Session E obs E4/E5, same rule as
+                // applyMedical): a runtime-keyed victim resolves nowhere raw;
+                // our copy is the minted puppet bound to this key. Liveness-
+                // proved before use, like every puppet touch.
+                if (!c && medXlate_) {
+                    std::map<Key, Character*>::iterator pit = proxyByKey_.find(k);
+                    if (pit != proxyByKey_.end()) {
+                        unsigned int lh[5];
+                        Character* live = 0;
+                        if (engine::readHand(pit->second, lh))
+                            live = engine::resolveCharByHand(lh[0], lh[1], lh[2],
+                                                             lh[3], lh[4]);
+                        if (live == pit->second) c = pit->second;
+                    }
+                }
                 if (!c) break; // not loaded here; the medical stream self-heals later
                 unsigned char states[4] = { LIMB_STATE_UNKNOWN, LIMB_STATE_UNKNOWN,
                                             LIMB_STATE_UNKNOWN, LIMB_STATE_UNKNOWN };

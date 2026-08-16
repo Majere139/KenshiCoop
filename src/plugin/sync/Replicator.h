@@ -708,8 +708,20 @@ public:
     // KENSHICOOP_STREAM_PROXY_GUARD (2026-08-15, Session D obs D8): a proxy
     // we minted never enters the NPC stream under its local hand, and a REQ
     // for one of our proxy hands answers found=0. 'false' is the field-triage
-    // kill switch (restores the mirror-of-mirror ping-pong).
+    // kill switch (restores the mirror-of-mirror ping-pong). Since Session E
+    // the same guard also covers ALIASED bodies (mirror-of-alias class).
     void setStreamProxyGuard(bool on) { streamProxyGuard_ = on; }
+
+    // KENSHICOOP_DOOR_AUTHORITY (Session E obs E8/E9): the cell owner is the
+    // only side that streams a door's state, and it periodically resends the
+    // baseline; the non-owner applies and never sends.
+    void setDoorAuthority(bool on) { doorAuthority_ = on; }
+
+    // KENSHICOOP_MED_XLATE (Session E obs E4/E5): incoming vitals/hit/limb
+    // keys that resolve nowhere raw are applied to the minted puppet bound to
+    // that key (puppets only - they are damage-guarded, so this stream is
+    // their sanctioned medical writer).
+    void setMedXlate(bool on) { medXlate_ = on; }
 
     // KENSHICOOP_CENSUS_PARK (v38 pack-hidden fix): how far a census-PRESENT
     // local copy may drift from the host's census position before the join
@@ -2359,6 +2371,9 @@ private:
     bool          streamProxyGuard_;
     unsigned long streamProxySkips_;
     unsigned long proxyAnswerDenied_;
+    bool          doorAuthority_;   // Session E: owner-authored doors
+    bool          medXlate_;        // Session E: receive-side puppet translation
+    unsigned long medXlates_;       // cumulative applied translations (log-sampled)
     bool isOwnProxyBody(Character* c) const {
         if (!c) return false;
         for (std::map<Key, Character*>::const_iterator it = proxyByKey_.begin();

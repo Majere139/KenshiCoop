@@ -237,13 +237,25 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
         // within 8 u on the host). A proxy is the peer's body: it never
         // enters our stream. Applied before the cell/attention gate so it
         // holds whether or not presence authority is on.
-        if (streamProxyGuard_ && got > 0 && !proxyByKey_.empty()) {
+        // Session E extension: ALIASED bodies are excluded for the same
+        // reason as proxies - the census publishes them under the PEER's key
+        // (the peer's own body), but this stream would publish the LOCAL
+        // hand, and the peer minted a mirror of its own body from it (14
+        // measured mirror-of-alias mints in Session E). Aliased bodies are
+        // never driven (v1 rule: each side runs its own sim of them), so
+        // nothing is lost by not streaming them.
+        if (streamProxyGuard_ && got > 0 &&
+            (!proxyByKey_.empty() || !aliasKeyOfChar_.empty())) {
             unsigned int kept = 0;
             for (unsigned int i = 0; i < got; ++i) {
                 Character* bc = engine::resolveCharByHand(
                     buf[n + i].hIndex, buf[n + i].hSerial, buf[n + i].hType,
                     buf[n + i].hContainer, buf[n + i].hContainerSerial);
-                if (bc && isOwnProxyBody(bc)) { ++streamProxySkips_; continue; }
+                if (bc && (isOwnProxyBody(bc) ||
+                           aliasKeyOfChar_.find(bc) != aliasKeyOfChar_.end())) {
+                    ++streamProxySkips_;
+                    continue;
+                }
                 if (kept != i) buf[n + kept] = buf[n + i];
                 ++kept;
             }
@@ -932,7 +944,9 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
             // list is keyed by the raw local hand. Never drive-slot it back
             // to the peer (the mid band's mover filter is why it leaked less
             // often than the near tier, not never).
-            if (streamProxyGuard_ && isOwnProxyBody(chars[i])) {
+            if (streamProxyGuard_ &&
+                (isOwnProxyBody(chars[i]) ||
+                 aliasKeyOfChar_.find(chars[i]) != aliasKeyOfChar_.end())) {
                 ++streamProxySkips_;
                 continue;
             }

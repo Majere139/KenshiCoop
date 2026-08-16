@@ -234,6 +234,40 @@ void Replicator::applyMedical(GameWorld* gw, Inbound& in, NetLink& net, u32 owne
         if (ownHands_.find(k) != ownHands_.end()) continue; // never write our own truth
         unsigned int hand[5] = { k.t, k.c, k.cs, k.i, k.s };
         Character* c = engine::resolveCharByHand(hand[3], hand[4], hand[0], hand[1], hand[2]);
+        // Puppet translation (2026-08-15, Session E obs E4/E5 - the
+        // "authorship rule"): the fight's author streams its bodies' vitals
+        // under ITS keys; a runtime-keyed body resolves nowhere on the
+        // receiver, so the whole stream was dropped and the non-author saw
+        // frozen health bars and no damage numbers - in BOTH directions,
+        // demonstrated twice in one session. The receiver's copy of such a
+        // body is the minted puppet bound to exactly this wire key. Puppets
+        // are damage-guarded, so this stream is their only sanctioned medical
+        // writer - the same path driven save-stable copies always took; only
+        // the raw-key resolve stood in the way. ALIASED natives stay out
+        // deliberately: they run their own live sim here, and writing the
+        // peer's vitals over it is a two-writer design call, not a fallback.
+        // The pointer is liveness-proved exactly like the drive path proves
+        // its proxies (readHand round-trip) before we touch it.
+        if (!c && medXlate_) {
+            std::map<Key, Character*>::iterator pit = proxyByKey_.find(k);
+            if (pit != proxyByKey_.end()) {
+                Character* pc = pit->second;
+                unsigned int lh[5];
+                Character* live = 0;
+                if (engine::readHand(pc, lh))
+                    live = engine::resolveCharByHand(lh[0], lh[1], lh[2], lh[3], lh[4]);
+                if (live == pc) {
+                    c = pc;
+                    ++medXlates_;
+                    if (medXlates_ <= 3 || (medXlates_ % 200) == 0) {
+                        char xb[120]; _snprintf(xb, sizeof(xb) - 1,
+                            "[med] XLATE apply hand=%u,%u -> puppet (n=%lu)",
+                            k.i, k.s, medXlates_);
+                        xb[sizeof(xb) - 1] = '\0'; coop::logLine(xb);
+                    }
+                }
+            }
+        }
         if (!c) continue;
         engine::MedicalRead w;
         memset(&w, 0, sizeof(w));
@@ -424,6 +458,27 @@ void Replicator::applyCombatHits(GameWorld* gw, Inbound& in) {
             continue;
         }
         unsigned int hand[5] = { k.t, k.c, k.cs, k.i, k.s };
+        // Puppet translation (Session E, same rule as applyMedical): the hit
+        // names its victim by the sender's wire key; when that resolves
+        // nowhere raw, apply it to our minted puppet's CURRENT local hand.
+        // readHand order is {i,s,t,c,cs}; applyReportedDamage takes
+        // {t,c,cs,i,s} - remap explicitly (the scrambled-order lesson).
+        bool xlated = false;
+        if (medXlate_ &&
+            !engine::resolveCharByHand(hand[3], hand[4], hand[0], hand[1], hand[2])) {
+            std::map<Key, Character*>::iterator pit = proxyByKey_.find(k);
+            if (pit != proxyByKey_.end()) {
+                unsigned int lh[5];
+                Character* live = 0;
+                if (engine::readHand(pit->second, lh))
+                    live = engine::resolveCharByHand(lh[0], lh[1], lh[2], lh[3], lh[4]);
+                if (live == pit->second) {
+                    hand[0] = lh[2]; hand[1] = lh[3]; hand[2] = lh[4];
+                    hand[3] = lh[0]; hand[4] = lh[1];
+                    xlated = true;
+                }
+            }
+        }
         bool applied = engine::applyReportedDamage(gw, hand, p.flesh, p.blood);
         // A wounded world NPC is definitionally combat-scoped: mark it so the NPC
         // vitals stream (publishMedical, Phase B) mirrors the authoritative drop
@@ -432,8 +487,8 @@ void Replicator::applyCombatHits(GameWorld* gw, Inbound& in) {
         // never reflect the host-applied wound.
         if (applied && streamNpcs_) medNpc_[k] = nowMs();
         char b[160]; _snprintf(b, sizeof(b) - 1,
-            "[combat] HIT RECV id=%u hand=%u,%u flesh=%.1f blood=%.1f applied=%d",
-            p.hitId, k.i, k.s, p.flesh, p.blood, applied ? 1 : 0);
+            "[combat] HIT RECV id=%u hand=%u,%u flesh=%.1f blood=%.1f applied=%d xlate=%d",
+            p.hitId, k.i, k.s, p.flesh, p.blood, applied ? 1 : 0, xlated ? 1 : 0);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
     }
 }
@@ -814,6 +869,27 @@ void Replicator::publishDoors(const SyncContext& ctx) {
         Key k; k.t = r.hand[0]; k.c = r.hand[1]; k.cs = r.hand[2];
         k.i = r.hand[3]; k.s = r.hand[4];
         DoorRow& dr = doorRows_[k];
+        // Door authority (2026-08-15, Session E obs E8/E9): the CELL OWNER is
+        // the only side that speaks for a door. Both sides used to stream
+        // changes with no arbitration and no baseline reconciliation, which
+        // produced two field failures with one cause: (1) a 1 Hz open/close
+        // tug-of-war when each engine kept reverting the other's applied
+        // state (Squin - a door neither player could pass, both screens, 35
+        // cycles mirror-imaged in the two captures); (2) SILENT lock
+        // divergence when one sim's keeper runs its lock-up schedule and the
+        // other's does not - nothing CHANGES on either side, so nothing ever
+        // crossed, and a door stayed locked on one screen only (Clownsteady:
+        // the sim that believed 'locked' read forcing it as a crime - a
+        // beating and a lost limb). Owner: streams changes AND the periodic
+        // baseline (resendUnsent=true below -> divergence heals within
+        // doorResendMs). Non-owner: never sends; it still tracks the local
+        // state so a later ownership flip does not misread the accumulated
+        // difference as a fresh local change.
+        bool doorAuth = doorAuthority_ && cellAuth_;
+        if (doorAuth && !weAuthor(gw, ownerId, r.x, r.z)) {
+            dr.seeded = true; dr.knownOpen = r.open; dr.knownLocked = r.locked;
+            continue;
+        }
         if (!dr.seeded) {
             // Both clients load the same save, so the baseline is shared: seed
             // silently and stream only genuine mid-session movement.
@@ -821,11 +897,12 @@ void Replicator::publishDoors(const SyncContext& ctx) {
             continue;
         }
         bool changed = (r.open != dr.knownOpen) || (r.locked != dr.knownLocked);
-        // Doors seed their baseline silently above, so a never-sent row holds
-        // (resendUnsent = false); only a real change or a post-send safety
-        // resend crosses. No burst throttle - the 1 Hz sample gate paces it.
+        // Under door authority the OWNER also resends the unsent baseline
+        // (resendUnsent=true): that is the reconciliation that heals seed
+        // divergence. Without authority (kill switch / cellAuth off) the
+        // legacy change-only behavior is preserved exactly.
         if (!sync::gateShouldSend(changed, now, dr.lastSendMs, /*minSendMs*/ 0,
-                                  RESEND_MS, /*resendUnsent*/ false))
+                                  RESEND_MS, /*resendUnsent*/ doorAuth))
             continue;
         dr.knownOpen = r.open; dr.knownLocked = r.locked; dr.lastSendMs = now;
         DoorPacket pkt;
@@ -850,6 +927,8 @@ void Replicator::publishDoors(const SyncContext& ctx) {
 
 void Replicator::applyDoors(const SyncContext& ctx) {
     Inbound& in = *ctx.in;
+    GameWorld* gw = ctx.gw;
+    u32 ownerId = ctx.localId;
     std::deque<InboundDoor> got;
     in.drainDoor(got);
     if (got.empty()) return;
@@ -868,6 +947,24 @@ void Replicator::applyDoors(const SyncContext& ctx) {
         engine::DoorRead cur;
         if (!engine::readDoorByHand(p.hand, &cur))
             continue; // out-of-interest or runtime door - accepted edge
+        // Door authority (Session E): a packet about a door WE author is a
+        // stale claim (ownership-flip lag) or an older build still streaming
+        // as non-owner. Ignore it. The baseline update above already ran, so
+        // the next publish sample reads the peer's belief as a CHANGE against
+        // our real state and re-asserts it - self-healing even against a
+        // mixed-version pair.
+        if (doorAuthority_ && cellAuth_ && weAuthor(gw, ownerId, cur.x, cur.z)) {
+            if (cur.open != (int)p.open ||
+                (cur.hasLock && cur.locked != (int)p.locked)) {
+                char b[176]; _snprintf(b, sizeof(b) - 1,
+                    "[door] RECV ignored (we author) hand=%u.%u.%u.%u.%u "
+                    "open=%u locked=%u ours=%d/%d seq=%u",
+                    p.hand[0], p.hand[1], p.hand[2], p.hand[3], p.hand[4],
+                    p.open, p.locked, cur.open, cur.locked, p.seq);
+                b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+            }
+            continue;
+        }
         bool lockMoves = cur.hasLock && (cur.locked != (int)p.locked);
         if (cur.open == (int)p.open && !lockMoves)
             continue; // already converged (resend or echo)

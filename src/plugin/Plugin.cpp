@@ -1991,6 +1991,8 @@ void configureReplicator() {
                                 g_cfg.clusterMatchFraction,
                                 g_cfg.clusterAmbiguityRadius);
         g_repl.setStreamProxyGuard(g_cfg.streamProxyGuard);
+        g_repl.setDoorAuthority(g_cfg.doorAuthority);
+        g_repl.setMedXlate(g_cfg.medXlate);
         g_repl.setCensusParkDist(g_cfg.censusParkDist);
         g_repl.setCensusFreezeAi(g_cfg.censusFreezeAi);
         g_repl.setAttentionRadius(g_cfg.attentionRadius);
