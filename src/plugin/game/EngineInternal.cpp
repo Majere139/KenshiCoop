@@ -1249,21 +1249,68 @@ std::map<Character*, ReportedDmg> g_reportedDmg;
 std::set<Character*>              g_reportAttackers;
 bool                              g_combatReport = false;
 
+// Guarded-swing damage floaters (Session F workup, 2026-08-16). The guard
+// returns HIT_MISSED before the engine's hit path, so a swing by OUR OWN
+// player character on a driven copy never draws the engine's damage number -
+// the join player's #1 complaint after the vitals fix ("I can see their
+// health, but not my numbers"). The hook only RECORDS (victim, would-be
+// damage) here - it may run on a character worker thread (Kenshi's
+// characterMultithreading), and the GUI is main-thread only - and the
+// replicator drains the ring on the main thread and draws the label. Fixed
+// ring + interlocked spinlock (no windows.h dependency in this TU, no
+// allocation, bounded, no std container touched from the hook thread; the
+// critical section is held for a handful of stores). Overflow drops the
+// oldest (cosmetic).
+extern "C" long _InterlockedExchange(long volatile* Target, long Value);
+#pragma intrinsic(_InterlockedExchange)
+bool                 g_dmgFloaters = false;
+volatile long        g_floaterSpin = 0;
+FloaterHit           g_floaterRing[FLOATER_RING_N];
+unsigned int         g_floaterHead = 0;   // next write
+unsigned int         g_floaterCount = 0;  // live entries (<= FLOATER_RING_N)
+unsigned long        g_floaterQueued = 0; // cumulative pushes (telemetry)
+
+static void floaterLock()   { while (_InterlockedExchange(&g_floaterSpin, 1) != 0) { } }
+static void floaterUnlock() { _InterlockedExchange(&g_floaterSpin, 0); }
+
+static void floaterPush(Character* victim, float amount) {
+    floaterLock();
+    FloaterHit& fh = g_floaterRing[g_floaterHead];
+    fh.victim = victim; fh.amount = amount;
+    g_floaterHead = (g_floaterHead + 1) % FLOATER_RING_N;
+    if (g_floaterCount < FLOATER_RING_N) ++g_floaterCount;
+    ++g_floaterQueued;
+    floaterUnlock();
+}
+
 HitMaterialType __fastcall hitByMelee_hook(Character* self, CutDirection dir,
                                            Damages& damage, Character* who,
                                            CombatTechniqueData* attack, int comboID) {
     if (!g_damageGuarded.empty() &&
         g_damageGuarded.find(self) != g_damageGuarded.end()) {
         ++g_dmgGuardedHits;
-        // Report path (join): the local swing never lands here, but if a player-
-        // squad attacker dealt it, accumulate so the host wounds the real NPC.
+        // Attacker filter: g_reportAttackers holds the LOCALLY OWNED player
+        // characters (rebuilt each tick by the replicator from ownHands_ -
+        // NOT every player character: the peer's driven copies replay their
+        // owner's fight here, and counting their cosmetic swings would
+        // report/draw the peer's hits as ours).
+        bool ownSwing = !g_reportAttackers.empty() && who &&
+                        g_reportAttackers.find(who) != g_reportAttackers.end();
+        // Report path (protocol 45, OFF by default since Session F): the
+        // local swing never lands here, but if one of our own PCs dealt it,
+        // accumulate so the world authority wounds the real NPC.
         // flesh ~ solid impact (cut+blunt+pierce+stun); blood ~ bleeding sources
         // (cut+pierce, plus the bleed multiplier). Absolute deltas, host-applied.
-        if (g_combatReport && !g_reportAttackers.empty() && who &&
-            g_reportAttackers.find(who) != g_reportAttackers.end()) {
+        if (g_combatReport && ownSwing) {
             ReportedDmg& rd = g_reportedDmg[self];
             rd.flesh += damage.cut + damage.blunt + damage.pierce + damage.extraStun;
             rd.blood += (damage.cut + damage.pierce) * 0.5f + damage.bleedMult;
+        }
+        // Floater path: the number the swing WOULD have dealt (pre-armour raw
+        // total, the same figure the report path forwards). Cosmetic.
+        if (g_dmgFloaters && ownSwing) {
+            float amt = damage.cut + damage.blunt + damage.pierce;
+            if (amt >= 0.5f) floaterPush(self, amt);
         }
         return HIT_MISSED; // cosmetic fight: the local swing never lands
     }
@@ -2421,6 +2468,26 @@ void setCombatReport(bool on) {
 }
 void clearReportAttackers()          { g_reportAttackers.clear(); }
 void addReportAttacker(Character* c)  { if (c) g_reportAttackers.insert(c); }
+bool isDamageGuarded(Character* c) {
+    return c && g_damageGuarded.find(c) != g_damageGuarded.end();
+}
+
+void setDamageFloaters(bool on) { g_dmgFloaters = on; }
+unsigned int takeFloaterHits(FloaterHit* out, unsigned int maxOut) {
+    if (!out || maxOut == 0) return 0;
+    unsigned int n = 0;
+    floaterLock();
+    // Oldest first: the ring's tail is head - count (mod N).
+    unsigned int idx = (g_floaterHead + FLOATER_RING_N - g_floaterCount) % FLOATER_RING_N;
+    while (g_floaterCount > 0 && n < maxOut) {
+        out[n++] = g_floaterRing[idx];
+        idx = (idx + 1) % FLOATER_RING_N;
+        --g_floaterCount;
+    }
+    floaterUnlock();
+    return n;
+}
+unsigned long floaterQueuedCount() { return g_floaterQueued; }
 bool takeReportedDamage(Character* c, float* outFlesh, float* outBlood) {
     std::map<Character*, ReportedDmg>::iterator it = g_reportedDmg.find(c);
     if (it == g_reportedDmg.end()) return false;

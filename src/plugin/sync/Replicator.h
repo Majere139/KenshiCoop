@@ -136,6 +136,7 @@ public:
     // streak while staying in position enters TRUSTED mode - no suspend, no drive,
     // cheap monitor only; re-engaged instantly on divergence or drift (doctrine 18).
     void setGateAuthority(bool v) { gateAuthority_ = v; }
+    bool gateAuthorityArmed() const { return gateAuthority_; } // for the connect-time armed line
 
     // Carried-body sync (protocol 18, default ON): reliable pickup/drop edges +
     // self-healing carried state for player-squad members, executed engine-
@@ -722,6 +723,18 @@ public:
     // that key (puppets only - they are damage-guarded, so this stream is
     // their sanctioned medical writer).
     void setMedXlate(bool on) { medXlate_ = on; }
+
+    // KENSHICOOP_EVT_XLATE (Session F workup): the carried-body and furniture
+    // EVENT channels translate carrier / carried / occupant keys that resolve
+    // nowhere raw to the minted puppet bound to that key (same rule and same
+    // liveness proof as medXlate; measured 0/34 carries and 0/131 furniture
+    // enters applied without it).
+    void setEvtXlate(bool on) { evtXlate_ = on; }
+
+    // KENSHICOOP_DMG_FLOATERS (Session F workup): draw a rising "-N" over a
+    // driven copy when one of OUR OWN player characters lands a guarded swing
+    // on it (the guard returns HIT_MISSED before the engine can draw its own).
+    void setDmgFloaters(bool on) { dmgFloaters_ = on; }
 
     // KENSHICOOP_CENSUS_PARK (v38 pack-hidden fix): how far a census-PRESENT
     // local copy may drift from the host's census position before the join
@@ -2374,6 +2387,25 @@ private:
     bool          doorAuthority_;   // Session E: owner-authored doors
     bool          medXlate_;        // Session E: receive-side puppet translation
     unsigned long medXlates_;       // cumulative applied translations (log-sampled)
+    bool          evtXlate_;        // Session F: carry/furniture event translation
+    unsigned long evtXlates_;       // cumulative translated event applies
+    // Guarded-swing damage floaters (Session F): drained from the engine ring
+    // at the top of applyTargets (before the guard set is rebuilt, so the
+    // victim pointer can be re-proved against the set the swing was judged
+    // by), drawn as rising labels, retired after FLOATER_LIFE_MS.
+    bool          dmgFloaters_;
+    unsigned long floatersShown_;
+    struct LiveFloater { void* label; unsigned long ms; };
+    std::vector<LiveFloater> floaters_;
+    void driveDamageFloaters();
+    // Receive-side puppet translation (the E4/E5 "authorship rule", shared by
+    // the medical, hit, limb-event, carry and furniture appliers): a wire key
+    // resolves raw first; failing that, the minted puppet bound to it - IF the
+    // pointer still round-trips through the engine (readHand -> resolve ==
+    // same pointer). Aliased natives are deliberately NOT consulted (a second
+    // writer on a live local sim is a design call, not a fallback). Returns
+    // null when neither resolves; *viaPuppet reports which path answered.
+    Character* resolveKeyOrPuppet(const Key& k, bool* viaPuppet) const;
     bool isOwnProxyBody(Character* c) const {
         if (!c) return false;
         for (std::map<Key, Character*>::const_iterator it = proxyByKey_.begin();

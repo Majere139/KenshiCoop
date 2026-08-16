@@ -1679,7 +1679,12 @@
         # damage AND it streams back to the join) and REPORTS host<->join combat
         # cohesion (Get-CombatParity joinOnlyFrac/churn) as a FINDING - the warp-
         # cohesion regression guard is combat_snap_rate on combat_crowd/battle/win.
+        # 2026-08-16: the report channel is OFF by default (the combat-order
+        # replay of the join PC on the host lands its damage in the field, and
+        # the report on top double-counts); this scenario arms it explicitly so
+        # its protocol-45 gate keeps measuring the report path itself.
         pc_assault = @{
+            DiagEnv = @{ KENSHICOOP_COMBAT_REPORT = '1' }
             Save = 'sync'; Setup = ''; Tolerance = 20.0
             PrimaryGate = 'pc_assault'
             Gating   = @('pc_assault', 'clock_sync')

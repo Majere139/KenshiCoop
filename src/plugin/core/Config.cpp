@@ -344,6 +344,12 @@ void loadConfig(Config& c) {
         // DEFAULT ON; "0" restores the prior behavior for field triage.
         c.doorAuthority = envOr("KENSHICOOP_DOOR_AUTHORITY", "1") != "0";
         c.medXlate      = envOr("KENSHICOOP_MED_XLATE", "1") != "0";
+        // Session F workup (2026-08-16): carry/furniture event translation
+        // and guarded-swing damage floaters DEFAULT ON; the protocol-45
+        // combat report is explicitly OFF (the replay already lands).
+        c.evtXlate      = envOr("KENSHICOOP_EVT_XLATE", "1") != "0";
+        c.dmgFloaters   = envOr("KENSHICOOP_DMG_FLOATERS", "1") != "0";
+        c.combatReport  = envOr("KENSHICOOP_COMBAT_REPORT", "0") == "1";
         // Census park distance: "0" (explicit) disables; absent = 120 u
         // default. Deliberately ABOVE town-schedule divergence (~50 u for a
         // bar NPC seated at a different stool per sim - run 185524 showed
@@ -441,6 +447,8 @@ std::string describeConfig(const Config& c) {
         { "latejoin",c.latejoinSync }, { "aiSuspend", c.aiSuspend },
         { "gateAuth",c.gateAuthority },{ "camInterest", c.camInterest },
         { "censusFreezeAi", c.censusFreezeAi },
+        { "evtXlate", c.evtXlate },    { "dmgFloaters", c.dmgFloaters },
+        { "combatReport", c.combatReport },
     };
     s += " on=[";
     bool first = true;

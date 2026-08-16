@@ -181,6 +181,11 @@ const unsigned long SNEAK_APPLY_MS   = 1000; // min gap between setStealthMode a
 // re-deriving the posture (or an AI-suspended one whose medical model has not
 // caught up yet) must be re-posed at 1 Hz, never fought per frame.
 const unsigned long PRONE_APPLY_MS   = 1000; // min gap between setProneState applies
+// Session F guarded-swing damage floaters: how long a "-N" label lives before
+// we retire it ourselves (a rising ScreenLabel may self-retire sooner - the
+// destroy is markerAlive-checked either way), and how many may be on screen.
+const unsigned long FLOATER_LIFE_MS  = 1400;
+const unsigned int  FLOATER_LIVE_MAX = 24;
 const unsigned long STEALTH_SEND_MS  = 250;  // detection snapshot cadence (~4 Hz)
 const unsigned long STEALTH_RESEND_MS = 2000; // unchanged-map safety resend (unreliable channel)
 // Step 4 divergence-gated authority (doctrine 18, behind KENSHICOOP_GATE_AUTHORITY).

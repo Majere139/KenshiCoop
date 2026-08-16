@@ -1128,10 +1128,18 @@ void tickReplicatePublish(GameWorld* gw, bool worldLive) {
             // the HOST applies it to the real body (blood + a frontal flesh wound),
             // which the vitals stream then mirrors back. Decouples the join PC's
             // damage from its disrupted (position-driven) copy animation.
-            if (g_cfg.isHost)
+            // Under cell authority either side may author the victim, so both
+            // halves run on both sides (each is a no-op when it has nothing:
+            // publish needs a pending report, apply needs an inbound one).
+            // The report itself is OFF by default since Session F.
+            if (g_cfg.cellAuth) {
                 g_repl.applyCombatHits(gw, g_inbound);
-            else
                 g_repl.publishCombatHits(gw, g_net, g_net.localId());
+            } else if (g_cfg.isHost) {
+                g_repl.applyCombatHits(gw, g_inbound);
+            } else {
+                g_repl.publishCombatHits(gw, g_net, g_net.localId());
+            }
         }
         // Character stats sync (protocol 17): owner-authoritative CharStats
         // stream for player-squad members, both directions. publishStats
@@ -1852,6 +1860,36 @@ void coopUiConnect(bool isHost, bool useSteam, unsigned long long peerId) {
     // squad, so that unit never moves on the client (unowned NPCs still sync).
     coop::resolveOwnRanks(g_cfg.ownRanks, isHost, g_cfg.ownRanksFromEnv);
     g_repl.setOwnRanks(g_cfg.ownRanks);
+    // Role re-arm hygiene (Session F workup, 2026-08-16). Several enables were
+    // armed ONCE at plugin start from the config file's mode (which defaults
+    // to host), and this panel path only ever re-armed streamNpcs/ownRanks -
+    // so a panel-connected JOIN kept the host's startup choices: the protocol
+    // 34 storage census (host-only by design) ran on the join too, and the
+    // join-only enables (protocol 45 report, divergence-gated authority) never
+    // engaged. Measured: every join capture logs the host-variant [dmg] line.
+    //   * storeSync: re-armed to the chosen role (host-only container census).
+    //   * combat report: no longer role-bound at all (KENSHICOOP_COMBAT_REPORT,
+    //     default OFF - see the startup comment; the replay lands the damage).
+    //   * gate authority: DELIBERATELY NOT re-armed. It has been off on both
+    //     sides in every measured session; flipping it on for the join under
+    //     cell authority + cluster/alias binding is an untested behavior
+    //     change (trusted puppets would run their local AI). A/B candidate,
+    //     not a fix. Stated here so the log's on=[gateAuth] cannot mislead.
+    g_repl.setStoreSync(g_cfg.storeSync && isHost);
+    {
+        char ab[200];
+        _snprintf(ab, sizeof(ab) - 1,
+                  "[coop-ui] armed: role=%s streamNpcs=%d storeSync=%d combatReport=%d"
+                  " gateAuth=%d(startup value, not re-armed) dmgFloaters=%d evtXlate=%d",
+                  isHost ? "HOST" : "JOIN",
+                  (isHost || g_cfg.cellAuth) ? 1 : 0,
+                  (g_cfg.storeSync && isHost) ? 1 : 0,
+                  g_cfg.combatReport ? 1 : 0,
+                  g_repl.gateAuthorityArmed() ? 1 : 0,
+                  g_cfg.dmgFloaters ? 1 : 0, g_cfg.evtXlate ? 1 : 0);
+        ab[sizeof(ab) - 1] = '\0';
+        coopLog(ab);
+    }
 
     std::string ranks;
     for (std::set<unsigned int>::const_iterator it = g_cfg.ownRanks.begin();
@@ -1993,6 +2031,7 @@ void configureReplicator() {
         g_repl.setStreamProxyGuard(g_cfg.streamProxyGuard);
         g_repl.setDoorAuthority(g_cfg.doorAuthority);
         g_repl.setMedXlate(g_cfg.medXlate);
+        g_repl.setEvtXlate(g_cfg.evtXlate);
         g_repl.setCensusParkDist(g_cfg.censusParkDist);
         g_repl.setCensusFreezeAi(g_cfg.censusFreezeAi);
         g_repl.setAttentionRadius(g_cfg.attentionRadius);
@@ -2138,15 +2177,29 @@ void installEngineDetours() {
     if (g_cfg.damageGuard) {
         if (coop::engine::installDamageGuardHook()) {
             g_repl.setDamageGuard(true);
-            // Join-dealt authoritative damage report (protocol 45): only the JOIN
-            // reports (the HOST owns + simulates world NPCs, so its own swings land
-            // natively). Enabling report mode on the join makes the guard accumulate
-            // the damage its player-squad melee WOULD have dealt to driven world-NPC
-            // copies; publishCombatHits forwards it and the host wounds the real body.
-            g_repl.setReportCombat(!g_cfg.isHost);
-            coopLog(g_cfg.isHost
-                ? "[dmg] hitByMeleeAttack detour installed; damage guard ON (host, driven peer-squad bodies)"
-                : "[dmg] hitByMeleeAttack detour installed; damage guard ON + combat-hit report ON (join)");
+            // Join-dealt authoritative damage report (protocol 45). Upstream
+            // armed it from the config-file ROLE here (join only), and the F2
+            // panel path never re-armed it - so in every measured session it
+            // was OFF, and the field data (Session F, 2026-08-16: the join's
+            // driven PC copy on the host landed KO-ing hits while the host
+            // player was down) shows the combat-order replay already lands
+            // the join's damage. Arming the report on top would double-count.
+            // Now an explicit, role-free switch (KENSHICOOP_COMBAT_REPORT,
+            // default OFF; when ON both sides report + apply under cell
+            // authority, attackers = locally OWNED PCs only).
+            g_repl.setReportCombat(g_cfg.combatReport);
+            // Guarded-swing damage floaters (Session F): the guard records the
+            // would-be damage of our own PCs' swings on driven copies and the
+            // replicator draws it, since HIT_MISSED skips the engine's number.
+            coop::engine::setDamageFloaters(g_cfg.dmgFloaters);
+            g_repl.setDmgFloaters(g_cfg.dmgFloaters);
+            char dgb[200];
+            _snprintf(dgb, sizeof(dgb) - 1,
+                      "[dmg] hitByMeleeAttack detour installed; damage guard ON (driven bodies)"
+                      " combatReport=%d dmgFloaters=%d",
+                      g_cfg.combatReport ? 1 : 0, g_cfg.dmgFloaters ? 1 : 0);
+            dgb[sizeof(dgb) - 1] = '\0';
+            coopLog(dgb);
         } else {
             coopLog("[dmg] FAILED to install hitByMeleeAttack detour; damage guard disabled");
         }

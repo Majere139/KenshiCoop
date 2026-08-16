@@ -136,6 +136,36 @@ struct Config {
     // call, not a fallback).
     bool         medXlate;               // KENSHICOOP_MED_XLATE             (1)
 
+    // Receive-side puppet translation for the carried-body and furniture
+    // EVENT channels (Session F workup, 2026-08-16): the reliable pickup /
+    // drop / enter / exit edges resolved carrier, carried and occupant by
+    // RAW wire key, so for a runtime-keyed body (a puppet on the receiver)
+    // every apply failed - measured 0/34 host->join and 0/2 join->host
+    // carries, 0/131 furniture enters, in one session. Carriers walked with
+    // empty shoulders while the "carried" puppet slid along under its own
+    // stream. Same rule as medXlate, separate switch for A/B.
+    bool         evtXlate;               // KENSHICOOP_EVT_XLATE             (1)
+
+    // Damage floaters for guarded swings (Session F workup, the join
+    // player's #1 complaint): the damage guard returns HIT_MISSED before the
+    // engine's hit path runs, so a swing by our own PC on a driven copy never
+    // draws the engine's damage number. When on, the guard queues the
+    // would-be damage and the main thread draws a rising red "-N" over the
+    // victim (the same render-proven ScreenLabel the debug markers use).
+    // Cosmetic only; the number is the LOCAL sim's estimate.
+    bool         dmgFloaters;            // KENSHICOOP_DMG_FLOATERS          (1)
+
+    // Protocol 45 combat-hit report (join-dealt damage forwarded to the
+    // world authority). Upstream armed it join-only at plugin start from the
+    // config file's mode; the F2 panel path never re-armed it, so in every
+    // measured session it was OFF - and the field data (Session F 23:33:05
+    // host clock: the join's DRIVEN COPY on the host landed a KO-ing hit
+    // while the host player was down) shows the combat-order replay already
+    // lands the join's damage. Arming the report on top would double-count.
+    // DEFAULT OFF, explicit; "1" arms it on BOTH sides (cell authority) for
+    // an A/B, with the attacker set restricted to locally OWNED PCs.
+    bool         combatReport;           // KENSHICOOP_COMBAT_REPORT         (0)
+
     // v38 census position parking (pack-hidden fix, 2026-07-11): how far a
     // census-PRESENT local NPC copy may drift from the host's census position
     // before the join parks it back onto the host's spot (wide pass only,

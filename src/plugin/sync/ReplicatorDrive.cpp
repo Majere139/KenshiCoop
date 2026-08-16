@@ -44,23 +44,31 @@ void Replicator::applyTargets(GameWorld* gw) {
     // here so its AI resumes. Safe to rebuild now - the periodicUpdate detour only
     // reads the set during the engine tick, which already ran this frame.
     if (aiSuspend_) engine::clearAiSuspend();
+    // Guarded-swing damage floaters (Session F): drain what the guard recorded
+    // during the engine tick BEFORE the guard set is rebuilt below, so each
+    // victim pointer can be re-proved against the very set that judged it.
+    if (dmgGuard_ && dmgFloaters_) driveDamageFloaters();
     // Damage-guard set rebuilds the same way: every body we DRIVE this tick (all
     // are non-owned - owned hands are skipped below) is protected from local melee
     // damage, so the join's cosmetic fights cannot diverge the local-only medical
     // model. A body we stop driving drops out and takes local damage again.
     if (dmgGuard_) engine::clearDamageGuard();
-    // Join-dealt damage report (protocol 45, JOIN only): keep the engine-side
-    // accumulator armed and refresh the ATTACKER set (our controllable squad) each
-    // tick, mirroring the guard-set rebuild. A guarded swing BY one of these bodies
-    // ON a driven copy is captured for publishCombatHits; the set rebuild handles
-    // recruit/roster churn. On the host reportCombat_ is false, so the accumulator
-    // stays disabled (host swings land natively on the NPCs it owns).
-    if (reportCombat_) {
-        engine::setCombatReport(true);
+    // Attacker set for the guard's two consumers - the protocol-45 damage
+    // report (OFF by default since Session F; the combat-order replay of our
+    // PC on the peer already lands its damage) and the damage floaters.
+    // Refreshed each tick like the guard set. Session F fix: LOCALLY OWNED
+    // player characters only (ownHands_), NOT listPlayerChars - the peer's
+    // driven PC copies are player characters too, and their cosmetic replay
+    // swings on our driven copies would otherwise be reported/drawn as ours
+    // (a latent double-report whenever both players fight the same body).
+    if (reportCombat_ || dmgFloaters_) {
+        if (reportCombat_) engine::setCombatReport(true);
         engine::clearReportAttackers();
-        Character* pcs[64];
-        unsigned int np = engine::listPlayerChars(gw, pcs, 64);
-        for (unsigned int i = 0; i < np; ++i) engine::addReportAttacker(pcs[i]);
+        for (std::set<Key>::const_iterator ok = ownHands_.begin();
+             ok != ownHands_.end(); ++ok) {
+            Character* pc = engine::resolveCharByHand(ok->i, ok->s, ok->t, ok->c, ok->cs);
+            if (pc) engine::addReportAttacker(pc);
+        }
     }
     // Driven-body pointer set rebuilds per tick too: enforceHostAuthority uses it
     // to recognise a streamed body whose LOCAL hand key changed (combat detach
@@ -1042,14 +1050,23 @@ void Replicator::applyTargets(GameWorld* gw) {
                 if (haveCr && !carryingRight &&
                     (now - d.carryHealTick) >= CARRY_HEAL_MS) {
                     d.carryHealTick = now;
-                    unsigned int ch[5] = { out.sType, out.sContainer,
-                                           out.sContainerSerial,
-                                           out.sIndex, out.sSerial };
-                    bool ok = engine::applyPickup(gw, c, ch);
+                    // Session F: the CARRIED body is named by the peer's wire
+                    // key; a runtime-keyed one is our minted puppet (the
+                    // carrier 'c' already came through the same translation
+                    // at the top of this loop). Measured 0/~130 heals applied
+                    // before this - every carried KO'd bandit was a puppet.
+                    Key ck; ck.t = out.sType; ck.c = out.sContainer;
+                    ck.cs = out.sContainerSerial; ck.i = out.sIndex; ck.s = out.sSerial;
+                    bool xl = false;
+                    Character* who = evtXlate_
+                        ? resolveKeyOrPuppet(ck, &xl)
+                        : engine::resolveCharByHand(ck.i, ck.s, ck.t, ck.c, ck.cs);
+                    bool ok = who && engine::applyPickupTo(c, who);
+                    if (ok && xl) ++evtXlates_;
                     char b[160]; _snprintf(b, sizeof(b) - 1,
-                        "[carry] HEAL PICKUP carrier=%u,%u carried=%u,%u ok=%d",
+                        "[carry] HEAL PICKUP carrier=%u,%u carried=%u,%u ok=%d xlate=%d",
                         out.hIndex, out.hSerial, out.sIndex, out.sSerial,
-                        ok ? 1 : 0);
+                        ok ? 1 : 0, xl ? 1 : 0);
                     b[sizeof(b) - 1] = '\0'; coop::logLine(b);
                     // Refresh the read: a pickup that just landed must take the
                     // NPC early-continue below THIS tick, not after one more
@@ -2098,6 +2115,70 @@ void Replicator::applyRest(Character* c, Driven& d, const EntityState& out,
         }
     }
     engine::applyMotion(c, false, 0.0f, 0.0f, 0.0f, 0.0f);
+}
+
+// Receive-side puppet translation shared by the event/vitals appliers (see the
+// declaration in Replicator.h). Raw resolve first (save-stable hands, our own
+// bodies, anything the peer keys the way we do); then the minted puppet bound to
+// exactly this wire key, accepted only when the cached pointer still round-trips
+// through the engine (readHand -> resolveCharByHand == the same pointer) - the
+// same liveness proof the drive path applies before touching a proxy.
+Character* Replicator::resolveKeyOrPuppet(const Key& k, bool* viaPuppet) const {
+    if (viaPuppet) *viaPuppet = false;
+    Character* c = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+    if (c) return c;
+    std::map<Key, Character*>::const_iterator pit = proxyByKey_.find(k);
+    if (pit == proxyByKey_.end() || !pit->second) return 0;
+    Character* pc = pit->second;
+    unsigned int lh[5];
+    if (!engine::readHand(pc, lh)) return 0;
+    Character* live = engine::resolveCharByHand(lh[0], lh[1], lh[2], lh[3], lh[4]);
+    if (live != pc) return 0;
+    if (viaPuppet) *viaPuppet = true;
+    return pc;
+}
+
+// Guarded-swing damage floaters (Session F workup). Runs at the top of
+// applyTargets, BEFORE clearDamageGuard: the ring holds (victim, amount) pairs
+// the detour recorded during the engine tick, and the guard set that judged
+// them is still intact, so isDamageGuarded(victim) re-proves the pointer was a
+// live driven body this tick (the same "ask the engine again" discipline as
+// markerAlive). Then draw a rising "-N" over it and retire it after
+// FLOATER_LIFE_MS. Honors the game's own damage-floater option.
+void Replicator::driveDamageFloaters() {
+    unsigned long now = nowMs();
+    // Retire the old ones (markerDestroy is markerAlive-checked, so an
+    // engine-side auto-retire of a risen label costs nothing).
+    for (unsigned int i = 0; i < floaters_.size(); ) {
+        if ((now - floaters_[i].ms) >= FLOATER_LIFE_MS) {
+            engine::markerDestroy(floaters_[i].label);
+            floaters_[i] = floaters_.back();
+            floaters_.pop_back();
+        } else {
+            ++i;
+        }
+    }
+    engine::FloaterHit hits[engine::FLOATER_RING_N];
+    unsigned int n = engine::takeFloaterHits(hits, engine::FLOATER_RING_N);
+    if (n == 0) return;
+    if (!engine::floatersOptionOn()) return; // recorded, deliberately not drawn
+    for (unsigned int i = 0; i < n; ++i) {
+        if (floaters_.size() >= FLOATER_LIVE_MAX) break; // burst cap (cosmetic)
+        Character* v = hits[i].victim;
+        if (!v || !engine::isDamageGuarded(v)) continue;
+        void* l = engine::floaterCreate(v, hits[i].amount);
+        if (!l) continue;
+        LiveFloater lf; lf.label = l; lf.ms = now;
+        floaters_.push_back(lf);
+        ++floatersShown_;
+        if (floatersShown_ <= 3 || (floatersShown_ % 100) == 0) {
+            char b[120]; _snprintf(b, sizeof(b) - 1,
+                "[dmg] FLOATER shown n=%lu amount=%.1f live=%u queued=%lu",
+                floatersShown_, hits[i].amount, (unsigned)floaters_.size(),
+                engine::floaterQueuedCount());
+            b[sizeof(b) - 1] = '\0'; coop::logLine(b);
+        }
+    }
 }
 
 

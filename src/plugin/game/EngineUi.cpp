@@ -20,6 +20,7 @@
 // digit entry.
 #include <kenshi/gui/DatapanelGUI.h>
 #include <kenshi/gui/DataPanelLine.h>
+#include <kenshi/OptionsHolder.h>   // OptionsHolder::damageFloaters (::options export)
 #include <mygui/MyGUI_Delegate.h> // MyGUI::newDelegate + CDelegate* (free-fn callbacks)
 #include <windows.h>
 
@@ -105,6 +106,31 @@ bool markerDestroySeh(ForgottenGUI* g, ScreenLabel* l) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+// Damage floater (Session F workup): same factory as the markers, but RISING.
+// LS_MEDIUM red, chest-height offset. POD-only frame (SEH; the std::string and
+// Colour are built by the outer function, exactly like markerCreateSeh).
+ScreenLabel* floaterCreateSeh(ForgottenGUI* g, Character* c,
+                              const std::string* text, const MyGUI::Colour* col,
+                              const Ogre::Vector3* off) {
+    __try {
+        ScreenLabel* l = g->createScreenLabel(*text, *col, ScreenLabel::LS_MEDIUM,
+                                              ScreenLabel::RS_NORMAL);
+        if (l) {
+            l->_NV_setRisingSpeed(ScreenLabel::RS_NORMAL);
+            l->_NV_setTracking(c->handle, *off);
+        }
+        return l;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+
+// OptionsHolder::damageFloaters is a plain int on the exported ::options
+// global (0 = the player turned the game's own damage numbers off).
+bool floatersOptionOnSeh(OptionsHolder* o) {
+    __try {
+        return o->damageFloaters != 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 } // namespace
 
 void* markerCreate(Character* c, const char* text, int colorId) {
@@ -148,6 +174,27 @@ void markerDestroy(void* label) {
     // Character went away, which is exactly when the GUI has cleaned up too.
     if (!markerAlive(label)) return;
     markerDestroySeh(g, (ScreenLabel*)label);
+}
+
+void* floaterCreate(Character* c, float amount) {
+    if (!c) return 0;
+    ForgottenGUI* g = ::gui; // KenshiLib data export (spike 46)
+    if (!g) return 0;
+    char txt[24];
+    int n = (int)(amount + 0.5f);
+    if (n < 1) n = 1;
+    _snprintf(txt, sizeof(txt) - 1, "-%d", n);
+    txt[sizeof(txt) - 1] = '\0';
+    std::string t(txt);
+    MyGUI::Colour col(1.00f, 0.30f, 0.30f, 1.0f);
+    Ogre::Vector3 off(0.0f, 1.6f, 0.0f); // chest height (markers use 2.2 = head)
+    return floaterCreateSeh(g, c, &t, &col, &off);
+}
+
+bool floatersOptionOn() {
+    OptionsHolder* o = ::options; // KenshiLib data export (Globals.h)
+    if (!o) return true;          // unreadable = don't second-guess the player
+    return floatersOptionOnSeh(o);
 }
 
 // ---- In-game co-op session panel (config-driven, spike-50 DatapanelGUI stack) -

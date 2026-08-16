@@ -333,6 +333,14 @@ void  markerDestroy(void* label);
 // this before dereferencing and callers holding a handle across ticks should
 // too. Cheap (a pointer scan of the GUI's own label registry).
 bool  markerAlive(void* label);
+// Damage floater (Session F workup): a RISING red "-N" label pinned to the
+// victim at chest height - the same ScreenLabel factory as the markers with
+// RS_NORMAL instead of RS_STOPPED. Returns the opaque handle (null on fault /
+// GUI not up); the caller retires it via markerDestroy after a short lifetime
+// (markerAlive-checked, so an engine-side auto-retire is harmless). Honors
+// the game's own "damage floaters" option (floatersOptionOn). Main-thread only.
+void* floaterCreate(Character* c, float amount);
+bool  floatersOptionOn();
 
 // ---- In-game co-op session panel ---------------------------------------------
 // Moved to EngineUi.h (Phase 5a domain split): CoopPanelState, CoopConnectFn,
@@ -1257,6 +1265,22 @@ void         addReportAttacker(Character* c);
 // Drain the accumulated join-dealt damage for one victim copy (returns false if
 // nothing pending). flesh/blood are the summed deltas since the last drain.
 bool         takeReportedDamage(Character* c, float* outFlesh, float* outBlood);
+// True while the body is in the CURRENT damage-guard set (main thread; the set
+// is intact from the last applyTargets rebuild until the next clearDamageGuard).
+bool         isDamageGuarded(Character* c);
+
+// ---- Guarded-swing damage floaters (Session F workup, 2026-08-16) ---------
+// A guarded swing by one of OUR OWN player characters (the report-attacker set,
+// which since Session F holds locally owned PCs only) records (victim, raw
+// would-be damage) into a fixed ring from the detour thread; the replicator
+// drains it on the main thread with takeFloaterHits and draws a rising label
+// (EngineUi floaterCreate). Purely cosmetic - the guard still returns
+// HIT_MISSED. setDamageFloaters(false) stops the recording.
+struct FloaterHit { Character* victim; float amount; };
+const unsigned int FLOATER_RING_N = 32;
+void         setDamageFloaters(bool on);
+unsigned int takeFloaterHits(FloaterHit* out, unsigned int maxOut);
+unsigned long floaterQueuedCount(); // cumulative pushes since load
 
 // Read a character's current blood level by hand (medical.blood). The vitals
 // ground-truth read for the damage_guard conformance oracle: the HOST's victim
@@ -1391,6 +1415,11 @@ bool readCarry(Character* c, CarryRead* out);
 // attach, carry animation, transform-follow). Idempotent: already carrying
 // that body = success; carrying a different body = refused. SEH-guarded.
 bool applyPickup(GameWorld* gw, Character* carrier, const unsigned int carriedHand[5]);
+// Same, with the carried body already resolved (Session F: the replicator
+// translates a peer wire key to our minted puppet before calling). The
+// idempotency check compares the carrier's carryingObject against the body's
+// OWN local hand.
+bool applyPickupTo(Character* carrier, Character* who);
 // Release the carrier's carried body (dropCarriedObject; ragdoll = limp
 // ground drop). Idempotent: not carrying = success no-op. SEH-guarded.
 bool applyDrop(Character* carrier, bool ragdoll);

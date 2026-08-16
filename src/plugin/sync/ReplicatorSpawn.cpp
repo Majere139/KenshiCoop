@@ -921,15 +921,29 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 // Works for own-tab, cross-tab, and either direction: each
                 // machine mirrors the relationship between its own instances.
                 if (!carrySync_) break;
-                Character* carrier = engine::resolveCharByHand(
-                    ev.aIndex, ev.aSerial, ev.aType, ev.aContainer, ev.aContainerSerial);
-                unsigned int ch[5] = { ev.sType, ev.sContainer, ev.sContainerSerial,
-                                       ev.sIndex, ev.sSerial };
-                bool ok = carrier && engine::applyPickup(0, carrier, ch);
+                // Session F puppet translation (the E4/E5 rule): a runtime-
+                // keyed carrier or carried body resolves nowhere raw here -
+                // it is our minted puppet. Measured before this: 0 of 34
+                // host->join and 0 of 2 join->host pickups applied; the
+                // carrier walked with an empty shoulder while the carried
+                // puppet slid along under its own stream. xlate bits: 1 =
+                // carrier translated, 2 = carried translated.
+                Key ak; ak.t = ev.aType; ak.c = ev.aContainer; ak.cs = ev.aContainerSerial;
+                ak.i = ev.aIndex; ak.s = ev.aSerial;
+                bool xa = false, xs = false;
+                Character* carrier = evtXlate_
+                    ? resolveKeyOrPuppet(ak, &xa)
+                    : engine::resolveCharByHand(ak.i, ak.s, ak.t, ak.c, ak.cs);
+                Character* who = evtXlate_
+                    ? resolveKeyOrPuppet(k, &xs)
+                    : engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+                bool ok = carrier && who && engine::applyPickupTo(carrier, who);
+                int xl = (xa ? 1 : 0) | (xs ? 2 : 0);
+                if (ok && xl) ++evtXlates_;
                 char cb[160]; _snprintf(cb, sizeof(cb) - 1,
-                    "[carry] RECV PICKUP id=%u carrier=%u,%u carried=%u,%u ok=%d",
+                    "[carry] RECV PICKUP id=%u carrier=%u,%u carried=%u,%u ok=%d xlate=%d",
                     ev.eventId, ev.aIndex, ev.aSerial, ev.sIndex, ev.sSerial,
-                    ok ? 1 : 0);
+                    ok ? 1 : 0, xl);
                 cb[sizeof(cb) - 1] = '\0'; coop::logLine(cb);
                 break;
             }
@@ -938,13 +952,18 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 // ragdoll flag). Idempotent - a carrier that never picked up
                 // locally (lost/late pickup) is a no-op success.
                 if (!carrySync_) break;
-                Character* carrier = engine::resolveCharByHand(
-                    ev.aIndex, ev.aSerial, ev.aType, ev.aContainer, ev.aContainerSerial);
+                Key ak; ak.t = ev.aType; ak.c = ev.aContainer; ak.cs = ev.aContainerSerial;
+                ak.i = ev.aIndex; ak.s = ev.aSerial;
+                bool xa = false;
+                Character* carrier = evtXlate_
+                    ? resolveKeyOrPuppet(ak, &xa)
+                    : engine::resolveCharByHand(ak.i, ak.s, ak.t, ak.c, ak.cs);
                 bool ok = carrier && engine::applyDrop(carrier, ev.arg != 0.0f);
+                if (ok && xa) ++evtXlates_;
                 char cb[160]; _snprintf(cb, sizeof(cb) - 1,
-                    "[carry] RECV DROP id=%u carrier=%u,%u carried=%u,%u ok=%d",
+                    "[carry] RECV DROP id=%u carrier=%u,%u carried=%u,%u ok=%d xlate=%d",
                     ev.eventId, ev.aIndex, ev.aSerial, ev.sIndex, ev.sSerial,
-                    ok ? 1 : 0);
+                    ok ? 1 : 0, xa ? 1 : 0);
                 cb[sizeof(cb) - 1] = '\0'; coop::logLine(cb);
                 break;
             }
@@ -982,15 +1001,43 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                         break;
                     }
                 }
-                Character* occ = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+                // Session F puppet translation: the OCCUPANT is named by the
+                // peer's wire key (a jailed/bedded runtime NPC is our puppet);
+                // the furniture hand is save-stable and resolves raw. Measured
+                // before this: 0 of 131 reliable enters applied on the join
+                // (the drive's nearest-fixture self-heal rescued ~2/3 of them,
+                // late and by proximity guess).
+                bool xo = false;
+                Character* occ = evtXlate_
+                    ? resolveKeyOrPuppet(k, &xo)
+                    : engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
                 unsigned int fh[5] = { ev.aType, ev.aContainer, ev.aContainerSerial,
                                        ev.aIndex, ev.aSerial };
                 int kind = (int)ev.arg;
+                // kind 3 (chained/pole): the "furniture" hand is the slave
+                // OWNER - a character, so it may be runtime-keyed too; hand
+                // the engine our puppet's LOCAL hand for it (readHand order
+                // is {i,s,t,c,cs}; fh is {t,c,cs,i,s}).
+                bool xk = false;
+                if (evtXlate_ && kind == 3) {
+                    Key ak; ak.t = ev.aType; ak.c = ev.aContainer; ak.cs = ev.aContainerSerial;
+                    ak.i = ev.aIndex; ak.s = ev.aSerial;
+                    Character* oc = resolveKeyOrPuppet(ak, &xk);
+                    unsigned int lh[5];
+                    if (oc && xk && engine::readHand(oc, lh)) {
+                        fh[0] = lh[2]; fh[1] = lh[3]; fh[2] = lh[4];
+                        fh[3] = lh[0]; fh[4] = lh[1];
+                    } else {
+                        xk = false;
+                    }
+                }
                 bool ok = occ && engine::applyFurniture(0, occ, fh, kind, true);
+                int xl = (xo ? 1 : 0) | (xk ? 2 : 0);
+                if (ok && xl) ++evtXlates_;
                 char fb[160]; _snprintf(fb, sizeof(fb) - 1,
-                    "[furn] RECV ENTER id=%u occ=%u,%u furn=%u,%u kind=%d ok=%d",
+                    "[furn] RECV ENTER id=%u occ=%u,%u furn=%u,%u kind=%d ok=%d xlate=%d",
                     ev.eventId, ev.sIndex, ev.sSerial, ev.aIndex, ev.aSerial,
-                    kind, ok ? 1 : 0);
+                    kind, ok ? 1 : 0, xl);
                 fb[sizeof(fb) - 1] = '\0'; coop::logLine(fb);
                 break;
             }
@@ -999,15 +1046,33 @@ void Replicator::applyEvents(GameWorld* gw, Inbound& in) {
                 // that never entered locally (lost/late enter) is a no-op success.
                 if (!furnSync_) break;
                 if (ownHands_.find(k) != ownHands_.end()) break;
-                Character* occ = engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
+                bool xo = false;
+                Character* occ = evtXlate_
+                    ? resolveKeyOrPuppet(k, &xo)
+                    : engine::resolveCharByHand(k.i, k.s, k.t, k.c, k.cs);
                 unsigned int fh[5] = { ev.aType, ev.aContainer, ev.aContainerSerial,
                                        ev.aIndex, ev.aSerial };
                 int kind = (int)ev.arg;
+                bool xk = false;
+                if (evtXlate_ && kind == 3) { // owner hand -> our puppet's local hand
+                    Key ak; ak.t = ev.aType; ak.c = ev.aContainer; ak.cs = ev.aContainerSerial;
+                    ak.i = ev.aIndex; ak.s = ev.aSerial;
+                    Character* oc = resolveKeyOrPuppet(ak, &xk);
+                    unsigned int lh[5];
+                    if (oc && xk && engine::readHand(oc, lh)) {
+                        fh[0] = lh[2]; fh[1] = lh[3]; fh[2] = lh[4];
+                        fh[3] = lh[0]; fh[4] = lh[1];
+                    } else {
+                        xk = false;
+                    }
+                }
                 bool ok = occ && engine::applyFurniture(0, occ, fh, kind, false);
+                int xl = (xo ? 1 : 0) | (xk ? 2 : 0);
+                if (ok && xl) ++evtXlates_;
                 char fb[160]; _snprintf(fb, sizeof(fb) - 1,
-                    "[furn] RECV EXIT id=%u occ=%u,%u furn=%u,%u kind=%d ok=%d",
+                    "[furn] RECV EXIT id=%u occ=%u,%u furn=%u,%u kind=%d ok=%d xlate=%d",
                     ev.eventId, ev.sIndex, ev.sSerial, ev.aIndex, ev.aSerial,
-                    kind, ok ? 1 : 0);
+                    kind, ok ? 1 : 0, xl);
                 fb[sizeof(fb) - 1] = '\0'; coop::logLine(fb);
                 break;
             }
