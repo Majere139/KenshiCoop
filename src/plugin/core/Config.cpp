@@ -337,6 +337,9 @@ void loadConfig(Config& c) {
         if (c.clusterMatchFraction > 100)    c.clusterMatchFraction = 100;
         if (c.clusterAmbiguityRadius < c.clusterMatchRadius)
             c.clusterAmbiguityRadius = c.clusterMatchRadius;
+        // Stream proxy guard (2026-08-15, obs D8): DEFAULT ON; "0" is the
+        // field-triage kill switch (restores the mirror ping-pong).
+        c.streamProxyGuard = envOr("KENSHICOOP_STREAM_PROXY_GUARD", "1") != "0";
         // Census park distance: "0" (explicit) disables; absent = 120 u
         // default. Deliberately ABOVE town-schedule divergence (~50 u for a
         // bar NPC seated at a different stool per sim - run 185524 showed

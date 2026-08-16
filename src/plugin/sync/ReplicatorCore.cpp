@@ -74,6 +74,7 @@ Replicator::Replicator()
       clusterMergeRadius_(300.0f), clusterMatchRadius_(600.0f),
       clusterPairDist_(400.0f), clusterAmbiguityRadius_(800.0f),
       clusterMatchFraction_(60),
+      streamProxyGuard_(true), streamProxySkips_(0), proxyAnswerDenied_(0),
       poolSeen_(-1), poolSent_(-1), poolSentMs_(0), poolTotal_(-1),
       poolSeq_(0), poolAcked_(0),
       moneySync_(true), recruitSync_(true),

@@ -223,6 +223,32 @@ void Replicator::publishOwned(GameWorld* gw, NetLink& net, u32 ownerId) {
     // it actually owns or the two of us drive the same bodies.
     if (streamNpcs_ && n < MAX_PUBLISH) {
         unsigned int got = engine::captureNpcs(gw, buf + n, MAX_PUBLISH - n);
+        // Stream proxy guard (2026-08-15, Session D obs D8 "mirror ping-pong"):
+        // captureNpcs enumerates every Character in the bubble, INCLUDING the
+        // proxies we minted for the peer's bodies. A proxy's local hand is one
+        // no other client has ever heard of (the census publisher translates
+        // it via proxyKeyOf for exactly that reason), and the peer-census
+        // exclusion below compares the LOCAL hand - so once we authored the
+        // cell a proxy stood in, it went out on the stream under our hand,
+        // the peer could not resolve it, asked, was told found=1, and minted
+        // a mirror of our mirror. Measured Session D: 42 of the 44 stream
+        // mints on both machines were mirrors of the peer's proxies, one
+        // generation per ownership flip (three High Paladin proxy hands
+        // within 8 u on the host). A proxy is the peer's body: it never
+        // enters our stream. Applied before the cell/attention gate so it
+        // holds whether or not presence authority is on.
+        if (streamProxyGuard_ && got > 0 && !proxyByKey_.empty()) {
+            unsigned int kept = 0;
+            for (unsigned int i = 0; i < got; ++i) {
+                Character* bc = engine::resolveCharByHand(
+                    buf[n + i].hIndex, buf[n + i].hSerial, buf[n + i].hType,
+                    buf[n + i].hContainer, buf[n + i].hContainerSerial);
+                if (bc && isOwnProxyBody(bc)) { ++streamProxySkips_; continue; }
+                if (kept != i) buf[n + kept] = buf[n + i];
+                ++kept;
+            }
+            got = kept;
+        }
         // The attention gate lives HERE, not on the census. Streaming is the
         // expensive half - a transform per body per tick - and it is the half
         // that is genuinely pointless when the peer has no camera or squad near
@@ -900,6 +926,16 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
                 if (best < 0.0f || d < best) best = d;
             }
             if (best < 0.0f || best <= MID_NEAR_EDGE) continue; // near tier
+            // Stream proxy guard (2026-08-15, obs D8): a proxy we minted is
+            // the peer's body under a hand only we know - the census row
+            // above went out under the PEER's key for that reason, but this
+            // list is keyed by the raw local hand. Never drive-slot it back
+            // to the peer (the mid band's mover filter is why it leaked less
+            // often than the near tier, not never).
+            if (streamProxyGuard_ && isOwnProxyBody(chars[i])) {
+                ++streamProxySkips_;
+                continue;
+            }
             // Same ownership rule as the near band: we drive what we author.
             if (cellAuth_ && !weAuthor(gw, ownerId, states[i].x, states[i].z)) continue;
             if (cellAuth_ && nPeerAnch > 0 &&
@@ -1017,9 +1053,10 @@ void Replicator::publishNpcCensus(GameWorld* gw, NetLink& net, u32 ownerId) {
         _snprintf(b, sizeof(b) - 1,
                   "[census] sent n=%u radius=%.0f mid=%u anchors=%u%s"
                   " enum=%u notmine=%u proxyrow=%u aliasrow=%u clbind=%lu"
-                  " attnR=%.0f",
+                  " pxskip=%lu pxdeny=%lu attnR=%.0f",
                   m, censusRadius_, (unsigned)midBand_.size(), na, det,
                   n, nNotMine, nProxyRow, nAliasRow, clusterBinds_,
+                  streamProxySkips_, proxyAnswerDenied_,
                   attentionRadius_);
         b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         // KENSHICOOP_DEBUG_CENSUS=1: dump every census row (hand + name) at the

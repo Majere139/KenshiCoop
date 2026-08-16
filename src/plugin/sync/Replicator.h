@@ -705,6 +705,12 @@ public:
         clusterMatchFraction_ = fracPct;
     }
 
+    // KENSHICOOP_STREAM_PROXY_GUARD (2026-08-15, Session D obs D8): a proxy
+    // we minted never enters the NPC stream under its local hand, and a REQ
+    // for one of our proxy hands answers found=0. 'false' is the field-triage
+    // kill switch (restores the mirror-of-mirror ping-pong).
+    void setStreamProxyGuard(bool on) { streamProxyGuard_ = on; }
+
     // KENSHICOOP_CENSUS_PARK (v38 pack-hidden fix): how far a census-PRESENT
     // local copy may drift from the host's census position before the join
     // parks it back onto the host's spot. <= 0 disables parking (existence-
@@ -2345,6 +2351,21 @@ private:
                             const char* sid, float x, float y, float z,
                             bool dead, unsigned long now);
     void clusterSweep(unsigned long now);
+    // Stream proxy guard (2026-08-15, obs D8 mirror ping-pong). A minted
+    // proxy is the peer's body; only the census (which translates via
+    // proxyKeyOf) may name it on the wire. streamProxySkips_ counts near-tier
+    // + mid-band exclusions (cumulative, 'pxskip=' on the census line);
+    // proxyAnswerDenied_ counts REQs for our own proxy hands answered found=0.
+    bool          streamProxyGuard_;
+    unsigned long streamProxySkips_;
+    unsigned long proxyAnswerDenied_;
+    bool isOwnProxyBody(Character* c) const {
+        if (!c) return false;
+        for (std::map<Key, Character*>::const_iterator it = proxyByKey_.begin();
+             it != proxyByKey_.end(); ++it)
+            if (it->second == c) return true;
+        return false;
+    }
     // JOIN: per-hand request state - debounce, retry cap, negative-reply
     // backoff (deniedMs = when the host said "can't resolve either" or the
     // local proxy spawn failed; retried only after a long cooldown).

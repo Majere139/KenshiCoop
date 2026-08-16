@@ -106,6 +106,17 @@ struct Config {
     unsigned int clusterMatchFraction;   // KENSHICOOP_CLUSTER_MATCH_FRACTION (60 %)
     float        clusterAmbiguityRadius; // KENSHICOOP_CLUSTER_AMBIGUITY_RADIUS (800 u)
 
+    // Stream proxy guard (2026-08-15, Session D obs D8 "mirror ping-pong"):
+    // a proxy we minted is the PEER's body under a hand only we know. The
+    // census publishes it under the peer's key, but the near-tier stream and
+    // the mid band published it under our LOCAL hand whenever we authored
+    // its cell, and the REQ answerer vouched for that hand (found=1) -
+    // so the peer minted a mirror of our mirror, one generation per
+    // ownership flip (42 of 44 stream mints in that session, both sides).
+    // On: proxies never enter the NPC stream and a REQ for one of our proxy
+    // hands answers found=0. Kill switch for field triage only.
+    bool         streamProxyGuard;       // KENSHICOOP_STREAM_PROXY_GUARD    (1)
+
     // v38 census position parking (pack-hidden fix, 2026-07-11): how far a
     // census-PRESENT local NPC copy may drift from the host's census position
     // before the join parks it back onto the host's spot (wide pass only,

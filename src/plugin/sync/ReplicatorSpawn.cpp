@@ -215,6 +215,22 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
                     proxyByKey_.erase(bp);
                 }
             }
+            // Stream proxy guard (2026-08-15, Session D obs D8): the engine
+            // resolves the LOCAL hand of a proxy WE minted exactly like any
+            // other body, so a REQ for it used to be answered found=1 with
+            // the proxy's template - and the peer minted a mirror of our
+            // mirror (a stream mint, no cluster/dupe guard by design). The
+            // peer only ever learns our proxy's local hand from a leak on
+            // our side (the stream publishers, fixed alongside this), so the
+            // honest answer is "no such body": the body it stands for is the
+            // peer's own, under the peer's key. found=0 -> the peer's
+            // denied-backoff stops the retries; nothing is destroyed.
+            bool ownProxy = false;
+            if (c && streamProxyGuard_ && isOwnProxyBody(c)) {
+                ownProxy = true;
+                c = 0;
+                ++proxyAnswerDenied_;
+            }
             bool dead = false;
             float age = 0.0f;
             bool found = c && engine::describeCharacter(
@@ -225,9 +241,10 @@ void Replicator::syncSpawns(GameWorld* gw, Inbound& in, NetLink& net, u32 ownerI
             pkt.age   = age; // animals scale body size by age (protocol 39)
             net.queueSpawnInfo(pkt);
             char b[240]; _snprintf(b, sizeof(b) - 1,
-                "[spawn] INFO send hand=%u,%u,%u,%u,%u found=%d dead=%d age=%.2f sid='%s' fac='%s'",
+                "[spawn] INFO send hand=%u,%u,%u,%u,%u found=%d dead=%d age=%.2f sid='%s' fac='%s'%s",
                 k.t, k.c, k.cs, k.i, k.s, pkt.found, pkt.dead, pkt.age,
-                pkt.charSid, pkt.facSid);
+                pkt.charSid, pkt.facSid,
+                ownProxy ? " (own proxy: denied)" : "");
             b[sizeof(b) - 1] = '\0'; coop::logLine(b);
         }
     }
