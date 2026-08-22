@@ -639,9 +639,29 @@ void Replicator::applyTargets(GameWorld* gw) {
                 // crippled body reads Character::isDown() while conscious, so
                 // plain bodyIsDown would have us author bed-enters for someone
                 // who crawled past a bed under their own control.
-                bool downish = coop::bodyDownNotCrawling(out.bodyState) ||
-                               d.koLatched || d.deathLatched ||
-                               coop::bodyDownNotCrawling(engine::readBodyState(c));
+                // Session G workup (2026-08-21, jail owner rule): the OWNER's
+                // stream decides whether the body is down. The old clause also
+                // accepted our LOCAL copy reading down - and a copy the host's
+                // sim had left lying in a cage kept the authoring alive for a
+                // full minute while the owner had lockpicked out and was free
+                // on its own screen (every PEER-ENTER skipped there: down=0).
+                // Now a conscious owner falls through to the debounced HEAL
+                // EXIT below, which releases our copy; the 2026-07-09 case
+                // (guards jail a KO'd peer body) still authors, because a KO'd
+                // owner streams the down bit / the KO latch.
+                bool ownerDown = coop::bodyDownNotCrawling(out.bodyState) ||
+                                 d.koLatched || d.deathLatched;
+                bool localDown = coop::bodyDownNotCrawling(engine::readBodyState(c));
+                bool downish = jailOwnerRule_ ? ownerDown : (ownerDown || localDown);
+                if (streamNpcs_ && isSquad && jailOwnerRule_ && localDown && !ownerDown &&
+                    (d.furnPeerTick == 0 || (now - d.furnPeerTick) >= FURN_PEER_MS)) {
+                    d.furnPeerTick = now; // same cadence as the authoring it replaces
+                    ++jailDeclines_;
+                    char jb[176]; _snprintf(jb, sizeof(jb) - 1,
+                        "[furn] PEER-ENTER declined occ=%u,%u kind=%d (owner conscious; local copy down) n=%lu",
+                        out.hIndex, out.hSerial, localKind, jailDeclines_);
+                    jb[sizeof(jb) - 1] = '\0'; coop::logLine(jb);
+                }
                 if (streamNpcs_ && isSquad && downish) {
                     if (d.furnPeerTick == 0 || (now - d.furnPeerTick) >= FURN_PEER_MS) {
                         d.furnPeerTick = now;

@@ -166,6 +166,18 @@ struct Config {
     // an A/B, with the attacker set restricted to locally OWNED PCs.
     bool         combatReport;           // KENSHICOOP_COMBAT_REPORT         (0)
 
+    // Jail owner rule (Session G workup, 2026-08-21): the host's third-party
+    // PEER-ENTER authoring for a peer-owned PC (protocol 36) decided "is the
+    // body down" from the OWNER's stream OR the host's LOCAL copy. Measured:
+    // the owner lockpicked out of a cage (conscious, free on its screen) while
+    // the host's sim still had the copy lying in the cage -> the host authored
+    // PEER-ENTER every 5 s for a minute, the owner skipped every one (down=0),
+    // and the two screens disagreed until a re-host. With the rule ON only
+    // the owner's stream (down bit / KO / death latch) can keep a jailing
+    // alive; a conscious owner releases the host's copy via the existing
+    // heal-exit. The owner is authoritative for its own character.
+    bool         jailOwnerRule;          // KENSHICOOP_JAIL_OWNER_RULE       (1)
+
     // v38 census position parking (pack-hidden fix, 2026-07-11): how far a
     // census-PRESENT local NPC copy may drift from the host's census position
     // before the join parks it back onto the host's spot (wide pass only,

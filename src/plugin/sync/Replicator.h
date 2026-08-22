@@ -736,6 +736,12 @@ public:
     // on it (the guard returns HIT_MISSED before the engine can draw its own).
     void setDmgFloaters(bool on) { dmgFloaters_ = on; }
 
+    // KENSHICOOP_JAIL_OWNER_RULE (Session G workup): the host keeps a
+    // third-party jailing of a peer PC alive (PEER-ENTER re-author, no
+    // self-heal eject) only while the OWNER's stream says the body is down;
+    // the host's local copy lying in the cage no longer counts.
+    void setJailOwnerRule(bool on) { jailOwnerRule_ = on; }
+
     // KENSHICOOP_CENSUS_PARK (v38 pack-hidden fix): how far a census-PRESENT
     // local copy may drift from the host's census position before the join
     // parks it back onto the host's spot. <= 0 disables parking (existence-
@@ -2395,6 +2401,8 @@ private:
     // by), drawn as rising labels, retired after FLOATER_LIFE_MS.
     bool          dmgFloaters_;
     unsigned long floatersShown_;
+    bool          jailOwnerRule_;   // Session G: owner's stream decides consciousness
+    unsigned long jailDeclines_;    // PEER-ENTER authorings declined under the rule
     struct LiveFloater { void* label; unsigned long ms; };
     std::vector<LiveFloater> floaters_;
     void driveDamageFloaters();

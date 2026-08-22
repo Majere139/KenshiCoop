@@ -350,6 +350,9 @@ void loadConfig(Config& c) {
         c.evtXlate      = envOr("KENSHICOOP_EVT_XLATE", "1") != "0";
         c.dmgFloaters   = envOr("KENSHICOOP_DMG_FLOATERS", "1") != "0";
         c.combatReport  = envOr("KENSHICOOP_COMBAT_REPORT", "0") == "1";
+        // Session G workup (2026-08-21): owner-decides-consciousness for the
+        // host's third-party jailing of a peer PC. DEFAULT ON.
+        c.jailOwnerRule = envOr("KENSHICOOP_JAIL_OWNER_RULE", "1") != "0";
         // Census park distance: "0" (explicit) disables; absent = 120 u
         // default. Deliberately ABOVE town-schedule divergence (~50 u for a
         // bar NPC seated at a different stool per sim - run 185524 showed
@@ -448,7 +451,7 @@ std::string describeConfig(const Config& c) {
         { "gateAuth",c.gateAuthority },{ "camInterest", c.camInterest },
         { "censusFreezeAi", c.censusFreezeAi },
         { "evtXlate", c.evtXlate },    { "dmgFloaters", c.dmgFloaters },
-        { "combatReport", c.combatReport },
+        { "combatReport", c.combatReport }, { "jailOwnerRule", c.jailOwnerRule },
     };
     s += " on=[";
     bool first = true;

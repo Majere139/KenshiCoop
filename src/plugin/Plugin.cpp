@@ -2032,6 +2032,7 @@ void configureReplicator() {
         g_repl.setDoorAuthority(g_cfg.doorAuthority);
         g_repl.setMedXlate(g_cfg.medXlate);
         g_repl.setEvtXlate(g_cfg.evtXlate);
+        g_repl.setJailOwnerRule(g_cfg.jailOwnerRule);
         g_repl.setCensusParkDist(g_cfg.censusParkDist);
         g_repl.setCensusFreezeAi(g_cfg.censusFreezeAi);
         g_repl.setAttentionRadius(g_cfg.attentionRadius);

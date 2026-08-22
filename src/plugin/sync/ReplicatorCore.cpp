@@ -77,6 +77,7 @@ Replicator::Replicator()
       streamProxyGuard_(true), streamProxySkips_(0), proxyAnswerDenied_(0),
       doorAuthority_(true), medXlate_(true), medXlates_(0),
       evtXlate_(true), evtXlates_(0), dmgFloaters_(true), floatersShown_(0),
+      jailOwnerRule_(true), jailDeclines_(0),
       poolSeen_(-1), poolSent_(-1), poolSentMs_(0), poolTotal_(-1),
       poolSeq_(0), poolAcked_(0),
       moneySync_(true), recruitSync_(true),
